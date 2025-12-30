@@ -1,8 +1,5 @@
 streamlit
-pandas
-plotly
 anthropic
-chromadb
-sentence-transformers
-torch
 python-dotenv
+pandas
+requests

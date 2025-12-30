@@ -1,0 +1,186 @@
+[
+  {
+    "message_id": "email-001",
+    "from": "program.office@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": ["finance.team@enterprise.com"],
+    "subject": "Clarification needed on upcoming delivery sequence",
+    "body": "Hi Jim,\n\nI wanted to take a moment to provide additional background around the delivery sequence that multiple teams have been aligning against over the past few weeks. As you know, several parallel efforts are now reaching a stage where their next set of activities depend on how the overall sequence is finalized.\n\nAt the moment, teams are continuing work based on the most recent guidance, but there are a few assumptions being made that may not fully reflect the intended direction. If those assumptions change later, it could lead to duplicated effort or require adjustments across related timelines.\n\nThe attached materials outline the current understanding of dependencies, handoffs, and timing considerations. Reviewing these and sharing your perspective would help ensure everyone remains aligned as planning progresses.\n\nThanks,\nProgram Office",
+    "received_at": "2025-12-24T10:15:30Z",
+    "attachments_count": 2,
+    "attachments": [
+      {
+        "file_name": "Delivery_Sequence_Overview.pdf",
+        "file_type": "pdf"
+      },
+      {
+        "file_name": "Open_Items_List.xlsx",
+        "file_type": "xlsx"
+      }
+    ]
+  },
+  {
+    "message_id": "email-002",
+    "from": "client.operations@partner.com",
+    "to": "jim@enterprise.com",
+    "cc": [],
+    "subject": "Next steps following recent integration review",
+    "body": "Hello Jim,\n\nFollowing the recent integration review sessions, I wanted to summarize where things currently stand from our side and provide some additional context. The majority of validation activities have been completed, and results have been shared internally for alignment.\n\nAs we move forward, there are a few transition-related decisions that will influence how remaining work is sequenced and coordinated across teams. While preparations are continuing based on the latest assumptions, clarity on the preferred approach would help ensure that all stakeholders remain consistent.\n\nPlease let us know if you would like to discuss any of these points further.\n\nBest regards,\nClient Operations",
+    "received_at": "2025-12-23T16:40:10Z",
+    "attachments_count": 1,
+    "attachments": [
+      {
+        "file_name": "Integration_Review_Notes.docx",
+        "file_type": "docx"
+      }
+    ]
+  },
+  {
+    "message_id": "email-003",
+    "from": "finance.planning@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": ["budget.team@enterprise.com"],
+    "subject": "Input required for planning assumptions",
+    "body": "Hi Jim,\n\nAs part of the current planning cycle, we are in the process of consolidating assumptions submitted by various teams. Most inputs are aligned, but a few areas related to cost phasing and timing could benefit from additional confirmation.\n\nThese assumptions will influence how projections are finalized and shared, so addressing any discrepancies early will help ensure accuracy. The attached files capture the latest inputs and illustrate how different assumptions affect projected outcomes.\n\nYour feedback will help us finalize the planning package with confidence.\n\nRegards,\nFinance Planning",
+    "received_at": "2025-12-22T11:05:55Z",
+    "attachments_count": 2,
+    "attachments": [
+      {
+        "file_name": "Planning_Assumptions.xlsx",
+        "file_type": "xlsx"
+      },
+      {
+        "file_name": "Scenario_Comparison.pdf",
+        "file_type": "pdf"
+      }
+    ]
+  },
+  {
+    "message_id": "email-004",
+    "from": "it.delivery@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": [],
+    "subject": "Context on upcoming system transition",
+    "body": "Hi Jim,\n\nI wanted to share some additional context regarding the upcoming system transition that teams have been preparing for. Over the past several weeks, technical and business teams have worked through readiness activities and preliminary testing.\n\nWhile overall progress has been positive, there are a few coordination points that may influence how smoothly the transition progresses. Reviewing these items ahead of time will help teams stay aligned and minimize disruption as plans move forward.\n\nThanks for taking a look when you have time.\n\nBest,\nIT Delivery",
+    "received_at": "2025-12-21T09:22:40Z",
+    "attachments_count": 1,
+    "attachments": [
+      {
+        "file_name": "Transition_Checklist.pdf",
+        "file_type": "pdf"
+      }
+    ]
+  },
+  {
+    "message_id": "email-005",
+    "from": "legal.operations@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": ["contracts.team@enterprise.com"],
+    "subject": "Review of revised documentation set",
+    "body": "Hi Jim,\n\nThe revised documentation set reflecting recent discussions has now been compiled and circulated internally. While the structure remains largely unchanged, several sections include updated language based on prior feedback.\n\nTeams are preparing to proceed using this version, and a brief review would help confirm alignment before it is referenced more broadly. Addressing any concerns now will help avoid revisions later in the process.\n\nPlease see the attached files for reference.\n\nRegards,\nLegal Operations",
+    "received_at": "2025-12-20T14:10:18Z",
+    "attachments_count": 2,
+    "attachments": [
+      {
+        "file_name": "Revised_Documentation.docx",
+        "file_type": "docx"
+      },
+      {
+        "file_name": "Change_Summary.txt",
+        "file_type": "txt"
+      }
+    ]
+  },
+  {
+    "message_id": "email-006",
+    "from": "project.management@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": [],
+    "subject": "Status update ahead of milestone review",
+    "body": "Hi Jim,\n\nAhead of the upcoming milestone review, I wanted to share a more detailed status update. Most deliverables are progressing as planned, and teams are actively working through remaining items.\n\nThere are a few interdependencies highlighted in the attached report that could benefit from early visibility. Reviewing these ahead of the meeting may help streamline discussions and keep the next phase on track.\n\nThanks,\nProject Management",
+    "received_at": "2025-12-19T17:30:00Z",
+    "attachments_count": 1,
+    "attachments": [
+      {
+        "file_name": "Milestone_Status_Report.pdf",
+        "file_type": "pdf"
+      }
+    ]
+  },
+  {
+    "message_id": "email-007",
+    "from": "strategy.team@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": ["executive.office@enterprise.com"],
+    "subject": "Background materials for upcoming discussion",
+    "body": "Hi Jim,\n\nAs preparation for the upcoming discussion, the strategy team has compiled background materials summarizing recent analysis and observations. These materials are intended to provide context and highlight key considerations.\n\nReviewing them in advance may help focus the conversation on decision points and trade-offs during the discussion.\n\nRegards,\nStrategy Team",
+    "received_at": "2025-12-18T08:55:44Z",
+    "attachments_count": 2,
+    "attachments": [
+      {
+        "file_name": "Strategic_Analysis.pptx",
+        "file_type": "pptx"
+      },
+      {
+        "file_name": "Supporting_Data.csv",
+        "file_type": "csv"
+      }
+    ]
+  },
+  {
+    "message_id": "email-008",
+    "from": "operations@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": [],
+    "subject": "Coordination needed on upcoming activities",
+    "body": "Hi Jim,\n\nOperations teams are aligning schedules for upcoming activities, and several coordination points have surfaced during planning discussions. Teams are currently proceeding based on the latest shared guidance.\n\nThe attached schedule provides a consolidated view of activities and highlights areas where confirmation would help maintain alignment as execution continues.\n\nThanks,\nOperations",
+    "received_at": "2025-12-17T13:42:09Z",
+    "attachments_count": 1,
+    "attachments": [
+      {
+        "file_name": "Activity_Schedule.xlsx",
+        "file_type": "xlsx"
+      }
+    ]
+  },
+  {
+    "message_id": "email-009",
+    "from": "vendor.management@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": [],
+    "subject": "Context on vendor coordination efforts",
+    "body": "Hello Jim,\n\nWe have been coordinating closely with external vendors to ensure alignment with internal plans. Most discussions have been productive, and next steps are being outlined on both sides.\n\nThere are a few decision points summarized in the attached notes that may influence how vendors schedule their remaining activities. Your guidance will help keep plans synchronized.\n\nBest,\nVendor Management",
+    "received_at": "2025-12-16T15:18:33Z",
+    "attachments_count": 1,
+    "attachments": [
+      {
+        "file_name": "Vendor_Coordination_Notes.docx",
+        "file_type": "docx"
+      }
+    ]
+  },
+  {
+    "message_id": "email-010",
+    "from": "executive.office@enterprise.com",
+    "to": "jim@enterprise.com",
+    "cc": [],
+    "subject": "Materials for review ahead of leadership sync",
+    "body": "Hi Jim,\n\nAhead of the upcoming leadership sync, we’ve assembled a set of materials intended to provide a clear overview of current initiatives and open considerations. These documents reflect inputs gathered from across teams.\n\nWhile no immediate response is required, reviewing them beforehand may help inform the discussion and guide next steps.\n\nRegards,\nExecutive Office",
+    "received_at": "2025-12-15T09:00:00Z",
+    "attachments_count": 3,
+    "attachments": [
+      {
+        "file_name": "Leadership_Overview.pdf",
+        "file_type": "pdf"
+      },
+      {
+        "file_name": "Key_Decisions_List.txt",
+        "file_type": "txt"
+      },
+      {
+        "file_name": "Reference_Data.xlsx",
+        "file_type": "xlsx"
+      }
+    ]
+  }
+]
