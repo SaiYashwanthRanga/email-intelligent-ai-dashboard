@@ -1,29 +1,37 @@
 import React, { useState } from 'react';
-// We don't need useNavigate here anymore because we are using window.location for a hard refresh
+import axios from 'axios';
 import { Lock, User, ChevronRight, AlertTriangle } from 'lucide-react';
 import './App.css'; 
+
+// NOW READS FROM FILE INSTEAD OF HARDCODED
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
 
 const Login = () => {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
-    
-    // 1. CHECK CREDENTIALS (Case Sensitive)
-    if (username === "Jim" && password === "admin123") {
-      
-      // 2. SET TOKEN
-      localStorage.setItem("jimAuthSession", "true");
-      
-      // 3. FORCE REDIRECT
-      // Using window.location.href ensures the App component re-mounts and sees the token immediately.
-      window.location.href = "/"; 
-      
-    } else {
-      setError("Invalid credentials. Try 'Jim' and 'admin123'");
+    setError("");
+    setLoading(true);
+
+    try {
+      const res = await axios.post(`${API_BASE}/login`, { 
+        username: username, 
+        password: password 
+      });
+
+      if (res.data.success) {
+        localStorage.setItem("jimAuthSession", "true");
+        localStorage.setItem("loggedInUser", username);
+        window.location.href = "/"; 
+      }
+    } catch (err) {
+      setError("Access Denied. Invalid credentials.");
     }
+    setLoading(false);
   };
 
   return (
@@ -60,8 +68,8 @@ const Login = () => {
             </div>
           </div>
           {error && <div className="error-msg"><AlertTriangle size={14}/> {error}</div>}
-          <button type="submit" className="btn-login">
-            Sign In <ChevronRight size={16}/>
+          <button type="submit" className="btn-login" disabled={loading}>
+            {loading ? "Verifying..." : "Sign In"} <ChevronRight size={16}/>
           </button>
         </form>
         <div className="login-footer">Protected System • HFMG Internal Only</div>

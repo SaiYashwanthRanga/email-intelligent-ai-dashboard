@@ -1,0 +1,30 @@
+# Repository-level .gitignore for email-dashboard
+
+# Node (frontend)
+email-dashboard/node_modules/
+email-dashboard/build/
+
+# Python (backend)
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# Local env / secrets
+*.env
+.env
+.env.*
+
+# Local caches / data dumps
+backend/db_cache.json
+backend/vip_list.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Optional: package lock files can be kept or ignored per preference
+# package-lock.json

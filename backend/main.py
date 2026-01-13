@@ -1,241 +1,122 @@
 import os
-import json
+import asyncio
 import requests
-import traceback
-from typing import List, Optional
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from dotenv import load_dotenv
-from openai import OpenAI
 
-# 1. LOAD CONFIG
+# Updated imports
+from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest
+from services import (
+    group_emails_by_subject, 
+    analyze_single_thread, 
+    generate_executive_brief, 
+    generate_sender_report,
+    draft_email_reply,
+    calculate_triage_stats,
+    # NEW IMPORTS FOR LEVEL 3
+    get_last_processed_timestamp,
+    set_last_processed_timestamp,
+    get_cached_report,
+    save_cached_report,
+    get_cached_emails,   # <--- Added
+    save_cached_emails   # <--- Added
+)
+
+# 1. LOAD CONFIGURATION
 load_dotenv()
+origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+origins = [origin.strip() for origin in origins_str.split(",")]
+
 app = FastAPI()
 
-# 2. SETUP SECURITY
+# 2. SECURITY (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=origins, 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 3. SETUP AI CLIENT
-api_key = os.getenv("OPENAI_API_KEY")
-ACTIVE_MODEL = "gpt-4o"
-
-if not api_key:
-    print("❌ CRITICAL ERROR: OPENAI_API_KEY is missing from .env file!")
-
-client = OpenAI(api_key=api_key)
-
-class AnalysisRequest(BaseModel):
-    emails: List[dict]
-
-class ReplyRequest(BaseModel):
-    email_body: str
-    sender: str
-    subject: str
-
-class ThreadParseRequest(BaseModel):
-    body: str
-
-# --- LOGIC ---
-
-def generate_thread_summary(emails):
-    """Generates a high-level summary AND groups attachments"""
-    print(f"🔹 Generating Thread Summary for {len(emails)} emails...")
-    
-    # 1. Python Logic: Collect all attachments accurately
-    all_thread_files = []
-    sender_files_map = {}
-
-    email_text = ""
-    for e in emails:
-        sender = e.get('from') or e.get('sender') or "Unknown"
-        # Collect Text for AI
-        email_text += f"From: {sender} | Sub: {e.get('subject')}\nBody: {str(e.get('body'))[:300]}\n---\n"
-        
-        # Collect Files for Python Report
-        if e.get('attachments'):
-            for att in e['attachments']:
-                file_info = {"file_name": att.get('file_name'), "type": att.get('content_type', 'file'), "sender": sender}
-                all_thread_files.append(file_info)
-                
-                # Group by sender (Simple string matching)
-                if sender not in sender_files_map:
-                    sender_files_map[sender] = []
-                sender_files_map[sender].append(file_info)
-
-    # 2. AI Logic: Generate the insights
-    prompt = f"""
-    You are an Executive Analyst. Analyze this entire email thread.
-    
-    OUTPUT JSON ONLY:
-    {{
-      "thread_title": "Create a professional, short Title (max 8 words).",
-      "thread_summary": "Write a detailed paragraph (4-5 sentences) explaining the project status, key players, and decisions.",
-      "sender_analysis": [
-        {{
-          "name": "Sender Name (Exact as appears in From)",
-          "role_guess": "Role",
-          "summary": "What are they asking for?",
-          "email_count": 0
-        }}
-      ]
-    }}
-
-    EMAILS:
-    {email_text}
-    """
-    
-    try:
-        response = client.chat.completions.create(
-            model=ACTIVE_MODEL,
-            messages=[{"role": "system", "content": "You are a helpful assistant that outputs JSON."}, 
-                      {"role": "user", "content": prompt}],
-            response_format={ "type": "json_object" },
-            temperature=0.0
-        )
-        report = json.loads(response.choices[0].message.content)
-
-        # 3. Merge Phase: Inject Python File Lists into AI Report
-        report["all_thread_files"] = all_thread_files
-        
-        # Try to match sender files to the AI's sender list
-        for sender_obj in report.get("sender_analysis", []):
-            name = sender_obj.get("name")
-            # Fuzzy match: if the AI name is in the Python sender map key
-            attached_files = []
-            for key in sender_files_map:
-                if name in key or key in name:
-                    attached_files.extend(sender_files_map[key])
-            
-            sender_obj["file_list"] = attached_files
-            sender_obj["attachment_count"] = len(attached_files)
-
-        return report
-
-    except Exception as e:
-        print(f"⚠️ THREAD SUMMARY FAILED: {e}")
-        return {
-            "thread_title": "Thread Analysis Failed",
-            "thread_summary": "Could not generate summary.",
-            "sender_analysis": [],
-            "all_thread_files": []
-        }
-
-def analyze_individual_emails(emails_batch):
-    print(f"🔹 Analyzing Batch of {len(emails_batch)} emails...")
-    email_block = ""
-    for idx, email in enumerate(emails_batch, start=1):
-        email_block += f"ID: {idx} | Body: {str(email.get('body'))[:500]}\n"
-
-    prompt = f"""
-    Analyze these emails. Return JSON.
-    CRITICAL: Detailed 3-sentence summaries.
-    OUTPUT SCHEMA:
-    {{
-      "analysis": [
-          {{
-            "category": "URGENT" or "CONFIDENTIAL" or "MEETING" or "NORMAL",
-            "priority": 1 to 5,
-            "summary": "Detailed explanation.",
-            "action": "REPLY" or "REVIEW" or "ARCHIVE"
-          }}
-      ]
-    }}
-    DATA:
-    {email_block}
-    """
-    try:
-        response = client.chat.completions.create(
-            model=ACTIVE_MODEL, 
-            messages=[{"role": "system", "content": "You are a helpful assistant that outputs JSON."},
-                      {"role": "user", "content": prompt}],
-            response_format={ "type": "json_object" },
-            temperature=0.0
-        )
-        result = json.loads(response.choices[0].message.content)
-        return result.get("analysis", [])
-    except Exception as e:
-        return [{"category": "NORMAL", "priority": 1, "summary": "Error analyzing.", "action": "REVIEW"}] * len(emails_batch)
-
 # --- ENDPOINTS ---
 
 @app.get("/api/fetch-inbox")
-def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox"):
+def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net"):
     try:
         clean_url = url.replace("[", "").replace("]", "").split("(")[0]
         if not clean_url.startswith("http"): clean_url = f"http://{clean_url}"
         print(f"Fetching: {clean_url}")
-        resp = requests.get(clean_url, timeout=10)
+        resp = requests.get(clean_url, timeout=60)
         return resp.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/api/login")
+def login(credentials: LoginRequest):
+    if credentials.username == "Jim" and credentials.password == "admin123":
+        return {"success": True, "token": "jim-secure-token-v1"}
+    else:
+        raise HTTPException(status_code=401, detail="Invalid Credentials")
+
 @app.post("/api/analyze")
-def analyze_emails(payload: AnalysisRequest):
+async def analyze_emails(payload: AnalysisRequest):
     emails = payload.emails
     if not emails: return {"emails": [], "report": None}
     
-    final_emails = []
-    chunk_size = 15
-    for i in range(0, len(emails), chunk_size):
-        chunk = emails[i:i + chunk_size]
-        results = analyze_individual_emails(chunk)
-        for j, orig in enumerate(chunk):
-            if j < len(results):
-                final_emails.append({**orig, **results[j]})
-            else:
-                final_emails.append({**orig, "category": "NORMAL", "summary": "Pending...", "action": "REVIEW"})
+    # --- LEVEL 3: GLOBAL GATEKEEPER ---
+    def get_date_str(e):
+        return e.get("receivedDateTime") or e.get("received_at") or e.get("date") or "1970-01-01"
+    
+    latest_email_ts = max((get_date_str(e) for e in emails), default="1970-01-01")
+    last_run_ts = get_last_processed_timestamp()
+    
+    # Try to load cached enriched emails
+    cached_emails = get_cached_emails()
 
-    # Send top 30 for Thread Summary to get better context
-    thread_report = generate_thread_summary(emails[:30])
-            
-    return {"emails": final_emails, "report": thread_report}
+    # 2. Compare: If newest email is NOT newer than last run, AND we have valid cached data
+    if last_run_ts and latest_email_ts <= last_run_ts and cached_emails:
+        print("⏳ No new emails detected. Returning cached enriched data.")
+        cached_report = get_cached_report()
+        # SUCCESS: We return the cached *enriched* emails, not the raw payload!
+        return {"emails": cached_emails, "report": cached_report}
+
+    print(f"🚀 New Data (or missing cache) Detected. Running Analysis...")
+
+    # --- STANDARD ANALYSIS LOGIC ---
+    grouped_data = group_emails_by_subject(emails)
+    
+    tasks = [analyze_single_thread(subj, msgs) for subj, msgs in grouped_data.items()]
+    final_threads = await asyncio.gather(*tasks)
+    
+    brief_task = generate_executive_brief(final_threads)
+    sender_task = generate_sender_report(emails)
+    
+    brief, sender_summaries = await asyncio.gather(brief_task, sender_task)
+    
+    triage_data = calculate_triage_stats(emails, final_threads, demo_mode=False)
+    
+    brief["thread_email_count"] = len(emails)
+    brief["thread_attachment_count"] = triage_data["att_total"]
+    brief["sender_summaries"] = sender_summaries
+    brief["triage_stats"] = triage_data 
+
+    # --- LEVEL 3: SAVE STATE ---
+    set_last_processed_timestamp(latest_email_ts)
+    save_cached_report(brief)
+    save_cached_emails(final_threads) # <--- Save the enriched emails!
+
+    return {"emails": final_threads, "report": brief}
 
 @app.post("/api/reply")
-def generate_reply(payload: ReplyRequest):
-    print(f"🔹 Drafting reply...")
-    prompt = f"""
-    You are Jim Olver-Goshen. Draft a reply.
-    CONTEXT: Busy executive. Keep it short, encouraging, and direct.
-    INCOMING: From: {payload.sender} | Sub: {payload.subject} | Body: {payload.email_body}
-    OUTPUT: Just the body text.
-    """
-    try:
-        response = client.chat.completions.create(
-            model=ACTIVE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7, max_tokens=1000
-        )
-        return {"reply": response.choices[0].message.content.strip()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to generate reply")
+async def generate_reply(payload: ReplyRequest):
+    reply_text = await draft_email_reply(payload.sender, payload.email_body)
+    return {"reply": reply_text}
 
 @app.post("/api/parse-thread")
-def parse_email_thread(payload: ThreadParseRequest):
-    print("🔹 AI Parsing Email Thread...")
-    prompt = f"""
-    You are an expert Email Thread Cleaner. 
-    Transform RAW email text into a JSON list.
-    OUTPUT JSON ONLY: {{ "segments": [ {{ "type": "latest" or "history", "header": "Sender/Date or null", "content": "Clean message body." }} ] }}
-    RAW TEXT: {payload.body}
-    """
-    try:
-        response = client.chat.completions.create(
-            model=ACTIVE_MODEL,
-            messages=[{"role": "system", "content": "You are a helpful assistant that outputs JSON."},
-                      {"role": "user", "content": prompt}],
-            response_format={ "type": "json_object" }, temperature=0.0
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        return {"segments": [{"type": "latest", "header": None, "content": payload.body}]}
+async def parse_email_thread(payload: ThreadParseRequest):
+    return {"segments": [{"type": "latest", "header": "Log", "content": payload.body}]}
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

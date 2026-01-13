@@ -1,127 +1,265 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import { 
-  LayoutDashboard, Zap, User, Paperclip, AlertTriangle, Shield, 
-  Calendar, Hash, BarChart3, Menu, X, PieChart, Mail, Clock, ArrowLeft, 
-  Copy, FileText, Download, Users, LogOut
+import {
+  LayoutDashboard, User, Paperclip, BarChart3, X, PieChart, Mail, Clock, ArrowLeft,
+  FileText, Download, Users, LogOut, Hash, Copy, Check, Sun, Moon, Bot, ArrowRight, Zap
 } from 'lucide-react';
 import './App.css';
+import TriageSummary from './TriageSummary';
+import ToastContainer from './Toast';
 
-const API_BASE = "http://localhost:8000/api";
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
 
 function Dashboard() {
   const navigate = useNavigate();
+  
+  // --- STATE ---
   const [emails, setEmails] = useState([]);
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('ALL');
   const [mainView, setMainView] = useState('INSIGHTS');
-  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/Jim@hfmg.net");
-  const [status, setStatus] = useState("");
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [username, setUsername] = useState("User"); // State for username
   
+  // Kept API URL in state (default hidden) in case you need to re-enable configuration later
+  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net");
+  
+  const [toasts, setToasts] = useState([]);
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [theme, setTheme] = useState(localStorage.getItem('theme') || 'dark');
   const [selectedEmail, setSelectedEmail] = useState(null);
   const [parsedThread, setParsedThread] = useState([]);
   const [threadLoading, setThreadLoading] = useState(false);
+  const [selectedBriefing, setSelectedBriefing] = useState(null); 
   const [replyDraft, setReplyDraft] = useState("");
   const [replyLoading, setReplyLoading] = useState(false);
-  const [fileModalData, setFileModalData] = useState(null); 
+  const [copySuccess, setCopySuccess] = useState(false);
+  const [fileModalData, setFileModalData] = useState(null);
 
-  // CHECK AUTH ON MOUNT
+  // --- GREETING & DATE ---
+  const [greetingInfo, setGreetingInfo] = useState({ greeting: 'Hello', date: '' });
+
+  useEffect(() => {
+    const updateTime = () => {
+      const now = new Date();
+      const hour = now.getHours();
+      let greet = 'Good Evening';
+      if (hour < 12) greet = 'Good Morning';
+      else if (hour < 18) greet = 'Good Afternoon';
+
+      const dateStr = now.toLocaleDateString('en-US', { 
+        weekday: 'long', 
+        month: 'short', 
+        day: 'numeric' 
+      }); 
+
+      setGreetingInfo({ greeting: greet, date: dateStr });
+    };
+
+    updateTime();
+    const interval = setInterval(updateTime, 60000); 
+    return () => clearInterval(interval);
+  }, []);
+
+  // --- HELPERS ---
+  const addToast = (message, type = 'info') => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, message, type }]);
+  };
+
+  const removeToast = (id) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  };
+
+  const getSafeDate = (emailObj) => {
+    if (!emailObj) return "Unknown Date";
+    const candidates = [emailObj.received, emailObj.received_at, emailObj.date, emailObj.createdDateTime, emailObj.receivedDateTime, emailObj.internalDate];
+    for (const d of candidates) { if (d && d !== "Unknown Date") return d; }
+    return "Unknown Date";
+  };
+
+  const formatDate = (dateString) => {
+    if (!dateString || dateString === "Unknown Date") return "Unknown Date";
+    try {
+      const date = new Date(dateString);
+      if (isNaN(date.getTime())) return dateString; 
+      return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    } catch (e) { return dateString; }
+  };
+
+  const getParticipantDisplay = (email) => {
+    if (email.participants && Array.isArray(email.participants) && email.participants.length > 0) {
+      return email.participants.join(', ');
+    }
+    return email.from || email.sender || "Unknown Sender";
+  };
+
+  // --- PERSISTENCE & AUTH ---
   useEffect(() => {
     const auth = localStorage.getItem("jimAuthSession");
-    if (auth !== "true") {
-      navigate("/login"); 
+    if (auth !== "true") { navigate("/login"); }
+
+    // Load cached data immediately so the screen isn't blank
+    const cached = localStorage.getItem("emailDashboardData");
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (parsed.emails && parsed.emails.length > 0) setEmails(parsed.emails);
+        if (parsed.report) setReport(parsed.report);
+      } catch (e) { console.error("Cache load error", e); }
     }
   }, [navigate]);
 
+  // --- LOAD USERNAME LOGIC ---
   useEffect(() => {
-    const savedData = localStorage.getItem("emailDashboardData");
-    if (savedData) {
-      try {
-        const parsed = JSON.parse(savedData);
-        if (parsed.emails && Array.isArray(parsed.emails)) {
-          setEmails(parsed.emails);
-          setReport(parsed.report);
-          setStatus("Loaded data from cache.");
-        }
-      } catch (e) { console.error(e); }
+    const savedUser = localStorage.getItem("loggedInUser");
+    if (savedUser) {
+      // Capitalize first letter, lowercase the rest
+      const formatted = savedUser.charAt(0).toUpperCase() + savedUser.slice(1).toLowerCase();
+      setUsername(formatted);
     }
   }, []);
 
   useEffect(() => {
-    if (Array.isArray(emails) && emails.length > 0) {
-      localStorage.setItem("emailDashboardData", JSON.stringify({ emails, report }));
-    }
-  }, [emails, report]);
+    if (theme === 'light') { document.body.classList.add('light-mode'); } 
+    else { document.body.classList.remove('light-mode'); }
+    localStorage.setItem('theme', theme);
+  }, [theme]);
 
+  // --- AUTO FETCH & ANALYZE ---
+  useEffect(() => {
+    fetchAndAnalyze();
+  }, []);
+
+  const toggleTheme = () => { setTheme(prev => prev === 'dark' ? 'light' : 'dark'); };
+
+  // --- CORE LOGIC ---
+
+  // 1. Fetch raw inbox
+  // 2. IMMEDIATELY pass that data to analysis (no waiting for state updates)
+  const fetchAndAnalyze = async () => {
+    addToast("Syncing Inbox...", "loading");
+    setLoading(true);
+    
+    try {
+      const res = await axios.get(`${API_BASE}/fetch-inbox`, { params: { url: apiUrl } });
+      
+      if (Array.isArray(res.data)) {
+        addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
+        setEmails(res.data); // Update UI with raw data temporarily
+        
+        // CHAINING: Trigger analysis immediately with the data we just got
+        await runAnalysis(res.data); 
+        
+      } else { 
+        addToast("Error: API returned unexpected format.", "error"); 
+        setLoading(false);
+      }
+    } catch (err) { 
+      addToast(`Sync Error: ${err.message}`, "error"); 
+      setLoading(false);
+    }
+  };
+
+  // Modified to accept 'emailsToAnalyze' argument
+  const runAnalysis = async (emailsToAnalyze) => {
+    // If no specific emails passed, use state (fallback)
+    const payload = emailsToAnalyze || emails;
+    
+    if (!payload || payload.length === 0) {
+        setLoading(false);
+        return;
+    }
+
+    try {
+      const res = await axios.post(`${API_BASE}/analyze`, { emails: payload });
+      
+      if (res.data.emails && Array.isArray(res.data.emails)) {
+        setEmails(res.data.emails);
+      }
+      
+      setReport(res.data.report);
+      
+      // Save for reload
+      localStorage.setItem(
+        "emailDashboardData",
+        JSON.stringify({
+          emails: res.data.emails,
+          report: res.data.report
+        })
+      );
+
+      addToast("Insights Updated!", "success");
+      setMainView('INSIGHTS'); // Switch to insights view automatically
+    } catch (err) { 
+      console.error(err); 
+      addToast("Analysis Failed. Check console.", "error"); 
+    }
+    setLoading(false);
+  };
+
+  // --- THREAD PARSING ---
   useEffect(() => {
     const fetchParsedThread = async () => {
       if (!selectedEmail) return;
       setThreadLoading(true);
-      setParsedThread([]); 
+      setParsedThread([]);
+      if (selectedEmail.messages && Array.isArray(selectedEmail.messages)) {
+        const segments = selectedEmail.messages.map((msg, idx) => ({
+          type: idx === 0 ? 'latest' : 'history',
+          header: `From: ${msg.from} | ${formatDate(getSafeDate(msg))}`,
+          content: msg.body || "" 
+        }));
+        setParsedThread(segments);
+        setThreadLoading(false);
+        return; 
+      }
       try {
         const res = await axios.post(`${API_BASE}/parse-thread`, { body: selectedEmail.body || "" });
-        setParsedThread(res.data.segments);
+        setParsedThread(res.data.segments || []);
       } catch (err) {
-        setParsedThread([{ type: 'latest', content: selectedEmail.body }]);
+        setParsedThread([{ type: 'latest', content: selectedEmail.body || "No content." }]);
       }
       setThreadLoading(false);
     };
     fetchParsedThread();
   }, [selectedEmail]);
 
-  const fetchFromApi = async () => {
-    setStatus("Syncing Inbox...");
-    try {
-      const res = await axios.get(`${API_BASE}/fetch-inbox`, { params: { url: apiUrl } });
-      if (Array.isArray(res.data)) {
-        setEmails(res.data);
-        setStatus(`Fetched ${res.data.length} emails.`);
-        setReport(null); 
-        setMainView('THREADS'); 
-      } else { setStatus("Error: API returned unexpected format."); }
-    } catch (err) { setStatus(`Error: ${err.message}`); }
-  };
-
-  const runAnalysis = async () => {
-    setLoading(true);
-    setStatus("Analyzing...");
-    try {
-      const res = await axios.post(`${API_BASE}/analyze`, { emails: emails });
-      if (res.data.emails && Array.isArray(res.data.emails)) setEmails(res.data.emails);
-      setReport(res.data.report);
-      setStatus("Analysis Complete!");
-      setMainView('INSIGHTS'); 
-    } catch (err) {
-      console.error(err);
-      setStatus("Analysis Failed.");
-    }
-    setLoading(false);
-  };
-
   const generateAiReply = async () => {
     if (!selectedEmail) return;
     setReplyLoading(true);
-    setReplyDraft(""); 
+    setReplyDraft("");
     try {
       const res = await axios.post(`${API_BASE}/reply`, {
-        email_body: selectedEmail.body || "",
+        email_body: selectedEmail.body || (selectedEmail.messages ? selectedEmail.messages[0].body : ""),
         sender: selectedEmail.from || "Unknown",
         subject: selectedEmail.subject || ""
       });
       setReplyDraft(res.data.reply);
-    } catch (err) { setStatus("Failed to generate reply."); }
+      addToast("Draft Generated!", "success");
+    } catch (err) { addToast("Failed to generate reply.", "error"); }
     setReplyLoading(false);
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("jimAuthSession");
-    window.location.href = "/login"; // Force refresh to login page
+  const handleCopy = async () => {
+    if (!replyDraft) return;
+    try { 
+      await navigator.clipboard.writeText(replyDraft); 
+      setCopySuccess(true); 
+      addToast("Copied to clipboard!", "success");
+      setTimeout(() => setCopySuccess(false), 2000); 
+    } catch (err) {}
   };
 
-  const filteredEmails = emails.filter(e => {
+  const handleLogout = () => {
+    localStorage.removeItem("jimAuthSession"); 
+    localStorage.removeItem("emailDashboardData");
+    localStorage.removeItem("loggedInUser"); // Optional: clear user on logout
+    window.location.href = "/login";
+  };
+
+  const filteredEmails = (emails || []).filter(e => {
     if (activeTab === 'ALL') return true;
     return (e.category || '').toUpperCase() === activeTab;
   });
@@ -131,67 +269,34 @@ function Dashboard() {
     setFileModalData({ title, files: safeList });
   };
 
-  const formatDate = (dateString) => {
-    if (!dateString) return "Unknown Date";
-    try {
-      const date = new Date(dateString);
-      return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    } catch (e) { return dateString; }
-  };
-
   return (
     <div className="app-container">
-      {/* SIDEBAR */}
-      <aside className={`sidebar ${isSidebarOpen ? 'open' : ''}`}>
-        <div className="brand-row">
-          <div className="brand"><LayoutDashboard size={22} color="white" /><h2>Email Dashboard</h2></div>
-          <button className="btn-icon-only" onClick={() => setIsSidebarOpen(false)}><X size={24} color="white" /></button>
-        </div>
-        <div className="sidebar-content">
-          <div className="control-section">
-            <label className="sidebar-label">DATA SOURCE</label>
-            <input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} className="input-text" />
-            <div style={{marginTop:'10px'}}>
-              <button onClick={fetchFromApi} className="btn-glass"><Zap size={16} /> Sync</button>
-            </div>
-          </div>
-          <div className="control-section">
-             <label className="sidebar-label">ACTIONS</label>
-            <button onClick={runAnalysis} disabled={loading || emails.length === 0} className="btn-gradient">
-              {loading ? 'Processing...' : '✨ Run Analysis'}
-            </button>
-            <p className="status-text">{status}</p>
-          </div>
-          <div style={{marginTop: 'auto'}}>
-            <button onClick={handleLogout} className="btn-glass btn-logout"><LogOut size={16}/> Sign Out</button>
-          </div>
-        </div>
-      </aside>
+      <ToastContainer toasts={toasts} removeToast={removeToast} />
 
-      {isSidebarOpen && <div className="overlay-backdrop" onClick={() => setIsSidebarOpen(false)}></div>}
-
-      {/* MODALS */}
-      {fileModalData && (
-        <div className="modal-overlay" onClick={() => setFileModalData(null)}>
-          <div className="modal-content file-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3><Paperclip size={18}/> {fileModalData.title}</h3>
-              <button className="btn-close" onClick={() => setFileModalData(null)}><X size={20}/></button>
+      {selectedBriefing && (
+        <>
+          <div className="slide-overlay" onClick={() => setSelectedBriefing(null)}></div>
+          <div className="slide-panel">
+            <div className="slide-header">
+              <h3 className="slide-title">Briefing Detail</h3>
+              <button className="btn-icon-only" onClick={() => setSelectedBriefing(null)}>
+                <X size={24} />
+              </button>
             </div>
-            <div className="file-list-container">
-              {fileModalData.files.length === 0 ? <div style={{textAlign:'center', padding:'40px'}}>No files found.</div> : 
-                fileModalData.files.map((f, i) => (
-                  <div key={i} className="file-row">
-                    <div className="file-icon">{f.file_name && f.file_name.endsWith('pdf') ? <FileText size={20} color="#ea580c"/> : <Paperclip size={20} color="#3b82f6"/>}</div>
-                    <div className="file-info"><div className="file-name">{f.file_name || "Unnamed"}</div><div className="file-sender">From: {f.sender || "Unknown"}</div></div>
-                    <button className="btn-glass small-btn download-btn"><Download size={14}/> Download</button>
-                  </div>
-                ))
-              }
+            <div className="slide-content">
+              <span className="slide-section-label">TOPIC</span>
+              <h2 style={{marginTop: '0', color: 'var(--text-primary)'}}>{selectedBriefing.topic}</h2>
+              <div className="divider"></div>
+              <span className="slide-section-label">AI ANALYSIS</span>
+              <p className="slide-body-text">{selectedBriefing.status}</p>
             </div>
           </div>
-        </div>
+        </>
       )}
+
+      {/* SIDEBAR REMOVED COMPLETELY */}
+
+      {fileModalData && (<div className="modal-overlay" onClick={() => setFileModalData(null)}><div className="modal-content file-modal" onClick={e => e.stopPropagation()}><div className="modal-header"><h3><Paperclip size={18} /> {fileModalData.title}</h3><button className="btn-close" onClick={() => setFileModalData(null)}><X size={20} /></button></div><div className="file-list-container">{fileModalData.files.length === 0 ? <div style={{ textAlign: 'center', padding: '40px' }}>No files found.</div> : fileModalData.files.map((f, i) => (<div key={i} className="file-row"><div className="file-icon">{f.file_name && f.file_name.endsWith('pdf') ? <FileText size={20} color="#ea580c" /> : <Paperclip size={20} color="#3b82f6" />}</div><div className="file-info"><div className="file-name">{f.file_name || "Unnamed"}</div><div className="file-sender">From: {f.sender || "Unknown"}</div></div><button className="btn-glass small-btn download-btn"><Download size={14} /> Download</button></div>))}</div></div></div>)}
 
       {selectedEmail && (
         <div className="modal-overlay" onClick={() => setSelectedEmail(null)}>
@@ -203,93 +308,196 @@ function Dashboard() {
             <div className="modal-body-scroll">
               <h2 className="modal-subject">{selectedEmail.subject}</h2>
               <div className="modal-meta-grid">
-                <div className="meta-item"><User size={16} /> <strong>From:</strong> {selectedEmail.from || selectedEmail.sender}</div>
-                <div className="meta-item"><Clock size={16} /> <strong>Received:</strong> {formatDate(selectedEmail.received_at || selectedEmail.date)}</div>
-                {(selectedEmail.cc || selectedEmail.CC) && <div className="meta-item" style={{gridColumn: '1 / -1'}}><Users size={16} /> <strong>CC:</strong> {selectedEmail.cc || selectedEmail.CC}</div>}
+                <div className="meta-item"><User size={16} /> <strong>From:</strong> {getParticipantDisplay(selectedEmail)}</div>
+                <div className="meta-item"><Clock size={16} /> <strong>Received:</strong> {formatDate(getSafeDate(selectedEmail))}</div>
+                {(selectedEmail.cc || selectedEmail.CC) && <div className="meta-item" style={{ gridColumn: '1 / -1' }}><Users size={16} /> <strong>CC:</strong> {selectedEmail.cc || selectedEmail.CC}</div>}
               </div>
               <div className="modal-summary-box"><strong>💡 AI Summary:</strong> {selectedEmail.summary}</div>
+              
               <div className="reply-section">
-                <div className="reply-header"><strong>Draft Reply</strong><button onClick={generateAiReply} disabled={replyLoading} className="btn-gradient small-btn">{replyLoading ? 'Drafting...' : '✨ Auto-Draft'}</button></div>
-                {(replyDraft || replyLoading) && <div className="reply-box">{replyLoading ? <div className="ai-thinking">Thinking...</div> : <textarea value={replyDraft} onChange={(e) => setReplyDraft(e.target.value)} className="reply-textarea"/>}</div>}
+                <div className="reply-header">
+                  <div style={{display: 'flex', alignItems: 'center', gap: '10px'}}><strong>Draft Reply</strong>{replyDraft && (<button onClick={handleCopy} className="btn-copy" title="Copy">{copySuccess ? <Check size={14} color="#10b981"/> : <Copy size={14}/>} {copySuccess ? "Copied!" : "Copy"}</button>)}</div>
+                  <button onClick={generateAiReply} disabled={replyLoading} className="btn-gradient small-btn">{replyLoading ? 'Drafting...' : '✨ Auto-Draft'}</button>
+                </div>
+                {(replyDraft || replyLoading) && (<div className="reply-box">{replyLoading ? (<div className="ai-thinking">Thinking...</div>) : (<textarea value={replyDraft} onChange={(e) => setReplyDraft(e.target.value)} className="reply-textarea" placeholder="AI will draft a reply here..." />)}</div>)}
               </div>
-              <hr className="divider"/>
-              <div className="email-thread-container">
-                 {threadLoading ? <div className="loading-text">Loading full email body...</div> : parsedThread.map((msg, idx) => (<div key={idx} className={`thread-message ${msg.type}`}>{msg.header && <div className="thread-header">{msg.header}</div>}<div className="thread-content">{msg.content.split('\n').map((l,i)=><p key={i}>{l}</p>)}</div></div>))}
-              </div>
+              <hr className="divider" />
+              {threadLoading ? <div className="loading-text">Loading content...</div> : (
+                <div className="email-thread-container">
+                  {parsedThread.length > 1 ? (
+                    <>
+                      <div style={{marginBottom: '10px', fontSize: '1rem', fontWeight: '700', color: '#1e1b4b'}}>
+                        <Hash size={16} style={{display:'inline', marginRight:'5px'}}/> Conversation History ({parsedThread.length})
+                      </div>
+                      {parsedThread.map((msg, idx) => (
+                        <div key={idx} className={`thread-message ${msg.type}`}>
+                          {msg.header && <div className="thread-header">{msg.header}</div>}
+                          <div className="thread-content">{msg.content.split('\n').map((l, i) => <p key={i}>{l}</p>)}</div>
+                        </div>
+                      ))}
+                    </>
+                  ) : (
+                    <div className="single-email-body">
+                      {parsedThread.map((msg, idx) => (
+                        <div key={idx} className="email-body-text">
+                            {msg.content.split('\n').map((l, i) => <p key={i}>{l}</p>)}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {/* MAIN CONTENT */}
       <main className="main-content">
         <header className="top-bar">
           <div className="top-left">
-            <button className="menu-btn" onClick={() => setIsSidebarOpen(true)}><Menu size={24} color="#374151" /></button>
-            <div className="view-switcher">
+            {/* Added a discrete refresh button here since sidebar is gone */}
+            <button className="menu-btn" onClick={fetchAndAnalyze} title="Refresh Inbox"><Zap size={20} color="#374151" /></button>
+            
+            <div className="brand" style={{marginLeft: '15px'}}>
+              <div className="logo-box">
+                <LayoutDashboard size={20} color="white" />
+              </div>
+              <div className="brand-info">
+                <h2>Email Intelligent</h2>
+                <span className="brand-tag">AI HUB</span>
+              </div>
+            </div>
+            <div className="view-switcher" style={{marginLeft: '30px'}}>
               <button className={`view-btn ${mainView === 'INSIGHTS' ? 'active' : ''}`} onClick={() => setMainView('INSIGHTS')}><PieChart size={18} /> Insights</button>
               <button className={`view-btn ${mainView === 'THREADS' ? 'active' : ''}`} onClick={() => setMainView('THREADS')}><Mail size={18} /> Inbox</button>
             </div>
+            <button className="menu-btn" style={{marginLeft: '15px', border: '1px solid var(--border-color)', background: 'var(--bg-card)'}} onClick={toggleTheme} title="Toggle Theme">
+              {theme === 'dark' ? <Sun size={20} color="#fbbf24" /> : <Moon size={20} color="#64748b" />}
+            </button>
           </div>
-          <div className="user-profile"><span className="welcome-text">Jim Olver-Goshen</span><div className="avatar">JO</div></div>
+          
+          <div className="user-profile" onClick={() => setIsProfileOpen(!isProfileOpen)}>
+            <div className="user-info" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginRight: '10px' }}>
+              {/* UPDATED GREETING TO USE DYNAMIC USERNAME */}
+              <span className="welcome-text" style={{ fontSize: '1.3rem', fontWeight: '700', letterSpacing: '-0.5px' }}>
+                {greetingInfo.greeting}, {username}
+              </span>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px', fontWeight: '500' }}>
+                {greetingInfo.date}
+              </span>
+            </div>
+            <div className="avatar">JO</div>
+            {isProfileOpen && (<div className="profile-dropdown"><button onClick={handleLogout} className="dropdown-item text-red"><LogOut size={16} /> Sign Out</button></div>)}
+          </div>
         </header>
 
-        {mainView === 'INSIGHTS' && (
-          <div className="dashboard-grid">
-            <div className="col-left">
-              <div className="section-title"><BarChart3 size={20} /> Sender Analysis</div>
-              {!report ? <div className="empty-placeholder">Run analysis to see stats.</div> : (
-                <div className="sender-list-grid">
-                  {report.sender_analysis.map((s, i) => (
-                    <div key={i} className="sender-card-large">
-                      <div className="sender-top"><div className="avatar-small">{s.name.charAt(0)}</div><div><strong>{s.name}</strong><div className="role-pill">{s.role_guess}</div></div></div>
-                      <p className="sender-desc">{s.summary}</p>
-                      <div className="sender-stats-row">
-                        <div className="stat-box"><span className="stat-num">{s.email_count}</span><span className="stat-label">Emails</span></div>
-                        <div className={`stat-box ${s.attachment_count > 0 ? 'clickable-stat' : ''}`} onClick={() => openFiles(`${s.name}'s Files`, s.file_list)} style={{cursor: 'pointer'}}>
-                          <span className="stat-num">{s.attachment_count || 0}</span><span className="stat-label">Files {s.attachment_count > 0 && <Paperclip size={10}/>}</span>
+        {loading ? (
+          <div className="ai-loading-container">
+            <div className="ai-loading-content">
+              <Bot size={80} className="loading-spinner" color="#00f3ff" />
+              <h2 className="loading-title">AI is getting your inbox ready...</h2>
+              <p className="loading-subtitle">Analyzing conversations, detecting priority, and drafting briefs.</p>
+            </div>
+          </div>
+        ) : (
+          <>
+            {mainView === 'INSIGHTS' && (
+              <div className="dashboard-grid">
+                
+                {/* --- LEFT COLUMN --- */}
+                <div className="col-left">
+                  
+                  {/* TRIAGE SUMMARY WIDGET */}
+                  <TriageSummary stats={report?.triage_stats} />
+
+                  <div className="section-title"><Hash size={20} /> 🧵 Ai thread summaries</div>
+                  {!report ? <div className="empty-placeholder">Run analysis first.</div> : (
+                    <div className="thread-summary-large">
+                      <div className="ts-hero"><h1>Executive Summary</h1>{report.all_thread_files && report.all_thread_files.length > 0 && <button className="btn-glass mt-2" onClick={() => openFiles("All Project Files", report.all_thread_files)}><Paperclip size={16} /> View All {report.all_thread_files.length} Files</button>}</div>
+                      <div className="ts-content">
+                        {(report.briefing_cards || []).length > 0 ? (
+                          <div style={{display: 'flex', flexDirection: 'column', gap: '15px'}}>
+                            {report.briefing_cards.map((card, idx) => (
+                              <div key={idx} className="briefing-card-row" onClick={() => setSelectedBriefing(card)} title="Click to view details">
+                                <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                                  <div className="briefing-topic">{card.topic}</div>
+                                  <ArrowRight size={16} color="var(--accent-blue)" />
+                                </div>
+                                <div className="briefing-status">{card.status}</div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (<p className="no-summary-text">{report.thread_summary || "No executive summary available."}</p>)}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* --- RIGHT COLUMN --- */}
+                <div className="col-right">
+                  <div className="section-title"><BarChart3 size={20} /> 📧 Individual Emails Summaries</div>
+                  {!report ? <div className="empty-placeholder">Run analysis to see stats.</div> : (
+                    <div className="sender-list-grid">
+                      {(report.sender_summaries || []).map((s, i) => (
+                        <div key={i} className="sender-card-large">
+                          <div className="sender-top">
+                            <div className="avatar-small">{s.name.charAt(0)}</div>
+                            <div><strong>{s.name}</strong></div>
+                          </div>
+                          <p className="sender-desc">{s.summary}</p>
+                          <div className="sender-stats-row">
+                            <div className="stat-box">
+                              <span className="stat-num">{s.count || 0}</span>
+                              <span className="stat-label">Emails</span>
+                            </div>
+                            <div 
+                              className="stat-box clickable-stat" 
+                              onClick={() => openFiles(`${s.name}'s Files`, s.file_list)} 
+                              style={{ cursor: 'pointer' }}
+                            >
+                              <span className="stat-num">{s.attachments || 0}</span>
+                              <span className="stat-label">Files <Paperclip size={10} /></span>
+                            </div>
+                          </div>
                         </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+              </div>
+            )}
+            {mainView === 'THREADS' && (
+              <div className="feed-container">
+                <div className="tabs-container">
+                  {['ALL', 'PRIORITY', 'URGENT', 'CONFIDENTIAL', 'MEETING', 'NEWSLETTER'].map(tab => (
+                    <button key={tab} className={`tab-btn ${activeTab === tab ? 'active' : ''} ${tab.toLowerCase()}`} onClick={() => setActiveTab(tab)}>
+                      {tab} <span className={`count-badge badge-${tab.toLowerCase()}`}>{emails.filter(e => (e.category || 'NORMAL').toUpperCase() === tab || tab === 'ALL').length}</span>
+                    </button>
+                  ))}
+                </div>
+                <div className="email-feed">
+                  {filteredEmails.map((email, idx) => (
+                    <div key={idx} className={`email-card border-${(email.category || 'normal').toLowerCase()}`} onClick={() => setSelectedEmail(email)}>
+                      <div className="ec-left-border"></div>
+                      <div className="ec-content">
+                        <div className="ec-top"><h4>{email.subject || "No Subject"}</h4><div className="ec-badges"><span className={`cat-tag ${(email.category || 'NORMAL').toLowerCase()}`}>{email.category || 'PENDING'}</span></div></div>
+                        <div className="ec-meta">
+                          <span title={getParticipantDisplay(email)} style={{maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                            <User size={14} /> {getParticipantDisplay(email)}
+                          </span>
+                          <span><Clock size={14} /> {formatDate(getSafeDate(email))}</span>
+                          {(email.cc || email.CC) && <span className="cc-badge"><Users size={12} /> CC</span>}
+                        </div>
+                        <div className="ec-body">{email.summary || "Pending analysis..."}</div>
+                        {(email.attachments && email.attachments.length > 0) && <div className="ec-atts"><Paperclip size={14} />{email.attachments.map((a, k) => <span key={k} className="att-file">{a.file_name}</span>)}</div>}
                       </div>
                     </div>
                   ))}
                 </div>
-              )}
-            </div>
-            <div className="col-right">
-              <div className="section-title"><Hash size={20} /> Thread Summary</div>
-              {!report ? <div className="empty-placeholder">Run analysis first.</div> : (
-                <div className="thread-summary-large">
-                  <div className="ts-hero"><h1>{report.thread_title || "Executive Summary"}</h1>{report.all_thread_files && report.all_thread_files.length > 0 && <button className="btn-glass mt-2" onClick={() => openFiles("All Project Files", report.all_thread_files)}><Paperclip size={16}/> View All {report.all_thread_files.length} Files</button>}</div>
-                  <div className="ts-content"><p>{report.thread_summary}</p></div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {mainView === 'THREADS' && (
-          <div className="feed-container">
-            <div className="tabs-container">
-              {['ALL', 'URGENT', 'CONFIDENTIAL', 'MEETING'].map(tab => (
-                <button key={tab} className={`tab-btn ${activeTab === tab ? 'active' : ''} ${tab.toLowerCase()}`} onClick={() => setActiveTab(tab)}>
-                  {tab} <span className={`count-badge badge-${tab.toLowerCase()}`}>{emails.filter(e => (e.category || 'NORMAL').toUpperCase() === tab || tab === 'ALL').length}</span>
-                </button>
-              ))}
-            </div>
-            <div className="email-feed">
-              {filteredEmails.map((email, idx) => (
-                <div key={idx} className={`email-card border-${(email.category || 'normal').toLowerCase()}`} onClick={() => setSelectedEmail(email)}>
-                  <div className="ec-left-border"></div>
-                  <div className="ec-content">
-                    <div className="ec-top"><h4>{email.subject || "No Subject"}</h4><div className="ec-badges"><span className={`cat-tag ${(email.category || 'NORMAL').toLowerCase()}`}>{email.category || 'PENDING'}</span></div></div>
-                    <div className="ec-meta"><span><User size={14}/> {email.from || email.sender}</span><span><Clock size={14}/> {formatDate(email.received_at || email.date)}</span>{(email.cc || email.CC) && <span className="cc-badge"><Users size={12}/> CC</span>}</div>
-                    <div className="ec-body">{email.summary || "Pending analysis..."}</div>
-                    {(email.attachments && email.attachments.length > 0) && <div className="ec-atts"><Paperclip size={14} />{email.attachments.map((a, k) => <span key={k} className="att-file">{a.file_name}</span>)}</div>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
+              </div>
+            )}
+          </>
         )}
       </main>
     </div>
