@@ -20,10 +20,10 @@ function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('ALL');
   const [mainView, setMainView] = useState('INSIGHTS');
-  const [username, setUsername] = useState("User"); // State for username
+  const [username, setUsername] = useState("User"); 
   
-  // Kept API URL in state (default hidden) in case you need to re-enable configuration later
-  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net");
+  // Kept API URL in state
+  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count20");
   
   const [toasts, setToasts] = useState([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -36,6 +36,14 @@ function Dashboard() {
   const [replyLoading, setReplyLoading] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
   const [fileModalData, setFileModalData] = useState(null);
+
+  // Separate real threads and single emails
+  const realThreads = (emails || []).filter(e => 
+    Array.isArray(e.messages) && e.messages.length > 1
+  );
+  const singleEmails = (emails || []).filter(e => 
+    !Array.isArray(e.messages) || e.messages.length === 1
+  );
 
   // --- GREETING & DATE ---
   const [greetingInfo, setGreetingInfo] = useState({ greeting: 'Hello', date: '' });
@@ -100,7 +108,6 @@ function Dashboard() {
     const auth = localStorage.getItem("jimAuthSession");
     if (auth !== "true") { navigate("/login"); }
 
-    // Load cached data immediately so the screen isn't blank
     const cached = localStorage.getItem("emailDashboardData");
     if (cached) {
       try {
@@ -115,7 +122,6 @@ function Dashboard() {
   useEffect(() => {
     const savedUser = localStorage.getItem("loggedInUser");
     if (savedUser) {
-      // Capitalize first letter, lowercase the rest
       const formatted = savedUser.charAt(0).toUpperCase() + savedUser.slice(1).toLowerCase();
       setUsername(formatted);
     }
@@ -135,9 +141,6 @@ function Dashboard() {
   const toggleTheme = () => { setTheme(prev => prev === 'dark' ? 'light' : 'dark'); };
 
   // --- CORE LOGIC ---
-
-  // 1. Fetch raw inbox
-  // 2. IMMEDIATELY pass that data to analysis (no waiting for state updates)
   const fetchAndAnalyze = async () => {
     addToast("Syncing Inbox...", "loading");
     setLoading(true);
@@ -147,11 +150,8 @@ function Dashboard() {
       
       if (Array.isArray(res.data)) {
         addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
-        setEmails(res.data); // Update UI with raw data temporarily
-        
-        // CHAINING: Trigger analysis immediately with the data we just got
+        setEmails(res.data); 
         await runAnalysis(res.data); 
-        
       } else { 
         addToast("Error: API returned unexpected format.", "error"); 
         setLoading(false);
@@ -162,9 +162,7 @@ function Dashboard() {
     }
   };
 
-  // Modified to accept 'emailsToAnalyze' argument
   const runAnalysis = async (emailsToAnalyze) => {
-    // If no specific emails passed, use state (fallback)
     const payload = emailsToAnalyze || emails;
     
     if (!payload || payload.length === 0) {
@@ -181,7 +179,6 @@ function Dashboard() {
       
       setReport(res.data.report);
       
-      // Save for reload
       localStorage.setItem(
         "emailDashboardData",
         JSON.stringify({
@@ -191,7 +188,7 @@ function Dashboard() {
       );
 
       addToast("Insights Updated!", "success");
-      setMainView('INSIGHTS'); // Switch to insights view automatically
+      setMainView('INSIGHTS'); 
     } catch (err) { 
       console.error(err); 
       addToast("Analysis Failed. Check console.", "error"); 
@@ -255,7 +252,7 @@ function Dashboard() {
   const handleLogout = () => {
     localStorage.removeItem("jimAuthSession"); 
     localStorage.removeItem("emailDashboardData");
-    localStorage.removeItem("loggedInUser"); // Optional: clear user on logout
+    localStorage.removeItem("loggedInUser");
     window.location.href = "/login";
   };
 
@@ -273,30 +270,56 @@ function Dashboard() {
     <div className="app-container">
       <ToastContainer toasts={toasts} removeToast={removeToast} />
 
-      {selectedBriefing && (
-        <>
-          <div className="slide-overlay" onClick={() => setSelectedBriefing(null)}></div>
-          <div className="slide-panel">
-            <div className="slide-header">
-              <h3 className="slide-title">Briefing Detail</h3>
-              <button className="btn-icon-only" onClick={() => setSelectedBriefing(null)}>
-                <X size={24} />
-              </button>
+      {fileModalData && (
+        <div className="modal-overlay" onClick={() => setFileModalData(null)}>
+          <div className="modal-content file-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3><Paperclip size={18} /> {fileModalData.title}</h3>
+              <button className="btn-close" onClick={() => setFileModalData(null)}><X size={20} /></button>
             </div>
-            <div className="slide-content">
-              <span className="slide-section-label">TOPIC</span>
-              <h2 style={{marginTop: '0', color: 'var(--text-primary)'}}>{selectedBriefing.topic}</h2>
-              <div className="divider"></div>
-              <span className="slide-section-label">AI ANALYSIS</span>
-              <p className="slide-body-text">{selectedBriefing.status}</p>
+            <div className="file-list-container">
+              {fileModalData.files.length === 0 ? <div style={{ textAlign: 'center', padding: '40px' }}>No files found.</div> : fileModalData.files.map((f, i) => (
+                <div key={i} className="file-row">
+                  <div className="file-icon">
+                    {f.name && f.name.toLowerCase().endsWith('.pdf') ? (
+                      <FileText size={20} color="#ea580c" />
+                    ) : (
+                      <Paperclip size={20} color="#3b82f6" />
+                    )}
+                  </div>
+                  <div className="file-info">
+                    <div className="file-name">{f.name || "Unnamed"}</div>
+                    <div className="file-sender">Type: {f.type || "Unknown"}</div>
+                  </div>
+                  <button
+                    className="btn-glass small-btn download-btn"
+                    onClick={async () => {
+                      try {
+                        const res = await axios.post(
+                          `${API_BASE}/download`,
+                          { name: f.name, hash: f.hash, type: f.type },
+                          { responseType: "blob" }
+                        );
+                        const url = window.URL.createObjectURL(new Blob([res.data]));
+                        const link = document.createElement("a");
+                        link.href = url;
+                        link.setAttribute("download", f.name);
+                        document.body.appendChild(link);
+                        link.click();
+                        link.remove();
+                      } catch (err) {
+                        addToast("Download failed", "error");
+                      }
+                    }}
+                  >
+                    <Download size={14} /> Download
+                  </button>
+                </div>
+              ))}
             </div>
           </div>
-        </>
+        </div>
       )}
-
-      {/* SIDEBAR REMOVED COMPLETELY */}
-
-      {fileModalData && (<div className="modal-overlay" onClick={() => setFileModalData(null)}><div className="modal-content file-modal" onClick={e => e.stopPropagation()}><div className="modal-header"><h3><Paperclip size={18} /> {fileModalData.title}</h3><button className="btn-close" onClick={() => setFileModalData(null)}><X size={20} /></button></div><div className="file-list-container">{fileModalData.files.length === 0 ? <div style={{ textAlign: 'center', padding: '40px' }}>No files found.</div> : fileModalData.files.map((f, i) => (<div key={i} className="file-row"><div className="file-icon">{f.file_name && f.file_name.endsWith('pdf') ? <FileText size={20} color="#ea580c" /> : <Paperclip size={20} color="#3b82f6" />}</div><div className="file-info"><div className="file-name">{f.file_name || "Unnamed"}</div><div className="file-sender">From: {f.sender || "Unknown"}</div></div><button className="btn-glass small-btn download-btn"><Download size={14} /> Download</button></div>))}</div></div></div>)}
 
       {selectedEmail && (
         <div className="modal-overlay" onClick={() => setSelectedEmail(null)}>
@@ -355,17 +378,10 @@ function Dashboard() {
       <main className="main-content">
         <header className="top-bar">
           <div className="top-left">
-            {/* Added a discrete refresh button here since sidebar is gone */}
             <button className="menu-btn" onClick={fetchAndAnalyze} title="Refresh Inbox"><Zap size={20} color="#374151" /></button>
-            
             <div className="brand" style={{marginLeft: '15px'}}>
-              <div className="logo-box">
-                <LayoutDashboard size={20} color="white" />
-              </div>
-              <div className="brand-info">
-                <h2>Email Intelligent</h2>
-                <span className="brand-tag">AI HUB</span>
-              </div>
+              <div className="logo-box"><LayoutDashboard size={20} color="white" /></div>
+              <div className="brand-info"><h2>Email Intelligent</h2><span className="brand-tag">AI HUB</span></div>
             </div>
             <div className="view-switcher" style={{marginLeft: '30px'}}>
               <button className={`view-btn ${mainView === 'INSIGHTS' ? 'active' : ''}`} onClick={() => setMainView('INSIGHTS')}><PieChart size={18} /> Insights</button>
@@ -378,13 +394,8 @@ function Dashboard() {
           
           <div className="user-profile" onClick={() => setIsProfileOpen(!isProfileOpen)}>
             <div className="user-info" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginRight: '10px' }}>
-              {/* UPDATED GREETING TO USE DYNAMIC USERNAME */}
-              <span className="welcome-text" style={{ fontSize: '1.3rem', fontWeight: '700', letterSpacing: '-0.5px' }}>
-                {greetingInfo.greeting}, {username}
-              </span>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px', fontWeight: '500' }}>
-                {greetingInfo.date}
-              </span>
+              <span className="welcome-text" style={{ fontSize: '1.3rem', fontWeight: '700', letterSpacing: '-0.5px' }}>{greetingInfo.greeting}, {username}</span>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px', fontWeight: '500' }}>{greetingInfo.date}</span>
             </div>
             <div className="avatar">JO</div>
             {isProfileOpen && (<div className="profile-dropdown"><button onClick={handleLogout} className="dropdown-item text-red"><LogOut size={16} /> Sign Out</button></div>)}
@@ -406,9 +417,7 @@ function Dashboard() {
                 
                 {/* --- LEFT COLUMN --- */}
                 <div className="col-left">
-                  
-                  {/* TRIAGE SUMMARY WIDGET */}
-                  <TriageSummary stats={report?.triage_stats} />
+                  <TriageSummary stats={report?.triage_stats} realThreads={realThreads} emails={emails} />
 
                   <div className="section-title"><Hash size={20} /> 🧵 Ai thread summaries</div>
                   {!report ? <div className="empty-placeholder">Run analysis first.</div> : (
@@ -417,15 +426,29 @@ function Dashboard() {
                       <div className="ts-content">
                         {(report.briefing_cards || []).length > 0 ? (
                           <div style={{display: 'flex', flexDirection: 'column', gap: '15px'}}>
-                            {report.briefing_cards.map((card, idx) => (
-                              <div key={idx} className="briefing-card-row" onClick={() => setSelectedBriefing(card)} title="Click to view details">
-                                <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
-                                  <div className="briefing-topic">{card.topic}</div>
-                                  <ArrowRight size={16} color="var(--accent-blue)" />
-                                </div>
-                                <div className="briefing-status">{card.status}</div>
-                              </div>
-                            ))}
+                            
+                            {/* STEP 2: Make thread cards open the Standard Email Modal */}
+                            {report.briefing_cards.map((card, idx) => {
+                                // Since we know emails[] corresponds 1:1 with tasks (and thus cards),
+                                // we can grab the email object directly by index.
+                                const threadEmail = emails[idx];
+
+                                return (
+                                  <div 
+                                    key={idx} 
+                                    className="briefing-card-row"
+                                    onClick={() => threadEmail && setSelectedEmail(threadEmail)}
+                                    style={{ cursor: "pointer" }}
+                                    title="Click to view full conversation"
+                                  >
+                                    <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                                      <div className="briefing-topic">{card.topic}</div>
+                                      <ArrowRight size={16} color="var(--accent-blue)" />
+                                    </div>
+                                    <div className="briefing-status">{card.status}</div>
+                                  </div>
+                                );
+                            })}
                           </div>
                         ) : (<p className="no-summary-text">{report.thread_summary || "No executive summary available."}</p>)}
                       </div>
@@ -438,29 +461,42 @@ function Dashboard() {
                   <div className="section-title"><BarChart3 size={20} /> 📧 Individual Emails Summaries</div>
                   {!report ? <div className="empty-placeholder">Run analysis to see stats.</div> : (
                     <div className="sender-list-grid">
-                      {(report.sender_summaries || []).map((s, i) => (
-                        <div key={i} className="sender-card-large">
-                          <div className="sender-top">
-                            <div className="avatar-small">{s.name.charAt(0)}</div>
-                            <div><strong>{s.name}</strong></div>
-                          </div>
-                          <p className="sender-desc">{s.summary}</p>
-                          <div className="sender-stats-row">
-                            <div className="stat-box">
-                              <span className="stat-num">{s.count || 0}</span>
-                              <span className="stat-label">Emails</span>
+                      {(report.sender_summaries || []).map((s, i) => {
+                        const senderFiles = [];
+                        emails.forEach(e => {
+                          (e.messages || []).forEach(m => {
+                            if (Array.isArray(m.attachments)) {
+                              senderFiles.push(...m.attachments);
+                            }
+                          });
+                        });
+                        
+                        return (
+                          <div key={i} className="sender-card-large">
+                            <div className="sender-top">
+                              <div className="avatar-small">{s.name.charAt(0)}</div>
+                              <div><strong>{s.name}</strong></div>
                             </div>
-                            <div 
-                              className="stat-box clickable-stat" 
-                              onClick={() => openFiles(`${s.name}'s Files`, s.file_list)} 
-                              style={{ cursor: 'pointer' }}
-                            >
-                              <span className="stat-num">{s.attachments || 0}</span>
-                              <span className="stat-label">Files <Paperclip size={10} /></span>
+                            <p className="sender-desc">{s.summary}</p>
+                            <div className="sender-stats-row">
+                              <div className="stat-box">
+                                <span className="stat-num">{s.count || 0}</span>
+                                <span className="stat-label">Emails</span>
+                              </div>
+                              <div 
+                                className="stat-box clickable-stat" 
+                                onClick={() => {
+                                  openFiles(`${s.name}'s Files`, senderFiles);
+                                }}
+                                style={{ cursor: 'pointer' }}
+                              >
+                                <span className="stat-num">{senderFiles.length}</span>
+                                <span className="stat-label">Files <Paperclip size={10} /></span>
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>

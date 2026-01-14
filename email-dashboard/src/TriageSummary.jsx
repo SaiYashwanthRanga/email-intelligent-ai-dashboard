@@ -32,7 +32,7 @@ const CountUp = ({ end, duration = 1500 }) => {
   return <span>{count}</span>;
 };
 
-const TriageSummary = ({ stats }) => {
+const TriageSummary = ({ stats, realThreads, emails }) => {
   if (!stats) return null;
 
   const { 
@@ -64,7 +64,7 @@ const TriageSummary = ({ stats }) => {
       <div className="triage-metric-block">
         <span className="triage-label">THREADS</span>
         <span className="triage-number">
-          <CountUp end={vol_threads} />
+          <CountUp end={realThreads?.length || 0} />
         </span>
       </div>
 

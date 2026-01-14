@@ -2,10 +2,12 @@ import os
 import json
 import re
 import asyncio
-from collections import defaultdict
+import hashlib
+import html
+from collections import defaultdict, Counter
+from datetime import datetime
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from collections import defaultdict, Counter
 
 # 1. SETUP AI CLIENT
 load_dotenv()
@@ -18,6 +20,25 @@ if not api_key:
 client = AsyncOpenAI(api_key=api_key)
 CACHE_FILE = "db_cache.json"
 VIP_FILE = "vip_list.json"
+
+# --- NEW: DATA NORMALIZATION ---
+def normalize_email(e: dict):
+    return {
+        "id": e.get("id") or e.get("_id") or e.get("messageId") or "mail",
+        "subject": e.get("subject", "No Subject"),
+        "from": e.get("from") or e.get("sender") or e.get("email") or "Unknown",
+        "to": e.get("to", []),
+        "cc": e.get("cc", []),
+        "body": str(e.get("body") or e.get("content") or e.get("text") or ""),
+        "received_at": (
+            e.get("receivedDateTime") or 
+            e.get("received_at") or 
+            e.get("received") or 
+            e.get("date") or 
+            "1970-01-01T00:00:00"
+        ),
+        "attachments": e.get("attachments", [])
+    }
 
 # --- CONFIGURATION: PRIORITY SENDERS ---
 def load_vip_list():
@@ -49,139 +70,210 @@ def save_cache(new_data):
 # --- LEVEL 3: TIMESTAMP & REPORT CACHING ---
 TIMESTAMP_KEY = "meta_last_processed_timestamp"
 REPORT_KEY = "meta_last_full_report"
-EMAILS_KEY = "meta_last_enriched_emails"  # <--- NEW KEY
+EMAILS_KEY = "meta_last_enriched_emails"
 
 def get_last_processed_timestamp():
-    """Retrieves the timestamp of the newest email from the last successful analysis."""
     cache = load_cache()
     return cache.get(TIMESTAMP_KEY)
 
 def set_last_processed_timestamp(ts):
-    """Updates the timestamp after a successful analysis."""
     save_cache({TIMESTAMP_KEY: ts})
 
 def get_cached_report():
-    """Retrieves the full previous report to serve instantly if no new mails arrive."""
     cache = load_cache()
     return cache.get(REPORT_KEY)
 
 def save_cached_report(report):
-    """Saves the report so we can serve it next time if nothing changed."""
     save_cache({REPORT_KEY: report})
 
 def get_cached_emails():
-    """Retrieves the fully analyzed email list from the last run."""
     cache = load_cache()
     return cache.get(EMAILS_KEY)
 
 def save_cached_emails(emails):
-    """Saves the analyzed email list."""
     save_cache({EMAILS_KEY: emails})
 
 # --- HELPER FUNCTIONS ---
 
+def body_hash(text):
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+
 def group_emails_by_subject(emails):
     groups = defaultdict(list)
     GENERIC_SUBJECTS = ["no subject", "hi", "hello", "update", "meeting", "question", "info", "query", "status"]
-    
-    for e in emails:
-        if 'thread_count' in e: continue 
 
-        subject = e.get('subject', 'No Subject')
-        sender = e.get('from') or e.get('sender') or "Unknown"
+    for e in emails:
+        if 'thread_count' in e: continue
+
+        subject = e.get('subject', 'No Subject').strip()
+        sender = e.get('from') or "Unknown"
+        body = e.get("body", "")
+
         clean_subj = re.sub(r'^(re|fwd|fw|aw):\s*', '', subject, flags=re.IGNORECASE).strip()
         is_generic = clean_subj.lower() in GENERIC_SUBJECTS or len(clean_subj) < 3
-        key = f"{clean_subj}::{sender}" if is_generic else clean_subj
+
+        key = f"{clean_subj}::{body_hash(body)}"
         groups[key].append(e)
+
     return groups
 
 # --- ROBUST THREAD SPLITTER LOGIC ---
-def split_reply_chain(body, main_sender, main_date):
-    """
-    Intelligently splits a raw email body into separate messages 
-    by looking for Outlook/Gmail reply headers.
-    """
-    if not body: return []
+# STEP 3: Updated signature
+def split_reply_chain(body, main_sender, main_date, attachments=None):
+    if not body:
+        return []
 
-    # Clean up HTML entities
-    body = body.replace("&nbsp;", " ")
+    # 1. Decode HTML entities
+    body = html.unescape(body)
 
-    # Regex to find "From: ... Sent: ... To: ... Subject: ..." patterns
-    split_pattern = r"(?:From:\s+.*?\s+Sent:\s+.*?\d{4}.*?\s+To:\s+.*?\s+Subject:\s+[^\n]*)"
-    
-    parts = re.split(f"({split_pattern})", body, flags=re.IGNORECASE | re.DOTALL)
-    
-    cleaned_messages = []
-    
-    # 1. The first part is ALWAYS the Latest Message
-    latest_content = parts[0].strip()
-    if latest_content:
-        cleaned_messages.append({
+    # 2. Clean Outlook junk
+    body = re.sub(r"\s*&nbsp;\s*", "\n", body)
+    body = re.sub(r"\n{2,}", "\n\n", body).strip()
+
+    # 3. Regex pattern
+    pattern = re.compile(
+        r"(From:\s.*?\nSent:\s.*?\nTo:\s.*?\n(?:Cc:\s.*?\n)?Subject:\s.*?\n)",
+        re.IGNORECASE | re.DOTALL
+    )
+
+    parts = pattern.split(body)
+    messages = []
+
+    # First block = latest reply
+    latest_body = parts[0].strip()
+    if latest_body:
+        # STEP 4: Attachments go ONLY to the latest message
+        messages.append({
             "from": main_sender,
             "date": main_date,
-            "body": latest_content,
-            "attachments": [] 
+            "body": latest_body,
+            "attachments": attachments or []
         })
 
-    # 2. Process the history parts
+    # Other blocks = history (no attachments)
     for i in range(1, len(parts), 2):
         header = parts[i]
-        content = parts[i+1] if i+1 < len(parts) else ""
-        
-        from_match = re.search(r"From:\s+(.*?)(?:\n|\r|$)", header)
-        sent_match = re.search(r"Sent:\s+(.*?)(?:\n|\r|$)", header)
-        
-        hist_sender = from_match.group(1).strip() if from_match else "Unknown"
-        hist_date = sent_match.group(1).strip() if sent_match else "Previous Message"
-        
-        cleaned_messages.append({
-            "from": hist_sender,
-            "date": hist_date,
+        content = parts[i + 1] if i + 1 < len(parts) else ""
+
+        from_match = re.search(r"From:\s*(.*)", header, re.IGNORECASE)
+        sent_match = re.search(r"Sent:\s*(.*)", header, re.IGNORECASE)
+
+        sender = from_match.group(1).strip() if from_match else "Unknown"
+        date = sent_match.group(1).strip() if sent_match else "Unknown"
+
+        messages.append({
+            "from": sender,
+            "date": date,
             "body": content.strip(),
             "attachments": []
         })
-        
-    return cleaned_messages
+
+    return messages
+
+# --- NEW: DETECT REAL THREADS ---
+def detect_real_threads(emails):
+    threads = []
+    singles = []
+
+    for e in emails:
+        body = str(e.get("body") or "")
+        sender = e.get("from") or "Unknown"
+        date = e.get("received_at") or e.get("date") or "Unknown"
+        attachments = e.get("attachments", [])
+
+        # Try splitting the body
+        split_messages = split_reply_chain(body, sender, date, attachments)
+
+        # If more than 1 message found → this is a real thread
+        if len(split_messages) > 1:
+            e["__is_thread__"] = True
+            threads.append(e)
+        else:
+            e["__is_thread__"] = False
+            singles.append(e)
+
+    return threads, singles
 
 # --- AI CORE FUNCTIONS ---
 
+async def analyze_single_email(email):
+    body = email.get("body", "")
+    subject = email.get("subject", "No Subject")
+    sender = email.get("from", "Unknown")
+    received = email.get("received_at", "Unknown")
+
+    prompt = f"""
+    Analyze this email:
+    SUBJECT: {subject}
+    FROM: {sender}
+    BODY: {body}
+
+    TASK:
+    - Categorize (URGENT / MEETING / NEWSLETTER / NORMAL / PRIORITY)
+    - Give a short executive summary (1 line)
+    - Give an action (REVIEW / RESPOND / IGNORE / SCHEDULE)
+
+    OUTPUT JSON:
+    {{
+      "category": "...",
+      "priority": 1-5,
+      "summary": "...",
+      "action": "..."
+    }}
+    """
+
+    try:
+        response = await client.chat.completions.create(
+            model=ACTIVE_MODEL,
+            messages=[
+                {"role": "system", "content": "Output JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+
+        result = json.loads(response.choices[0].message.content)
+
+        # Merge AI result into original email (without making it a thread)
+        email["category"] = result.get("category", "NORMAL")
+        email["priority"] = result.get("priority", 1)
+        email["summary"] = result.get("summary", "No summary")
+        email["action"] = result.get("action", "REVIEW")
+
+        return email
+
+    except Exception as e:
+        print("Single mail analysis failed:", e)
+        email["category"] = "NORMAL"
+        email["summary"] = "Pending analysis"
+        return email
+
 async def generate_sender_report(emails):
     print("🔹 Jarvis Generating Sender Summaries...")
-    
     sender_groups = defaultdict(list)
     for e in emails:
         if 'thread_count' in e: continue
         sender = e.get('from') or e.get('sender') or "Unknown"
-        
         if "<" in sender:
             simple_name = sender.split("<")[1].strip(">").lower()
         else:
             simple_name = sender.strip().lower()
-            
         sender_groups[simple_name].append(e)
     
     top_senders = sorted(sender_groups.items(), key=lambda x: len(x[1]), reverse=True)[:7]
     if not top_senders: return []
 
-    # 1. PREPARE STRUCTURED INPUT
     senders_input = []
     for name, msgs in top_senders:
         details = " | ".join([f"Subject: {m.get('subject')} (Body: {str(m.get('body'))[:100]}...)" for m in msgs[:3]])
         senders_input.append({ "id": name, "content": details })
         
-    # 2. ROBUST PROMPT WITH ID MATCHING
     prompt = f"""
     Analyze these email senders and their content.
     INPUT JSON: {json.dumps(senders_input)}
-    
-    TASK:
-    Return a JSON object with a "summaries" list.
-    Each item in the list must have:
-    - "id": The EXACT same "id" string from the INPUT.
-    - "text": A specific, high-quality 1-sentence summary of topics.
-    
-    OUTPUT FORMAT:
-    {{ "summaries": [ {{ "id": "email@address.com", "text": "Asking for a demo regarding the dashboard..." }} ] }}
+    TASK: Return a JSON object with a "summaries" list.
+    OUTPUT FORMAT: {{ "summaries": [ {{ "id": "email@address.com", "text": "Asking for a demo..." }} ] }}
     """
     
     try:
@@ -191,18 +283,15 @@ async def generate_sender_report(emails):
             response_format={ "type": "json_object" }, temperature=0.0
         )
         ai_response = json.loads(response.choices[0].message.content)
-        
         ai_summaries = { item['id'].lower(): item['text'] for item in ai_response.get("summaries", []) }
         
         final_list = []
         for name, msgs in top_senders:
             fallback_text = f"Discussing: {msgs[0].get('subject')}"
             summary_text = ai_summaries.get(name, fallback_text)
-            
             att_count = sum(len(m.get('attachments', [])) for m in msgs)
             display_name = msgs[0].get('from').split('<')[0].strip()
             if not display_name: display_name = name
-
             final_list.append({ "name": display_name, "count": len(msgs), "attachments": att_count, "summary": summary_text })
         return final_list
     except Exception as e:
@@ -218,7 +307,11 @@ async def analyze_single_thread(subject, messages):
         main_sender = messages[0].get('from') or "Unknown"
         main_date = messages[0].get('received') or messages[0].get('received_at') or messages[0].get('date') or "Unknown"
         
-        split_result = split_reply_chain(raw_body, main_sender, main_date)
+        # STEP 2: Capture attachments
+        raw_attachments = messages[0].get("attachments", [])
+        
+        # STEP 2: Pass attachments to splitter
+        split_result = split_reply_chain(raw_body, main_sender, main_date, raw_attachments)
         
         if len(split_result) > 1:
             final_messages = split_result
@@ -227,14 +320,14 @@ async def analyze_single_thread(subject, messages):
                 "from": main_sender, 
                 "date": main_date, 
                 "body": raw_body, 
-                "attachments": messages[0].get('attachments', [])
+                "attachments": raw_attachments
             }]
     else:
         final_messages = []
         for m in messages:
             final_messages.append({
                 "from": m.get('from') or "Unknown",
-                "date": m.get('received') or m.get('received_at') or m.get('date') or "Unknown",
+                "date": m.get('received_at') or m.get('date') or "Unknown",
                 "body": str(m.get('body')),
                 "attachments": m.get('attachments', [])
             })
@@ -264,6 +357,11 @@ async def analyze_single_thread(subject, messages):
         history_text += f"[{i+1}] FROM: {sender}\nDATE: {date}\nCONTENT: {msg['body'][:300]}\n----------------\n"
         clean_messages.append(msg)
 
+    # STEP 5: Aggregate attachments at thread level
+    thread_attachments = []
+    for m in clean_messages:
+        thread_attachments.extend(m.get("attachments", []))
+
     prompt = f"""
     Analyze this thread.
     THREAD: {display_subject}
@@ -292,7 +390,8 @@ async def analyze_single_thread(subject, messages):
             "received_at": final_date, 
             "messages": clean_messages, 
             "thread_count": len(clean_messages), 
-            "attachments": [],
+            # STEP 5: Replaced empty list with aggregated list
+            "attachments": thread_attachments, 
             "category": final_category, 
             "priority": result.get("priority", 1),
             "summary": result.get("summary", "Analysis failed."),
@@ -347,7 +446,6 @@ async def draft_email_reply(sender, context):
         return "Drafting failed."
 
 def calculate_triage_stats(emails, threads=None, user_identifier="Jim@hfmg.net", demo_mode=False):
-    import re
     target = user_identifier.strip().lower()
     vol_emails = len(emails)
 
