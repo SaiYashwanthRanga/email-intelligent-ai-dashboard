@@ -3,8 +3,8 @@ import axios from 'axios';
 import { Lock, User, ChevronRight, AlertTriangle } from 'lucide-react';
 import './App.css'; 
 
-// NOW READS FROM FILE INSTEAD OF HARDCODED
-const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
+
+const API_BASE = "http://172.22.6.145/";
 
 const Login = () => {
   const [username, setUsername] = useState("");
@@ -17,22 +17,28 @@ const Login = () => {
     setError("");
     setLoading(true);
 
-    try {
-      const res = await axios.post(`${API_BASE}/login`, { 
-        username: username, 
-        password: password 
-      });
+try {
+   const res = await axios.post(`${API_BASE}/login`, {
+      email: username,     
+      password: password
+    });
 
-      if (res.data.success) {
-        localStorage.setItem("jimAuthSession", "true");
-        localStorage.setItem("loggedInUser", username);
-        window.location.href = "/"; 
-      }
-    } catch (err) {
-      setError("Access Denied. Invalid credentials.");
+    // If API returns user object
+    if (res.status === 200) {
+      localStorage.setItem("jimAuthSession", "true");
+      localStorage.setItem("loggedInUser", res.data.account || username);
+      window.location.href = "/";
     }
+  } catch (err) {
+    if (err.response?.status === 401) {
+      setError("Invalid credentials");
+    } else {
+      setError("Server error. Please try again later.");
+    }
+  } finally {
     setLoading(false);
-  };
+  }
+};
 
   return (
     <div className="login-container">
