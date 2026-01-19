@@ -4,19 +4,20 @@ import requests
 import uvicorn
 import io
 import base64
+import json
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
-# Updated imports
+# Updated imports - Added get_attachment_bytes
 from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest
 from services import (
     group_emails_by_subject, 
     detect_real_threads, 
     analyze_single_thread, 
-    analyze_single_email, # <--- NEW IMPORT ADDED
+    analyze_single_email, 
     generate_executive_brief, 
     generate_sender_report,
     draft_email_reply,
@@ -27,7 +28,8 @@ from services import (
     save_cached_report,
     get_cached_emails,
     save_cached_emails,
-    normalize_email
+    normalize_email,
+    get_attachment_bytes  # <--- NEW IMPORT
 )
 
 # 1. LOAD CONFIGURATION
@@ -49,13 +51,62 @@ app.add_middleware(
 # --- ENDPOINTS ---
 
 @app.get("/api/fetch-inbox")
-def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count20"):
+def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count30"):
     try:
         clean_url = url.replace("[", "").replace("]", "").split("(")[0]
-        if not clean_url.startswith("http"): clean_url = f"http://{clean_url}"
-        print(f"Fetching: {clean_url}")
+        if not clean_url.startswith("http"):
+            clean_url = f"http://{clean_url}"
+
+        print(f"Fetching inbox from: {clean_url}")
+
         resp = requests.get(clean_url, timeout=60)
-        return resp.json()
+        data = resp.json()
+
+        # STEP 1.1 → Strip heavy Base64 immediately
+        for mail in data:
+            for att in mail.get("attachments", []):
+                if "hash" in att:
+                    raw_hash = att["hash"]  # Store ORIGINAL complete hash
+                    att["size"] = len(raw_hash)
+
+                    file_name = (att.get("name") or "").lower()
+
+                    # Detect video files
+                    is_video = any(file_name.endswith(ext) for ext in [
+                        ".mp4", ".mov", ".avi", ".mkv", ".webm"
+                    ])
+
+                    if is_video:
+                        # 🚫 Do NOT keep full video in memory
+                        att["hash"] = raw_hash[:16]  # Preview only
+                        att["full_hash"] = None  # Explicitly don't store full data
+                        att["storage"] = "remote"
+                        print(f"🎥 Large video detected, skipping Base64 load: {att.get('name')}")
+                    else:
+                        # Safe for PDFs, DOCs, images - KEEP THE FULL ORIGINAL HASH
+                        att["hash"] = raw_hash[:16]  # Keep preview for UI
+                        att["full_hash"] = raw_hash  # Keep COMPLETE data for download
+                        att["storage"] = "inline"
+                        print(f"✅ File processed: {att.get('name')} | preview hash: {att['hash']} | full_hash len: {len(att['full_hash'])}")
+        
+        # STEP 1.2 → Debug confirmation
+        if data and data[0].get("attachments"):
+            print("\n🔍 FIRST EMAIL ATTACHMENTS AFTER PROCESSING:")
+            for att in data[0].get("attachments", [])[:2]:
+                print(f"  Name: {att.get('name')}")
+                print(f"    hash length: {len(att.get('hash', ''))}")
+                print(f"    full_hash length: {len(att.get('full_hash', '') or '')}")
+                print(f"    storage: {att.get('storage')}")
+                print(f"    Keys in att: {list(att.keys())}")
+                print()
+
+        # STEP 1.2 → Debug confirmation
+        if data and data[0].get("attachments"):
+            print("Hash length after strip:", len(data[0]["attachments"][0]["hash"]))
+            print("Original size:", data[0]["attachments"][0]["size"])
+
+        return data
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -126,9 +177,9 @@ async def analyze_emails(payload: AnalysisRequest):
 
     # Analyze single emails normally (no thread structure)
     for e in single_emails:
-        tasks.append(analyze_single_email(e)) # <--- UPDATED LOOP
+        tasks.append(analyze_single_email(e)) 
 
-    analyzed_results = await asyncio.gather(*tasks) # <--- UPDATED VARIABLE NAME
+    analyzed_results = await asyncio.gather(*tasks)
     
     # Briefing only for Real Threads (filter results that are threads for brief)
     # (Since analyzed_results has everything mixed, we filter for threads to generate brief)
@@ -153,7 +204,7 @@ async def analyze_emails(payload: AnalysisRequest):
     save_cached_report(brief)
     save_cached_emails(analyzed_results)
 
-    return {"emails": analyzed_results, "report": brief} # <--- UPDATED RETURN
+    return {"emails": analyzed_results, "report": brief} 
 
 @app.post("/api/reply")
 async def generate_reply(payload: ReplyRequest):
@@ -164,29 +215,186 @@ async def generate_reply(payload: ReplyRequest):
 async def parse_email_thread(payload: ThreadParseRequest):
     return {"segments": [{"type": "latest", "header": "Log", "content": payload.body}]}
 
-# --- NEW DOWNLOAD ENDPOINT ---
+# --- OPTIMIZED DOWNLOAD ENDPOINT ---
 @app.post("/api/download")
 def download_file(payload: dict):
     try:
         file_name = payload.get("name")
-        file_hash = payload.get("hash")
+        storage = payload.get("storage", "inline")
         file_type = payload.get("type", "application/octet-stream")
+        file_hash = payload.get("full_hash")
+
+        # Block remote/video files
+        if storage == "remote":
+            raise HTTPException(
+                status_code=403,
+                detail="Video files cannot be downloaded. Please use the original email."
+            )
 
         if not file_hash:
-            raise HTTPException(status_code=400, detail="File data missing")
+            raise HTTPException(
+                status_code=400,
+                detail=f"File data missing for {file_name}"
+            )
 
-        file_bytes = base64.b64decode(file_hash)
+        # Decode base64 safely
+        try:
+            file_bytes = base64.b64decode(file_hash)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file data"
+            )
+
         file_stream = io.BytesIO(file_bytes)
 
         return StreamingResponse(
             file_stream,
             media_type=file_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{file_name}"'
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "Cache-Control": "no-store"
             }
         )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Download failed")
+
+# --- REMOTE FILE DOWNLOAD ENDPOINT (MP3/MP4 and large files from mailbox) ---
+@app.post("/api/download-remote-file")
+def download_remote_file(payload: dict):
+    print("📦 Remote download payload:", payload)
+
+    raise HTTPException(
+        status_code=400,
+        detail="Mailbox attachment download endpoint not configured yet. Need attachment download URL."
+    )
+
+# --- NEW DIRECT ATTACHMENT DOWNLOAD ENDPOINT WITH STREAMING ---
+@app.post("/api/download-attachment")
+def download_attachment(payload: dict):
+    # 1. DEBUG LOGGING: Start
+    print("📥 Incoming download request:", payload)
+    
+    message_id = payload.get("messageId")
+    filename = payload.get("name")
+
+    if not message_id or not filename:
+        raise HTTPException(status_code=400, detail="messageId and name required")
+
+    # Call mailbox API directly
+    inbox_api = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count20"
+    
+    # 2. DEBUG LOGGING: API call
+    resp = requests.get(inbox_api, timeout=60)
+    print("📨 Mailbox API status:", resp.status_code)
+    try:
+        print("📨 Mailbox API size:", len(resp.text))
+    except:
+        pass
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail="Mailbox API failed")
+
+    mails = resp.json()
+    
+    # 3. DEBUG LOGGING: Mail count
+    print("📧 Total mails received:", len(mails))
+
+    for mail in mails:
+        # 4. DEBUG LOGGING: Message ID check
+        print("🔍 Checking mail:", mail.get("messageId"))
+        
+        if mail.get("messageId") == message_id:
+            print(f"✅ FOUND Matching Message ID: {message_id}")
+            for att in mail.get("attachments", []):
+                # 5. DEBUG LOGGING: Attachment Name check
+                print("📎 Found attachment:", att.get("name"))
+                
+                if att.get("name") == filename:
+                    print(f"🎯 DOWNLOAD STARTING: {filename}")
+                    
+                    # --- CRITICAL CHANGE: USE SERVICE HELPER FOR RAW BYTES ---
+                    final_name, file_bytes = get_attachment_bytes(att)
+
+                    file_stream = io.BytesIO(file_bytes)
+
+                    headers = {
+                        "Content-Disposition": f'attachment; filename="{final_name}"',
+                        "Content-Type": "application/octet-stream"
+                    }
+
+                    return StreamingResponse(
+                        file_stream, 
+                        headers=headers
+                    )
+
+    print("❌ ERROR: Attachment not found after scanning all emails.")
+    raise HTTPException(status_code=404, detail="Attachment not found")
+
+# --- NEW OPTIMIZED FILE STREAMING ENDPOINT (PDF, DOC, Images, MP3, MP4) ---
+@app.post("/api/file-stream")
+async def file_stream(request: Request, mode: str = "preview"):
+    payload = None
+    content_type = request.headers.get("content-type", "")
+    print("📥 file-stream Content-Type:", content_type)
+
+    # Try FORM first (Preview)
+    try:
+        form = await request.form()
+        if form:
+            print("📄 Form keys:", list(form.keys()))
+            raw = form.get("payload")
+            print("📄 Raw payload from form:", raw)
+
+            if raw and raw.strip():
+                payload = json.loads(raw)
+    except Exception as e:
+        print("⚠️ Form parse failed:", e)
+
+    # If no payload yet, try JSON (Download)
+    if payload is None:
+        try:
+            payload = await request.json()
+            print("📦 Payload from JSON:", payload)
+        except Exception as e:
+            print("⚠️ JSON parse failed:", e)
+
+    # Final guard
+    if not payload:
+        raise HTTPException(status_code=400, detail="No payload received in request")
+
+    filename = payload.get("name", "file")
+    filetype = payload.get("type", "application/octet-stream")
+
+    # Determine disposition: inline for docs/images in preview mode, attachment for videos/audio or download mode
+    is_video_or_audio = filetype.startswith("video/") or filetype.startswith("audio/")
+    disposition = "attachment" if is_video_or_audio or mode == "download" else "inline" if mode == "preview" else "attachment"
+
+    headers = {
+        "Content-Type": filetype,
+        "Content-Disposition": f'{disposition}; filename="{filename}"'
+    }
+
+    # Get file data - check both "hash" (for video/audio) and "full_hash" (for docs/images)
+    file_hash = payload.get("hash") or payload.get("full_hash")
+
+    if not file_hash:
+        raise HTTPException(status_code=400, detail="File hash missing")
+
+    try:
+        binary = base64.b64decode(file_hash)
+        print(f"✅ Decoded {filename} ({len(binary)} bytes)")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Base64 decode failed: {e}")
+
+    return StreamingResponse(
+        io.BytesIO(binary),
+        headers=headers,
+        media_type=filetype
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

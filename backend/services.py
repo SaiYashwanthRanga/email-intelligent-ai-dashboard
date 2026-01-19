@@ -4,10 +4,57 @@ import re
 import asyncio
 import hashlib
 import html
+import base64  # <--- Added Import
 from collections import defaultdict, Counter
 from datetime import datetime
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+
+# --- STEP 1: Create a strict classification prompt ---
+CLASSIFICATION_PROMPT = """
+You are an enterprise email triage assistant.
+
+Your job is to strictly classify an email into ONE of the following categories:
+
+1. PRIORITY  
+   - Emails from executives, leadership, or VIP senders  
+   - Financial, legal, compliance, production-impacting topics  
+
+2. URGENT  
+   - Time-sensitive  
+   - Deadlines today or tomorrow  
+   - Outages, incidents, escalations  
+
+3. CONFIDENTIAL  
+   - Sensitive, legal, HR, patient, or contract information  
+   - Financial approvals, payment authorizations, invoices, budget approvals, purchase approvals  
+   - Any email that contains financial decision making or approval requests 
+
+4. MEETING  
+   - Meeting invites, schedules, minutes, follow-ups  
+
+5. NEWSLETTER  
+   - Marketing, announcements, automated updates  
+
+6. NORMAL  
+   - Everything else  
+
+Rules:
+- Always choose exactly ONE category.
+- Do NOT invent categories.
+- Do NOT explain.
+- Output ONLY valid JSON.
+- Give a priority score (1 to 5).
+- Give a one-sentence professional summary.
+
+JSON format:
+
+{
+  "category": "PRIORITY | URGENT | CONFIDENTIAL | MEETING | NEWSLETTER | NORMAL",
+  "priority": 1,
+  "summary": "short professional summary"
+}
+"""
 
 # 1. SETUP AI CLIENT
 load_dotenv()
@@ -21,8 +68,35 @@ client = AsyncOpenAI(api_key=api_key)
 CACHE_FILE = "db_cache.json"
 VIP_FILE = "vip_list.json"
 
-# --- NEW: DATA NORMALIZATION ---
+# --- CONFIGURATION: PRIORITY SENDERS ---
+def load_vip_list():
+    if os.path.exists(VIP_FILE):
+        try:
+            with open(VIP_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ Error loading VIP list: {e}")
+            return []
+    return []
+
+# Load VIP list once at startup
+VIP_SENDERS = [v.lower() for v in load_vip_list()]
+print(f"✅ Loaded {len(VIP_SENDERS)} VIP senders: {VIP_SENDERS}")
+
+# --- DATA NORMALIZATION ---
 def normalize_email(e: dict):
+    clean_attachments = []
+
+    for att in e.get("attachments", []):
+        clean_attachments.append({
+            "name": att.get("name"),
+            "type": att.get("type", "application/octet-stream"),
+            "size": att.get("size", 0),
+            "hash": att.get("hash"),           # already trimmed in main.py
+            "full_hash": att.get("full_hash"), # used only for download
+            "storage": att.get("storage", "inline") # Ensure storage type is preserved
+        })
+
     return {
         "id": e.get("id") or e.get("_id") or e.get("messageId") or "mail",
         "subject": e.get("subject", "No Subject"),
@@ -37,19 +111,8 @@ def normalize_email(e: dict):
             e.get("date") or 
             "1970-01-01T00:00:00"
         ),
-        "attachments": e.get("attachments", [])
+        "attachments": clean_attachments
     }
-
-# --- CONFIGURATION: PRIORITY SENDERS ---
-def load_vip_list():
-    if os.path.exists(VIP_FILE):
-        try:
-            with open(VIP_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"⚠️ Error loading VIP list: {e}")
-            return []
-    return []
 
 # --- CACHE SYSTEM ---
 def load_cache():
@@ -90,8 +153,26 @@ def get_cached_emails():
     cache = load_cache()
     return cache.get(EMAILS_KEY)
 
+# --- UPDATED FUNCTION HERE ---
 def save_cached_emails(emails):
+    """
+    Cache enriched emails but keep full_hash ONLY for inline attachments.
+    Video/remote files never contain base64 anyway.
+    """
+    for e in emails:
+        # Top-level attachments
+        for att in e.get("attachments", []):
+            if att.get("storage") == "remote":
+                att.pop("full_hash", None)
+
+        # Thread message attachments
+        for msg in e.get("messages", []):
+            for att in msg.get("attachments", []):
+                if att.get("storage") == "remote":
+                    att.pop("full_hash", None)
+
     save_cache({EMAILS_KEY: emails})
+# -----------------------------
 
 # --- HELPER FUNCTIONS ---
 
@@ -118,7 +199,6 @@ def group_emails_by_subject(emails):
     return groups
 
 # --- ROBUST THREAD SPLITTER LOGIC ---
-# STEP 3: Updated signature
 def split_reply_chain(body, main_sender, main_date, attachments=None):
     if not body:
         return []
@@ -142,7 +222,6 @@ def split_reply_chain(body, main_sender, main_date, attachments=None):
     # First block = latest reply
     latest_body = parts[0].strip()
     if latest_body:
-        # STEP 4: Attachments go ONLY to the latest message
         messages.append({
             "from": main_sender,
             "date": main_date,
@@ -198,29 +277,17 @@ def detect_real_threads(emails):
 
 async def analyze_single_email(email):
     body = email.get("body", "")
+    email_body = body  # Ensure variable matches the requested snippet
     subject = email.get("subject", "No Subject")
     sender = email.get("from", "Unknown")
     received = email.get("received_at", "Unknown")
 
+    # --- STEP 2: Update AI call prompt ---
     prompt = f"""
-    Analyze this email:
-    SUBJECT: {subject}
-    FROM: {sender}
-    BODY: {body}
-
-    TASK:
-    - Categorize (URGENT / MEETING / NEWSLETTER / NORMAL / PRIORITY)
-    - Give a short executive summary (1 line)
-    - Give an action (REVIEW / RESPOND / IGNORE / SCHEDULE)
-
-    OUTPUT JSON:
-    {{
-      "category": "...",
-      "priority": 1-5,
-      "summary": "...",
-      "action": "..."
-    }}
-    """
+Subject: {email.get('subject')}
+From: {email.get('from')}
+Body:{email_body}{CLASSIFICATION_PROMPT}
+"""
 
     try:
         response = await client.chat.completions.create(
@@ -235,9 +302,15 @@ async def analyze_single_email(email):
 
         result = json.loads(response.choices[0].message.content)
 
-        # Merge AI result into original email (without making it a thread)
-        email["category"] = result.get("category", "NORMAL")
-        email["priority"] = result.get("priority", 1)
+        # --- STEP 3: Enforce VIP rule after AI response ---
+        sender = (email.get("from") or "").lower()
+        if sender in VIP_SENDERS:
+            email["category"] = "PRIORITY"
+            email["priority"] = 5
+        else:
+            email["category"] = result.get("category", "NORMAL")
+            email["priority"] = result.get("priority", 1)
+
         email["summary"] = result.get("summary", "No summary")
         email["action"] = result.get("action", "REVIEW")
 
@@ -307,10 +380,7 @@ async def analyze_single_thread(subject, messages):
         main_sender = messages[0].get('from') or "Unknown"
         main_date = messages[0].get('received') or messages[0].get('received_at') or messages[0].get('date') or "Unknown"
         
-        # STEP 2: Capture attachments
         raw_attachments = messages[0].get("attachments", [])
-        
-        # STEP 2: Pass attachments to splitter
         split_result = split_reply_chain(raw_body, main_sender, main_date, raw_attachments)
         
         if len(split_result) > 1:
@@ -343,13 +413,15 @@ async def analyze_single_thread(subject, messages):
     clean_messages = []
     history_text = ""
     is_priority_sender = False
-    priority_senders_list = load_vip_list() 
 
     for i, msg in enumerate(final_messages):
         sender = msg['from']
         participants.add(sender)
-        for vip in priority_senders_list:
-            if vip.lower() in sender.lower(): is_priority_sender = True
+        
+        # Check if sender is in VIP list
+        sender_lower = sender.lower()
+        if sender_lower in VIP_SENDERS:
+            is_priority_sender = True
         
         date = msg['date']
         if latest_date is None or date != "Unknown": latest_date = date
@@ -357,7 +429,7 @@ async def analyze_single_thread(subject, messages):
         history_text += f"[{i+1}] FROM: {sender}\nDATE: {date}\nCONTENT: {msg['body'][:300]}\n----------------\n"
         clean_messages.append(msg)
 
-    # STEP 5: Aggregate attachments at thread level
+    # Aggregate attachments at thread level
     thread_attachments = []
     for m in clean_messages:
         thread_attachments.extend(m.get("attachments", []))
@@ -377,7 +449,16 @@ async def analyze_single_thread(subject, messages):
             response_format={ "type": "json_object" }, temperature=0.0
         )
         result = json.loads(response.choices[0].message.content)
-        final_category = "PRIORITY" if is_priority_sender else result.get("category", "NORMAL")
+        
+        # Apply VIP rule to threads (kept as originally provided since user didn't request changes here)
+        if is_priority_sender:
+            final_category = "PRIORITY"
+            final_priority = 5
+            print(f"✅ VIP THREAD DETECTED: {display_subject}")
+        else:
+            final_category = result.get("category", "NORMAL")
+            final_priority = result.get("priority", 1)
+        
         final_date = result.get("normalized_date") or latest_date
 
         final_result = {
@@ -390,10 +471,9 @@ async def analyze_single_thread(subject, messages):
             "received_at": final_date, 
             "messages": clean_messages, 
             "thread_count": len(clean_messages), 
-            # STEP 5: Replaced empty list with aggregated list
             "attachments": thread_attachments, 
             "category": final_category, 
-            "priority": result.get("priority", 1),
+            "priority": final_priority,
             "summary": result.get("summary", "Analysis failed."),
             "action": result.get("action", "REVIEW")
         }
@@ -509,3 +589,13 @@ def calculate_triage_stats(emails, threads=None, user_identifier="Jim@hfmg.net",
         "to": to_count,
         "cc": cc_count
     }
+
+# --- ATTACHMENT DECODER HELPER ---
+def get_attachment_bytes(attachment):
+    file_name = attachment["name"]
+    file_hash = attachment["hash"]
+
+    file_bytes = base64.b64decode(file_hash)
+    print("📦 Decoded file size:", len(file_bytes))
+
+    return file_name, file_bytes

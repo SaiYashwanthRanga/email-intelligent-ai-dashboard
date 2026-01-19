@@ -32,92 +32,137 @@ const CountUp = ({ end, duration = 1500 }) => {
   return <span>{count}</span>;
 };
 
-const TriageSummary = ({ stats, realThreads, emails }) => {
+// --- FILE TYPE ICONS MAP ---
+const FILE_ICONS = {
+  pdf: "📕",
+  xlsx: "📊",
+  xls: "📊",
+  docx: "📄",
+  doc: "📄",
+  ppt: "PY",
+  pptx: "PY",
+  png: "🖼",
+  jpg: "🖼",
+  jpeg: "🖼",
+  csv: "📑",
+  zip: "🗜",
+  txt: "📝",
+  rar: "🗜"
+};
+
+// --- STYLES FOR BIGGER EMOJIS ---
+const emojiStyleMain = { fontSize: "1.4rem", marginRight: "6px", verticalAlign: "middle" };
+const emojiStyleSub = { fontSize: "1.2rem", marginRight: "5px", verticalAlign: "middle" };
+
+const TriageSummary = ({ stats, realThreads, emails, onAttachmentClick }) => {
   if (!stats) return null;
 
   const { 
     vol_emails, 
-    vol_threads, 
     vol_meetings, 
     total_unread, 
     att_total, 
     att_breakdown,
-    // New props from Dashboard.js logic
     to = 0,
     cc = 0 
   } = stats;
 
   return (
-  <div className="triage-glass-panel triage-premium">
-    
-    {/* TOP ROW */}
-    <div className="triage-main-row">
-      <div className="triage-metric-block">
-        <span className="triage-label">EMAILS</span>
-        <span className="triage-number">
-          <CountUp end={vol_emails} />
-        </span>
+    <div className="triage-glass-panel triage-premium">
+      
+      {/* TOP ROW: Now Perfectly Symmetrical */}
+      <div className="triage-main-row">
+        
+        {/* BLOCK 1: EMAILS */}
+        <div className="triage-metric-block">
+          <span className="triage-label">
+            <span style={emojiStyleMain}>📧</span> EMAILS
+          </span>
+          <span className="triage-number">
+            <CountUp end={vol_emails} />
+          </span>
+        </div>
+
+        <div className="triage-divider-vertical" />
+
+        {/* BLOCK 2: THREADS */}
+        <div className="triage-metric-block">
+          <span className="triage-label">
+            <span style={emojiStyleMain}>🧵</span> THREADS
+          </span>
+          <span className="triage-number">
+            <CountUp end={realThreads?.length || 0} />
+          </span>
+        </div>
+
+        <div className="triage-divider-vertical" />
+
+        {/* BLOCK 3: MEETINGS */}
+        <div className="triage-metric-block">
+          <span className="triage-label">
+            <span style={emojiStyleMain}>📅</span> MEETINGS
+          </span>
+          <span className="triage-number">
+            <CountUp end={vol_meetings} />
+          </span>
+        </div>
+
+        <div className="triage-divider-vertical" />
+
+        {/* BLOCK 4: UNREAD (Now matches others perfectly) */}
+        <div className="triage-metric-block">
+          <span className="triage-label">
+            <span style={emojiStyleMain}>🔔</span> UNREAD
+          </span>
+          <span className="triage-number">
+            <CountUp end={total_unread} />
+          </span>
+        </div>
+
       </div>
 
-      <div className="triage-divider-vertical" />
+      {/* SECOND ROW */}
+      <div className="triage-sub-row">
+        <div className="triage-sub-left">
+          <span className="triage-sub-label">
+            <span style={emojiStyleSub}>📎</span> ATTACHMENTS
+          </span>
+          
+          <span 
+            className="triage-sub-value clickable-stat" 
+            onClick={onAttachmentClick}
+            style={{ cursor: 'pointer' }}
+            title="Click to view all attachments"
+          >
+            <CountUp end={att_total} />
+          </span>
 
-      <div className="triage-metric-block">
-        <span className="triage-label">THREADS</span>
-        <span className="triage-number">
-          <CountUp end={realThreads?.length || 0} />
-        </span>
-      </div>
+          {att_total > 0 && (
+            <div className="triage-file-breakdown">
+              {Object.entries(att_breakdown).map(([type, count]) => {
+                const icon = FILE_ICONS[type.toLowerCase()] || "🗂";
+                return (
+                  <span key={type}>
+                    <span style={{ fontSize: "1.1rem", marginRight: "3px" }}>{icon}</span> {type} <strong>{count}</strong>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
-      <div className="triage-divider-vertical" />
-
-      <div className="triage-metric-block">
-        <span className="triage-label">MEETINGS</span>
-        <span className="triage-number">
-          <CountUp end={vol_meetings} />
-        </span>
-      </div>
-
-      <div className="triage-divider-vertical thick" />
-
-      <div className="triage-total-block">
-        <span className="triage-total-number">
-          <CountUp end={total_unread} />
-        </span>
-        <span className="triage-total-text">NEW UNREAD</span>
+        <div className="triage-sub-right">
+          <span>
+            <span style={emojiStyleSub}>📤</span> TO <strong><CountUp end={to} /></strong>
+          </span>
+          <span className="triage-sub-sep">|</span>
+          <span>
+            <span style={emojiStyleSub}>👥</span> CC <strong><CountUp end={cc} /></strong>
+          </span>
+        </div>
       </div>
     </div>
-
-    {/* SECOND ROW */}
-    <div className="triage-sub-row">
-      <div className="triage-sub-left">
-        <span className="triage-sub-label">ATTACHMENTS</span>
-        <span className="triage-sub-value">
-          <CountUp end={att_total} />
-        </span>
-
-        {att_total > 0 && (
-          <div className="triage-file-breakdown">
-            {Object.entries(att_breakdown).map(([type, count]) => (
-              <span key={type}>
-                {type} <strong>{count}</strong>
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="triage-sub-right">
-        <span>
-          TO <strong><CountUp end={to} /></strong>
-        </span>
-        <span className="triage-sub-sep">|</span>
-        <span>
-          CC <strong><CountUp end={cc} /></strong>
-        </span>
-      </div>
-    </div>
-  </div>
-);
+  );
 };
 
 export default TriageSummary;
