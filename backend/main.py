@@ -5,13 +5,15 @@ import uvicorn
 import io
 import base64
 import json
+import uuid  # Added for unique file naming
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
-# Updated imports - Added get_attachment_bytes
+# Updated imports
 from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest
 from services import (
     group_emails_by_subject, 
@@ -29,13 +31,20 @@ from services import (
     get_cached_emails,
     save_cached_emails,
     normalize_email,
-    get_attachment_bytes  # <--- NEW IMPORT
+    get_attachment_bytes
 )
 
 # 1. LOAD CONFIGURATION
 load_dotenv()
 origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
 origins = [origin.strip() for origin in origins_str.split(",")]
+
+# Create temporary directory for heavy attachments
+TEMP_DIR = "temp_attachments"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Cache file path
+CACHE_FILE = Path("db_cache.json")
 
 app = FastAPI()
 
@@ -48,10 +57,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- HELPER FUNCTIONS ---
+
+def update_cache_mark_read(message_id: str):
+    """
+    Update the backend cache to mark an email as read.
+    This ensures the email doesn't reappear on next refresh.
+    """
+    if not CACHE_FILE.exists():
+        print(f"⚠️  Cache file not found: {CACHE_FILE}")
+        return
+
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Update in enriched emails
+        emails = data.get("meta_last_enriched_emails", [])
+        updated = False
+        
+        for e in emails:
+            if e.get("id") == message_id or e.get("messageId") == message_id:
+                e["isRead"] = True
+                updated = True
+                print(f"✅ Cache: Marked email {message_id} as read in enriched emails")
+                break
+
+        # Update in threads if present
+        threads = data.get("threads", [])
+        for t in threads:
+            if t.get("id") == message_id or t.get("messageId") == message_id:
+                t["isRead"] = True
+                updated = True
+                print(f"✅ Cache: Marked email {message_id} as read in threads")
+                break
+
+        # Save updated cache only if we made changes
+        if updated:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            print(f"💾 Cache file updated successfully")
+        else:
+            print(f"⚠️  Email {message_id} not found in cache")
+
+    except Exception as e:
+        print(f"❌ Failed to update cache: {e}")
+
+
 # --- ENDPOINTS ---
 
 @app.get("/api/fetch-inbox")
-def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count30"):
+def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count10"):
     try:
         clean_url = url.replace("[", "").replace("]", "").split("(")[0]
         if not clean_url.startswith("http"):
@@ -76,12 +132,21 @@ def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hf
                         ".mp4", ".mov", ".avi", ".mkv", ".webm"
                     ])
 
+                    # --- STEP 1: CHANGE STORAGE LOGIC TO DISK ---
                     if is_video:
-                        # 🚫 Do NOT keep full video in memory
-                        att["hash"] = raw_hash[:16]  # Preview only
-                        att["full_hash"] = None  # Explicitly don't store full data
-                        att["storage"] = "remote"
-                        print(f"🎥 Large video detected, skipping Base64 load: {att.get('name')}")
+                        # Save large file to disk instead of RAM
+                        file_id = f"{uuid.uuid4()}.b64"
+                        file_path = os.path.join(TEMP_DIR, file_id)
+
+                        with open(file_path, "w") as f:
+                            f.write(raw_hash)
+
+                        att["hash"] = raw_hash[:16]
+                        att["full_hash"] = None
+                        att["storage"] = "disk"
+                        att["file_path"] = file_path
+
+                        print(f"💾 Video saved to disk: {att.get('name')} -> {file_path}")
                     else:
                         # Safe for PDFs, DOCs, images - KEEP THE FULL ORIGINAL HASH
                         att["hash"] = raw_hash[:16]  # Keep preview for UI
@@ -100,10 +165,30 @@ def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hf
                 print(f"    Keys in att: {list(att.keys())}")
                 print()
 
-        # STEP 1.2 → Debug confirmation
-        if data and data[0].get("attachments"):
-            print("Hash length after strip:", len(data[0]["attachments"][0]["hash"]))
-            print("Original size:", data[0]["attachments"][0]["size"])
+        # 🔁 STEP 1.3 → FORCE ATTACHMENTS TO EXIST AT EMAIL ROOT LEVEL
+        for mail in data:
+            combined_attachments = []
+
+            # 1. Normal single email attachments
+            if "attachments" in mail and isinstance(mail["attachments"], list):
+                combined_attachments.extend(mail["attachments"])
+
+            # 2. If this mail is a thread, pull attachments from messages
+            if "messages" in mail and isinstance(mail["messages"], list):
+                for msg in mail["messages"]:
+                    if "attachments" in msg and isinstance(msg["attachments"], list):
+                        combined_attachments.extend(msg["attachments"])
+
+            # 3. Overwrite root attachments with unified list
+            mail["attachments"] = combined_attachments
+
+        print(f"\n✅ UNIFICATION COMPLETE: All {len(data)} emails now have attachments at root level")
+
+        # Sort mails by received time (newest first)
+        data.sort(
+            key=lambda x: datetime.fromisoformat(x.get("received", "1970-01-01T00:00:00")),
+            reverse=True
+        )
 
         return data
 
@@ -131,11 +216,13 @@ async def analyze_emails(payload: AnalysisRequest):
     
     # --- LEVEL 3: GLOBAL GATEKEEPER ---
     
-    # Helper to parse dates for comparison. 
-    # Handles ISO format including timezone (e.g. 2026-01-12T18:43:01-05:00)
+    # ✅ CHANGE 1: Helper to parse dates for comparison (with timezone handling)
     def get_date_obj(e):
         try:
-            return datetime.fromisoformat(e["received_at"])
+            dt = datetime.fromisoformat(e["received_at"])
+            if dt.tzinfo:
+                dt = dt.astimezone(tz=None).replace(tzinfo=None)
+            return dt
         except:
             return datetime(1970, 1, 1)
 
@@ -165,7 +252,6 @@ async def analyze_emails(payload: AnalysisRequest):
     # --- STANDARD ANALYSIS LOGIC ---
     
     # 3. REAL THREAD DETECTION (Replaces Subject Grouping)
-    # This separates emails with reply history (threads) from standalone emails
     real_threads, single_emails = detect_real_threads(emails)
 
     tasks = []
@@ -181,8 +267,7 @@ async def analyze_emails(payload: AnalysisRequest):
 
     analyzed_results = await asyncio.gather(*tasks)
     
-    # Briefing only for Real Threads (filter results that are threads for brief)
-    # (Since analyzed_results has everything mixed, we filter for threads to generate brief)
+    # Briefing only for Real Threads
     threads_only = [t for t in analyzed_results if t.get("thread_count", 1) > 1]
     
     brief_task = generate_executive_brief(threads_only)  
@@ -199,10 +284,24 @@ async def analyze_emails(payload: AnalysisRequest):
     brief["triage_stats"] = triage_data 
 
     # --- LEVEL 3: SAVE STATE ---
-    # Save as ISO string for consistent future comparisons
     set_last_processed_timestamp(latest_email_ts.isoformat())
     save_cached_report(brief)
     save_cached_emails(analyzed_results)
+
+    # ✅ CHANGE 2: Safe datetime helper for sorting (with timezone handling)
+    def safe_datetime(val):
+        try:
+            dt = datetime.fromisoformat(val)
+            if dt.tzinfo:
+                dt = dt.astimezone(tz=None).replace(tzinfo=None)
+            return dt
+        except:
+            return datetime(1970, 1, 1)
+
+    analyzed_results.sort(
+        key=lambda x: safe_datetime(x.get("received_at", "1970-01-01T00:00:00")),
+        reverse=True
+    )
 
     return {"emails": analyzed_results, "report": brief} 
 
@@ -215,7 +314,7 @@ async def generate_reply(payload: ReplyRequest):
 async def parse_email_thread(payload: ThreadParseRequest):
     return {"segments": [{"type": "latest", "header": "Log", "content": payload.body}]}
 
-# --- OPTIMIZED DOWNLOAD ENDPOINT ---
+# --- OPTIMIZED DOWNLOAD ENDPOINT (Generic) ---
 @app.post("/api/download")
 def download_file(payload: dict):
     try:
@@ -262,7 +361,7 @@ def download_file(payload: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Download failed")
 
-# --- REMOTE FILE DOWNLOAD ENDPOINT (MP3/MP4 and large files from mailbox) ---
+# --- REMOTE FILE DOWNLOAD ENDPOINT ---
 @app.post("/api/download-remote-file")
 def download_remote_file(payload: dict):
     print("📦 Remote download payload:", payload)
@@ -272,69 +371,106 @@ def download_remote_file(payload: dict):
         detail="Mailbox attachment download endpoint not configured yet. Need attachment download URL."
     )
 
-# --- NEW DIRECT ATTACHMENT DOWNLOAD ENDPOINT WITH STREAMING ---
+# --- STEP 2: UPDATE DOWNLOAD API (DISK SUPPORT) ---
 @app.post("/api/download-attachment")
-def download_attachment(payload: dict):
-    # 1. DEBUG LOGGING: Start
-    print("📥 Incoming download request:", payload)
-    
-    message_id = payload.get("messageId")
-    filename = payload.get("name")
+def download_attachment(data: dict):
+    name = data.get("name")
+    message_id = data.get("messageId")
 
-    if not message_id or not filename:
-        raise HTTPException(status_code=400, detail="messageId and name required")
+    cached_emails = get_cached_emails()
 
-    # Call mailbox API directly
-    inbox_api = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count20"
-    
-    # 2. DEBUG LOGGING: API call
-    resp = requests.get(inbox_api, timeout=60)
-    print("📨 Mailbox API status:", resp.status_code)
-    try:
-        print("📨 Mailbox API size:", len(resp.text))
-    except:
-        pass
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Mailbox API failed")
-
-    mails = resp.json()
-    
-    # 3. DEBUG LOGGING: Mail count
-    print("📧 Total mails received:", len(mails))
-
-    for mail in mails:
-        # 4. DEBUG LOGGING: Message ID check
-        print("🔍 Checking mail:", mail.get("messageId"))
-        
-        if mail.get("messageId") == message_id:
-            print(f"✅ FOUND Matching Message ID: {message_id}")
+    for mail in cached_emails:
+        # Check both id fields for robustness
+        if mail.get("id") == message_id or mail.get("messageId") == message_id:
             for att in mail.get("attachments", []):
-                # 5. DEBUG LOGGING: Attachment Name check
-                print("📎 Found attachment:", att.get("name"))
-                
-                if att.get("name") == filename:
-                    print(f"🎯 DOWNLOAD STARTING: {filename}")
-                    
-                    # --- CRITICAL CHANGE: USE SERVICE HELPER FOR RAW BYTES ---
-                    final_name, file_bytes = get_attachment_bytes(att)
 
-                    file_stream = io.BytesIO(file_bytes)
+                if att["name"] == name:
 
-                    headers = {
-                        "Content-Disposition": f'attachment; filename="{final_name}"',
-                        "Content-Type": "application/octet-stream"
-                    }
+                    # Small files (Inline in Memory)
+                    if att.get("storage") == "inline":
+                        file_bytes = base64.b64decode(att["full_hash"])
+                        return StreamingResponse(
+                            io.BytesIO(file_bytes),
+                            media_type=att.get("type"),
+                            headers={"Content-Disposition": f'attachment; filename="{name}"'}
+                        )
 
-                    return StreamingResponse(
-                        file_stream, 
-                        headers=headers
-                    )
+                    # Large files (Saved on Disk)
+                    if att.get("storage") == "disk":
+                        file_path = att.get("file_path")
 
-    print("❌ ERROR: Attachment not found after scanning all emails.")
+                        if not file_path or not os.path.exists(file_path):
+                            raise HTTPException(status_code=404, detail="File not found on disk")
+
+                        print(f"💾 Loading large file from disk: {file_path}")
+
+                        with open(file_path, "r") as f:
+                            base64_data = f.read()
+
+                        file_bytes = base64.b64decode(base64_data)
+
+                        return StreamingResponse(
+                            io.BytesIO(file_bytes),
+                            media_type=att.get("type"),
+                            headers={"Content-Disposition": f'attachment; filename="{name}"'}
+                        )
+
     raise HTTPException(status_code=404, detail="Attachment not found")
 
-# --- NEW OPTIMIZED FILE STREAMING ENDPOINT (PDF, DOC, Images, MP3, MP4) ---
+# --- MARK AS READ ENDPOINT (CORS-SAFE PROXY) ---
+@app.post("/api/mark-read")
+def mark_mail_as_read(payload: dict = Body(...)):
+    """
+    Mark an email as read in the organization mailbox.
+    Updates:
+    1. Organization mailbox (source of truth)
+    2. Backend cache (so it doesn't reappear on refresh)
+    3. Returns success to frontend (which already updated its state)
+    """
+    try:
+        email = payload.get("email")
+        message_id = payload.get("messageId")
+
+        if not email or not message_id:
+            raise HTTPException(status_code=400, detail="Missing email or messageId")
+
+        org_api_url = "http://172.22.6.145/api/Values/mail/read-status"
+
+        params = {
+            "email": email,
+            "messageId": message_id,
+            "isRead": True
+        }
+
+        print(f"📩 Calling org mailbox API with params: {params}")
+
+        # Call organization mailbox API
+        resp = requests.post(org_api_url, params=params, timeout=20)
+
+        print(f"📬 Org API response: {resp.status_code} | {resp.text}")
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Organization API error: {resp.text}"
+            )
+
+        # 🔥 STEP 2: Update backend cache to match organization mailbox
+        print(f"🔄 Updating backend cache for message {message_id}...")
+        update_cache_mark_read(message_id)
+
+        return {
+            "success": True,
+            "message": "Email marked as read in organization inbox and cache updated"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in mark-read endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- FILE STREAMING ENDPOINT ---
 @app.post("/api/file-stream")
 async def file_stream(request: Request, mode: str = "preview"):
     payload = None
@@ -369,7 +505,7 @@ async def file_stream(request: Request, mode: str = "preview"):
     filename = payload.get("name", "file")
     filetype = payload.get("type", "application/octet-stream")
 
-    # Determine disposition: inline for docs/images in preview mode, attachment for videos/audio or download mode
+    # Determine disposition
     is_video_or_audio = filetype.startswith("video/") or filetype.startswith("audio/")
     disposition = "attachment" if is_video_or_audio or mode == "download" else "inline" if mode == "preview" else "attachment"
 
@@ -378,7 +514,7 @@ async def file_stream(request: Request, mode: str = "preview"):
         "Content-Disposition": f'{disposition}; filename="{filename}"'
     }
 
-    # Get file data - check both "hash" (for video/audio) and "full_hash" (for docs/images)
+    # Get file data
     file_hash = payload.get("hash") or payload.get("full_hash")
 
     if not file_hash:

@@ -1081,3 +1081,38 @@ body.light-mode .toast-item {
 .spin-icon { animation: spin 1.5s linear infinite; }
 
 @keyframes slideIn { from { opacity: 0; transform: translateX(50px); } to { opacity: 1; transform: translateX(0); } }
+
+/* Whole conversation background */
+.thread-conversation {
+  background-color: #f8fafc;
+  padding: 12px;
+  border-radius: 10px;
+}
+/* Each message box */
+.message-item {
+  padding: 10px;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  max-width: 80%;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+/* Messages sent by you */
+.message-me {
+  background-color: #2563eb;
+  color: white;
+  margin-left: auto;
+  text-align: right;
+}
+/* Messages sent by others */
+.message-other {
+  background-color: #e5e7eb;
+  color: #111827;
+  margin-right: auto;
+  text-align: left;
+}
+/* Single color version */
+.message-thread {
+  background-color: #eef2ff;
+  color: #1e3a8a;
+}

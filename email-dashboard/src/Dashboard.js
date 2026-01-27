@@ -1,16 +1,37 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect } from "react";
+import "./App.css";
+import DashboardView from "./DashboardView";
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import './App.css';
-import DashboardView from './DashboardView';
+import { useMemo, useRef } from "react";
 
 const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
 
 function Dashboard() {
   const navigate = useNavigate();
   
+  // ✅ IDLE TIMER CONFIG + REF
+  const IDLE_TIMEOUT = 20 * 1000; // use 20 sec for testing
+  const idleTimerRef = useRef(null);
+  
   // --- STATE ---
   const [emails, setEmails] = useState([]);
+  const [lastUserActivityTime, setLastUserActivityTime] = useState(Date.now());
+  const [lastSyncTime, setLastSyncTime] = useState(null);
+  const [isIdle, setIsIdle] = useState(false);
+  const [inboxReady, setInboxReady] = useState(false);
+  const [isSoftSyncing, setIsSoftSyncing] = useState(false);
+
+  // --- CHANGED: Stable sorted emails list ---
+  const sortedEmails = useMemo(() => {
+    if (!emails || emails.length === 0) return [];
+    return [...emails].sort(
+      (a, b) =>
+        new Date(b.received || b.received_at) -
+        new Date(a.received || a.received_at)
+    );
+  }, [emails]);
+
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('ALL');
@@ -18,17 +39,13 @@ function Dashboard() {
   const [username, setUsername] = useState("User"); 
   
   // Kept API URL in state
-  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count20");
-
-  // --- NEW STATE: Last Sync Time ---
-  const [lastSyncTime, setLastSyncTime] = useState(
-    localStorage.getItem("lastSyncTime")
-  );
+  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count10");
   
   const [toasts, setToasts] = useState([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem('theme') || 'dark');
   const [selectedEmail, setSelectedEmail] = useState(null);
+  const [selectedEmailId, setSelectedEmailId] = useState(null);
   const [parsedThread, setParsedThread] = useState([]);
   const [threadLoading, setThreadLoading] = useState(false);
   const [selectedBriefing, setSelectedBriefing] = useState(null); 
@@ -36,33 +53,45 @@ function Dashboard() {
   const [replyLoading, setReplyLoading] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
   const [fileModalData, setFileModalData] = useState(null);
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState(true);
+
+  // --- HELPER: Get Safe Date (Moved up for use in Sorting) ---
+  const getSafeDate = (emailObj) => {
+    if (!emailObj) return "Unknown Date";
+    const candidates = [emailObj.received, emailObj.received_at, emailObj.date, emailObj.createdDateTime, emailObj.receivedDateTime, emailObj.internalDate];
+    for (const d of candidates) { if (d && d !== "Unknown Date") return d; }
+    return "Unknown Date";
+  };
+
+  // ✅ REPLACED: markUserActive with idle timer
+  const markUserActive = () => {
+    console.log("🟢 markUserActive called");
+
+    setLastUserActivityTime(Date.now());
+
+    if (isIdle) {
+      console.log("🟢 User became active again, stopping auto sync");
+    }
+
+    setIsIdle(false);
+
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+    }
+
+    idleTimerRef.current = setTimeout(() => {
+      console.log("🟡 User is now IDLE → auto sync should start");
+      setIsIdle(true);
+    }, IDLE_TIMEOUT);
+  };
 
   // --- NEW FUNCTION: Collect all attachments (LIGHTWEIGHT) ---
   const getAllAttachments = () => {
     const files = [];
 
     (emails || []).forEach(e => {
-      // Thread emails
-      if (Array.isArray(e.messages)) {
-        e.messages.forEach(m => {
-          if (Array.isArray(m.attachments)) {
-            m.attachments.forEach(att => {
-              files.push({
-                name: att.name,
-                type: att.type,
-                size: att.size,
-                hash: att.hash,           // short preview only
-                storage: att.storage,     // "inline" or "remote"
-                full_hash: att.full_hash || null,
-                senders: [m.from || e.from || "Unknown"]
-              });
-            });
-          }
-        });
-      }
-
-      // Single emails
-      if (Array.isArray(e.attachments)) {
+      // Attachments are now merged into email.attachments
+      if (e.attachments && Array.isArray(e.attachments)) {
         e.attachments.forEach(att => {
           files.push({
             name: att.name,
@@ -71,6 +100,7 @@ function Dashboard() {
             hash: att.hash,
             storage: att.storage,
             full_hash: att.full_hash || null,
+            messageId: att.messageId,
             senders: [e.from || "Unknown"]
           });
         });
@@ -80,16 +110,22 @@ function Dashboard() {
     return files;
   };
 
-  // Separate real threads and single emails
-  const realThreads = (emails || []).filter(e => 
-    Array.isArray(e.messages) && e.messages.length > 1
-  );
+  // --- DERIVED STATE: Filter & Safe Sort ---
+
+  // Separate real threads and single emails (Sorted)
+  const realThreads = (emails || [])
+    .filter(e => Array.isArray(e.messages) && e.messages.length > 1)
+    .sort((a, b) => new Date(getSafeDate(b)) - new Date(getSafeDate(a))); // ✅ Safe Sort
   
-  // Derived state for filtered emails in Inbox view
-  const filteredEmails = (emails || []).filter(e => {
-    if (activeTab === 'ALL') return true;
-    return (e.category || '').toUpperCase() === activeTab;
-  });
+  // --- CHANGED: Replace filteredEmails logic ---
+  const filteredAndSortedEmails = useMemo(() => {
+    if (!sortedEmails.length) return [];
+    if (activeTab === "ALL") return sortedEmails;
+  
+    return sortedEmails.filter(
+      (e) => (e.category || "").toUpperCase() === activeTab
+    );
+  }, [sortedEmails, activeTab]);
 
   // --- GREETING & DATE ---
   const [greetingInfo, setGreetingInfo] = useState({ greeting: 'Hello', date: '' });
@@ -126,13 +162,6 @@ function Dashboard() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  const getSafeDate = (emailObj) => {
-    if (!emailObj) return "Unknown Date";
-    const candidates = [emailObj.received, emailObj.received_at, emailObj.date, emailObj.createdDateTime, emailObj.receivedDateTime, emailObj.internalDate];
-    for (const d of candidates) { if (d && d !== "Unknown Date") return d; }
-    return "Unknown Date";
-  };
-
   const formatDate = (dateString) => {
     if (!dateString || dateString === "Unknown Date") return "Unknown Date";
     try {
@@ -150,6 +179,12 @@ function Dashboard() {
   };
 
   // --- HELPERS: Safe email content readers ---
+  
+  // 1. Unified Attachment Check (SIMPLIFIED)
+  const emailHasAttachments = (email) => {
+    return (email.attachments || []).length > 0;
+  };
+
   const getEmailBody = (email) => {
     if (email.messages && Array.isArray(email.messages) && email.messages.length > 0) {
       return email.messages[0].body || "";
@@ -157,10 +192,8 @@ function Dashboard() {
     return email.body || "";
   };
 
+  // STEP 2: SIMPLIFIED - Backend already merged everything
   const getEmailAttachments = (email) => {
-    if (email.messages && Array.isArray(email.messages)) {
-      return email.messages.flatMap(m => m.attachments || []);
-    }
     return email.attachments || [];
   };
 
@@ -174,17 +207,8 @@ function Dashboard() {
     const attachments = [];
 
     senderMails.forEach(e => {
-      // For thread emails
-      if (Array.isArray(e.messages)) {
-        e.messages.forEach(m => {
-          if (Array.isArray(m.attachments)) {
-            attachments.push(...m.attachments);
-          }
-        });
-      }
-
-      // For single emails
-      if (Array.isArray(e.attachments)) {
+      // Attachments are now in email.attachments
+      if (e.attachments && Array.isArray(e.attachments)) {
         attachments.push(...e.attachments);
       }
     });
@@ -200,13 +224,11 @@ function Dashboard() {
     const auth = localStorage.getItem("jimAuthSession");
     if (auth !== "true") { navigate("/login"); }
 
-    const cached = localStorage.getItem("emailDashboardData");
-    if (cached) {
-      try {
-        const parsed = JSON.parse(cached);
-        if (parsed.emails && parsed.emails.length > 0) setEmails(parsed.emails);
-        if (parsed.report) setReport(parsed.report);
-      } catch (e) { console.error("Cache load error", e); }
+    // ✅ FIXED: Only restore metadata, not full email data
+    const meta = JSON.parse(localStorage.getItem("emailDashboardMeta") || "{}");
+    if (meta.lastSync) {
+      setLastSyncTime(meta.lastSync);
+      console.log(`📋 Cached metadata loaded: ${meta.emailCount} emails, synced at ${meta.lastSync}`);
     }
   }, [navigate]);
 
@@ -225,43 +247,134 @@ function Dashboard() {
     localStorage.setItem('theme', theme);
   }, [theme]);
 
-  // --- AUTO FETCH & ANALYZE ---
-  useEffect(() => {
-    fetchAndAnalyze();
-  }, []);
-
   const toggleTheme = () => { setTheme(prev => prev === 'dark' ? 'light' : 'dark'); };
 
-  // --- CORE LOGIC ---
-  const fetchAndAnalyze = async () => {
-    addToast("Syncing Inbox...", "loading");
-    setLoading(true);
+  // ✅ FIXED: Activity listeners with logging
+  useEffect(() => {
+    const handleActivity = () => {
+      console.log("🖱️ User activity detected");
+      markUserActive();
+    };
+
+    window.addEventListener("mousemove", handleActivity);
+    window.addEventListener("mousedown", handleActivity);
+    window.addEventListener("keydown", handleActivity);
+    window.addEventListener("scroll", handleActivity);
+
+    return () => {
+      window.removeEventListener("mousemove", handleActivity);
+      window.removeEventListener("mousedown", handleActivity);
+      window.removeEventListener("keydown", handleActivity);
+      window.removeEventListener("scroll", handleActivity);
+    };
+  }, []);
+
+  // --- INITIAL LOAD (First time dashboard opens) ---
+  useEffect(() => {
+    console.log("🚀 Initial dashboard load");
+    fetchAndAnalyze(false);
+
+    // After first successful load, set sync time
+    setLastSyncTime(Date.now());
+  }, []);
+
+  // ✅ START IDLE TIMER WHEN DASHBOARD MOUNTS
+  useEffect(() => {
+    console.log("🚀 Dashboard mounted, starting idle timer");
+    markUserActive();
+  }, []);
+
+  // ✅ VERIFIED: Auto-refresh effect with logging
+  useEffect(() => {
+    console.log("🔥 isIdle:", isIdle, "AutoSync:", autoSyncEnabled);
+
+    // If user turned Auto Sync OFF
+    if (!autoSyncEnabled) {
+      console.log("⛔ Auto Sync is OFF");
+      return;
+    }
+
+    // If user is active, pause auto refresh
+    if (!isIdle) {
+      console.log("⏸ Auto refresh paused (user active)");
+      return;
+    }
+
+    console.log("▶ Auto refresh started (user idle)");
+
+    const interval = setInterval(() => {
+      console.log("🔄 Soft refresh running now...");
+      fetchAndAnalyze(true);
+    }, 2 * 60 * 1000);   // 2 minutes
+
+    return () => {
+      console.log("⏹ Auto refresh stopped");
+      clearInterval(interval);
+    };
+  }, [isIdle, autoSyncEnabled]);
+
+  // --- STEP 4: UPDATED FETCH FUNCTION TO RESTORE SELECTION ---
+  const fetchAndAnalyze = async (arg) => {
+    const silent = arg === true;
+    const currentSelectedId = selectedEmailId; // Capture current ID
+
+    console.log(
+      silent ? "🤫 Soft refresh triggered" : "🔁 Manual refresh triggered"
+    );
+
+    if (silent) {
+      setIsSoftSyncing(true);
+    }
+
+    if (!silent) setInboxReady(false);   // only block UI on manual refresh
+
+    if (!silent) {
+      addToast("Syncing Inbox...", "loading");
+      setLoading(true);
+    }
     
     try {
       const res = await axios.get(`${API_BASE}/fetch-inbox`, { params: { url: apiUrl } });
       
       if (Array.isArray(res.data)) {
-        addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
-        setEmails(res.data); 
+        if (!silent) {
+            addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
+        }
+        setEmails(res.data);
+        setInboxReady(true); // ✅ Inbox is now safe to render
         await runAnalysis(res.data); 
 
-        // --- NEW: Update Last Sync Time ---
+        // Restore selected email after refresh
+        if (currentSelectedId) {
+            const updatedEmail = res.data.find(
+              e => (e.id || e.messageId) === currentSelectedId
+            );
+            if (updatedEmail) {
+              setSelectedEmail(updatedEmail);
+            }
+        }
+
         const now = new Date().toISOString();
         localStorage.setItem("lastSyncTime", now);
         setLastSyncTime(now);
       } else { 
-        addToast("Error: API returned unexpected format.", "error"); 
-        setLoading(false);
+        if (!silent) addToast("Error: API returned unexpected format.", "error"); 
       }
     } catch (err) { 
-      addToast(`Sync Error: ${err.message}`, "error"); 
-      setLoading(false);
+      if (!silent) addToast(`Sync Error: ${err.message}`, "error"); 
+    } finally {
+        if (silent) {
+          setIsSoftSyncing(false);
+        } else {
+          setLoading(false);
+        }
     }
   };
 
   const runAnalysis = async (emailsToAnalyze) => {
     const payload = emailsToAnalyze || emails;
     
+    // Even if payload is empty, we must ensure loading is turned off
     if (!payload || payload.length === 0) {
         setLoading(false);
         return;
@@ -271,6 +384,7 @@ function Dashboard() {
       const res = await axios.post(`${API_BASE}/analyze`, { emails: payload });
       
       if (res.data.emails && Array.isArray(res.data.emails)) {
+        // Sanitize attachments structure for UI
         const sanitized = res.data.emails.map(e => {
           if (Array.isArray(e.attachments)) {
             e.attachments = e.attachments.map(a => ({
@@ -279,63 +393,55 @@ function Dashboard() {
               size: a.size,
               hash: a.hash,
               storage: a.storage,
-              full_hash: a.full_hash || null
+              full_hash: a.full_hash || null,
+              messageId: a.messageId
             }));
           }
 
-          if (Array.isArray(e.messages)) {
-            e.messages.forEach(m => {
-              if (Array.isArray(m.attachments)) {
-                m.attachments = m.attachments.map(a => ({
-                  name: a.name,
-                  type: a.type,
-                  size: a.size,
-                  hash: a.hash,
-                  storage: a.storage,
-                  full_hash: a.full_hash || null
-                }));
-              }
-            });
-          }
+          // No need to process e.messages attachments separately
+          // Backend should have merged them into e.attachments
           return e;
         });
 
         setEmails(sanitized);
+        
+        // Update report
+        setReport(res.data.report);
+      
+        // ✅ FIXED: Save only metadata to LocalStorage (not full data)
+        const metaCache = {
+          lastSync: new Date().toISOString(),
+          emailCount: res.data.emails?.length || 0,
+          briefingCount: res.data.report?.briefing_cards?.length || 0
+        };
+        localStorage.setItem("emailDashboardMeta", JSON.stringify(metaCache));
       }
       
-      setReport(res.data.report);
-      
-      localStorage.setItem(
-        "emailDashboardData",
-        JSON.stringify({
-          emails: res.data.emails,
-          report: res.data.report
-        })
-      );
-
       addToast("Insights Updated!", "success");
       setMainView('INSIGHTS'); 
     } catch (err) { 
       console.error(err); 
       addToast("Analysis Failed. Check console.", "error"); 
+    } finally {
+        // 🔴 FIX: Always turn off loading, even if error or 0 zoom mails
+        setLoading(false);
     }
-    setLoading(false);
   };
 
-  // --- THREAD PARSING (STEP 2: ATTACHMENTS FIX) ---
+  // --- THREAD PARSING (SIMPLIFIED) ---
   useEffect(() => {
     const fetchParsedThread = async () => {
       if (!selectedEmail) return;
       setThreadLoading(true);
       setParsedThread([]);
       
-      // STEP 2: Updated to include attachments at message level
+      // If email has messages array, use it; otherwise treat as single message
       if (selectedEmail.messages && Array.isArray(selectedEmail.messages)) {
         const segments = selectedEmail.messages.map((msg, idx) => ({
           type: idx === 0 ? 'latest' : 'history',
           header: `From: ${msg.from} | ${formatDate(msg.date || msg.received_at)}`,
           content: msg.body || "",
-          attachments: Array.isArray(msg.attachments) ? msg.attachments : []
+          attachments: msg.attachments || []
         }));
         setParsedThread(segments);
         setThreadLoading(false);
@@ -380,9 +486,59 @@ function Dashboard() {
 
   const handleLogout = () => {
     localStorage.removeItem("jimAuthSession"); 
-    localStorage.removeItem("emailDashboardData");
+    localStorage.removeItem("emailDashboardMeta");
     localStorage.removeItem("loggedInUser");
     window.location.href = "/login";
+  };
+
+  // ✅ UPDATED FUNCTION: Mark email as read + update backend cache
+  const markAsRead = async (emailObj) => {
+    try {
+      const userEmail = apiUrl.split("/inbox/")[1].split("/")[0];
+      
+      // 🔥 DEFINE messageId HERE (BEFORE using it in setEmails)
+      const messageId = emailObj.id || emailObj.messageId;
+
+      // STEP 1: Update frontend state IMMEDIATELY (optimistic update)
+      setEmails(prev =>
+        prev.map(e =>
+          (e.id === messageId || e.messageId === messageId)
+            ? { ...e, isRead: true }
+            : e
+        )
+      );
+
+      console.log("✅ Frontend updated: marked as read:", messageId);
+
+      // STEP 2: Call backend to mark as read in the actual inbox
+      await axios.post(
+        `${process.env.REACT_APP_API_URL || "http://localhost:8000/api"}/mark-read`,
+        {
+          email: userEmail,
+          messageId: messageId
+        }
+      );
+
+      console.log("✅ Backend inbox updated:", messageId);
+
+      addToast("Email marked as read", "success");
+
+    } catch (err) {
+      console.error("❌ Failed to mark as read:", err);
+      addToast("Failed to mark email as read", "error");
+      
+      // 🔥 Revert frontend state if backend call failed
+      // messageId is still in scope here from the try block
+      const messageId = emailObj.id || emailObj.messageId;
+      
+      setEmails(prev =>
+        prev.map(e =>
+          (e.id === messageId || e.messageId === messageId)
+            ? { ...e, isRead: false }
+            : e
+        )
+      );
+    }
   };
 
   const openFiles = (title, fileList) => {
@@ -444,12 +600,22 @@ function Dashboard() {
       isProfileOpen={isProfileOpen}
       setIsProfileOpen={setIsProfileOpen}
       
-      // --- NEW PROP PASSED DOWN ---
+      // --- NEW PROPS PASSED DOWN ---
       lastSyncTime={lastSyncTime}
+      inboxReady={inboxReady}
+      isSoftSyncing={isSoftSyncing}
+      autoSyncEnabled={autoSyncEnabled}
+      setAutoSyncEnabled={setAutoSyncEnabled}
 
       // Selection & Modals
       selectedEmail={selectedEmail}
-      setSelectedEmail={setSelectedEmail}
+      
+      // --- STEP 3: WRAPPED SETTER TO STORE ID ---
+      setSelectedEmail={(email) => {
+        setSelectedEmail(email);
+        setSelectedEmailId(email ? (email.id || email.messageId) : null);
+      }}
+      
       fileModalData={fileModalData}
       setFileModalData={setFileModalData}
       
@@ -463,7 +629,7 @@ function Dashboard() {
       
       // Computed Data
       realThreads={realThreads}
-      filteredEmails={filteredEmails}
+      filteredEmails={filteredAndSortedEmails}
       
       // Functions / Handlers
       fetchAndAnalyze={fetchAndAnalyze}
@@ -474,6 +640,7 @@ function Dashboard() {
       getAllAttachments={getAllAttachments}
       handleFileDownload={handleFileDownload}
       getSenderDetails={getSenderDetails}
+      markAsRead={markAsRead}
       
       // Helpers
       getParticipantDisplay={getParticipantDisplay}
@@ -481,6 +648,7 @@ function Dashboard() {
       getSafeDate={getSafeDate}
       getEmailBody={getEmailBody}
       getEmailAttachments={getEmailAttachments}
+      emailHasAttachments={emailHasAttachments}
     />
   );
 }

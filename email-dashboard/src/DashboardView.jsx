@@ -13,6 +13,7 @@ const CATEGORY_META = {
   URGENT: { emoji: "⚠️", label: "URGENT" },
   CONFIDENTIAL: { emoji: "🔒", label: "CONFIDENTIAL" },
   MEETING: { emoji: "📅", label: "MEETING" },
+  ZOOM: { emoji: "📹", label: "ZOOM" },
   NEWSLETTER: { emoji: "📰", label: "NEWSLETTER" },
   NORMAL: { emoji: "📬", label: "NORMAL" },
   PENDING: { emoji: "⏳", label: "PENDING" }
@@ -36,15 +37,19 @@ const DashboardView = ({
   isProfileOpen,
   setIsProfileOpen,
   
-  // --- NEW PROP ---
+  // --- NEW PROPS ---
   lastSyncTime,
-   
+  inboxReady,
+  isSoftSyncing,
+  autoSyncEnabled,
+  setAutoSyncEnabled,
+    
   // Selection & Modals
   selectedEmail,
   setSelectedEmail,
   fileModalData,
   setFileModalData,
-   
+    
   // Thread & Reply
   parsedThread,
   threadLoading,
@@ -52,11 +57,11 @@ const DashboardView = ({
   setReplyDraft,
   replyLoading,
   copySuccess,
-   
+    
   // Computed Data
   realThreads,
   filteredEmails,
-   
+    
   // Functions / Handlers
   fetchAndAnalyze,
   handleLogout,
@@ -65,6 +70,7 @@ const DashboardView = ({
   openFiles,
   getAllAttachments,
   getSenderDetails,
+  markAsRead, // <--- ✅ ACCEPTED PROP
 
   // Helpers
   getParticipantDisplay,
@@ -75,6 +81,9 @@ const DashboardView = ({
 }) => {
   // --- 1. NEW STATE FOR DOWNLOADING ---
   const [isDownloading, setIsDownloading] = useState(false);
+  // --- ADDED: Progress States ---
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [currentFileName, setCurrentFileName] = useState("");
 
   // --- HELPER: FORMAT FILE SIZE ---
   const formatFileSize = (bytes) => {
@@ -84,78 +93,64 @@ const DashboardView = ({
     return ` (${mb.toFixed(2)} MB)`;
   };
 
-  // --- STYLE FOR DOWNLOAD BUTTON ---
-  const downloadBtnStyle = {
-    backgroundColor: "#2563eb", // Blue-600
-    color: "#ffffff",
-    border: "none",
-    padding: "8px 16px", // Bigger padding
-    borderRadius: "8px",
-    fontSize: "0.9rem",
-    fontWeight: "600",
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    cursor: isDownloading ? "wait" : "pointer",
-    opacity: isDownloading ? 0.7 : 1,
-    transition: "background 0.2s ease",
-    boxShadow: "0 2px 4px rgba(37, 99, 235, 0.2)"
-  };
-
-  // --- UPDATED DOWNLOAD FUNCTION WITH LOADING STATE ---
+  // --- UPDATED DOWNLOAD FUNCTION (AXIOS + PROGRESS) ---
   const handleFileDownload = async (file, messageId) => {
-    if (isDownloading) return; // Prevent multiple clicks
+    // STEP 2: Debug log added
+    console.log("📤 Frontend download request:", {
+      fileName: file.name,
+      messageIdSent: messageId,
+      attachmentMessageId: file.messageId
+    });
 
     try {
-      // 1. Resolve Message ID
-      const targetMessageId = messageId || file.messageId || file.id;
-
+      setIsDownloading(true);
+      setDownloadProgress(0);
+      setCurrentFileName(file.name);
+  
+      const targetMessageId = messageId || file.messageId;
       if (!targetMessageId) {
-        console.error("❌ Cannot download: Missing messageId for file:", file);
-        alert("System Error: This file is missing its source Message ID. Cannot download.");
+        alert("Missing messageId for this file");
         return;
       }
-
-      // 2. Set Loading State
-      setIsDownloading(true);
-      console.log(`⬇️ Requesting download: ${file.name} (MsgID: ${targetMessageId})`);
-
-      // 3. Request Payload
-      const response = await fetch(`${process.env.REACT_APP_API_URL}/download-attachment`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+  
+      const response = await axios.post(
+        `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api'}/download-attachment`,
+        {
           name: file.name,
-          messageId: targetMessageId 
-        })
-      });
-
-      if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`Server Error: ${response.status} ${response.statusText} - ${errText}`);
-      }
-
-      // 4. Handle Binary Blob
-      const blob = await response.blob();
+          messageId: targetMessageId
+        },
+        {
+          responseType: "blob",
+          onDownloadProgress: (progressEvent) => {
+            if (progressEvent.total) {
+              const percent = Math.round(
+                (progressEvent.loaded * 100) / progressEvent.total
+              );
+              setDownloadProgress(percent);
+            }
+          }
+        }
+      );
+  
+      const blob = new Blob([response.data]);
       const url = window.URL.createObjectURL(blob);
-
-      // 5. Trigger Browser Download
       const a = document.createElement("a");
       a.href = url;
       a.download = file.name;
-      document.body.appendChild(a); 
+      document.body.appendChild(a);
       a.click();
-      
-      // 6. Cleanup
       a.remove();
       window.URL.revokeObjectURL(url);
-
+  
     } catch (error) {
-      console.error("Download failed:", error);
-      alert(`Download failed: ${error.message}`);
+      console.error(error);
+      alert("Download failed");
     } finally {
-      // 7. Reset Loading State
-      setIsDownloading(false);
+      setTimeout(() => {
+        setIsDownloading(false);
+        setDownloadProgress(0);
+        setCurrentFileName("");
+      }, 800); // small delay so 100% is visible
     }
   };
 
@@ -170,7 +165,47 @@ const DashboardView = ({
               <h3><Paperclip size={18} /> {fileModalData.title}</h3>
               <button className="btn-close" onClick={() => setFileModalData(null)}><X size={20} /></button>
             </div>
+            
             <div className="file-list-container">
+              {/* --- ADDED: Progress UI inside Modal --- */}
+              {isDownloading && (
+                <div style={{ marginBottom: "12px" }}>
+                  <div style={{ fontSize: "0.85rem", marginBottom: "4px" }}>
+                    Downloading: <strong>{currentFileName}</strong>
+                  </div>
+
+                  <div
+                    style={{
+                      width: "100%",
+                      height: "8px",
+                      background: "#e5e7eb",
+                      borderRadius: "5px",
+                      overflow: "hidden"
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${downloadProgress}%`,
+                        height: "100%",
+                        background: "#2563eb",
+                        transition: "width 0.2s ease"
+                      }}
+                    />
+                  </div>
+
+                  <div
+                    style={{
+                      fontSize: "0.8rem",
+                      marginTop: "4px",
+                      textAlign: "right",
+                      fontWeight: "600"
+                    }}
+                  >
+                    {downloadProgress}%
+                  </div>
+                </div>
+              )}
+
               {fileModalData.files.length === 0 ? <div style={{ textAlign: 'center', padding: '40px' }}>No files found.</div> : fileModalData.files.map((f, i) => (
                 <div key={i} className="file-row">
                   <div className="file-icon">
@@ -195,18 +230,27 @@ const DashboardView = ({
                   </div>
                   <div style={{ display: "flex", gap: "6px" }}>
                     
-                    {/* --- BIG BLUE DOWNLOAD BUTTON 1 --- */}
+                    {/* --- CHANGED: Download Button (Modal) --- */}
                     <button
-                      onClick={() => handleFileDownload(f, f.messageId)} 
-                      title="Download file"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        // STEP 1: Correct ID usage
+                        handleFileDownload(f, f.messageId);
+                      }}
                       disabled={isDownloading}
-                      style={downloadBtnStyle}
-                      onMouseOver={(e) => e.currentTarget.style.backgroundColor = "#1d4ed8"}
-                      onMouseOut={(e) => e.currentTarget.style.backgroundColor = "#2563eb"}
+                      style={{
+                        backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
+                        cursor: isDownloading ? "not-allowed" : "pointer",
+                        color: "white",
+                        padding: "6px 12px",
+                        borderRadius: "6px",
+                        border: "none",
+                        display: "flex", alignItems: "center", gap: "6px"
+                      }}
                     >
                       {isDownloading ? (
                         <>
-                           <Loader size={16} className="animate-spin" /> Downloading...
+                          <Loader size={14} className="animate-spin" /> {downloadProgress}%
                         </>
                       ) : (
                         <>
@@ -257,70 +301,79 @@ const DashboardView = ({
                 {(replyDraft || replyLoading) && (<div className="reply-box">{replyLoading ? (<div className="ai-thinking">Thinking...</div>) : (<textarea value={replyDraft} onChange={(e) => setReplyDraft(e.target.value)} className="reply-textarea" placeholder="AI will draft a reply here..." />)}</div>)}
               </div>
               <hr className="divider" />
-              {threadLoading ? <div className="loading-text">Loading content...</div> : (
+              {threadLoading ? (
+                <div className="loading-text">Loading content...</div>
+              ) : selectedEmail.messages && selectedEmail.messages.length > 1 ? (
+                /* 🧵 THREAD EMAIL */
                 <div className="email-thread-container">
-                  {parsedThread.length > 1 ? (
-                    <>
-                      <div style={{marginBottom: '10px', fontSize: '1rem', fontWeight: '700', color: '#1e1b4b'}}>
-                        <Hash size={16} style={{display:'inline', marginRight:'5px'}}/> Conversation History ({parsedThread.length})
-                      </div>
-                      {parsedThread.map((msg, idx) => (
-                        <div key={idx} className={`thread-message ${msg.type}`}>
-                          {msg.header && <div className="thread-header">{msg.header}</div>}
-                          <div className="thread-content">
-                            {msg.content.split('\n').map((l, i) => <p key={i}>{l}</p>)}
-                          </div>
-                          {msg.attachments && msg.attachments.length > 0 && (
-                            <div className="ec-atts mt-2">
-                              <Paperclip size={14} />
-                              {msg.attachments.map((att, aidx) => (
-                                <div key={aidx} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
-                                  <span style={{ flex: 1 }}>
-                                    {att.name || "Unnamed file"}
-                                    <span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>
-                                      {formatFileSize(att.size)}
-                                    </span>
+                  <div style={{marginBottom: '10px', fontSize: '1rem', fontWeight: '700', color: '#1e1b4b'}}>
+                    <Hash size={16} style={{display:'inline', marginRight:'5px'}}/> Conversation History ({selectedEmail.messages.length})
+                  </div>
+                  <div className="thread-conversation">
+                    {parsedThread.map((msg, idx) => (
+                      <div key={idx} className="message-item message-thread">
+                        {msg.header && <div className="message-from">{msg.header}</div>}
+                        <div className="message-body">
+                          {msg.content.split('\n').map((l, i) => (
+                            <p key={i}>{l}</p>
+                          ))}
+                        </div>
+                        {msg.attachments && msg.attachments.length > 0 && (
+                          <div className="ec-atts mt-2">
+                            <Paperclip size={14} />
+                            {msg.attachments.map((att, aidx) => (
+                              <div key={aidx} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
+                                <span style={{ flex: 1 }}>
+                                  {att.name || "Unnamed file"}
+                                  <span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>
+                                    {formatFileSize(att.size)}
                                   </span>
-                                  
-                                  {/* --- BIG BLUE DOWNLOAD BUTTON 2 --- */}
-                                  <button
-                                    onClick={(e) => { 
-                                      e.stopPropagation(); 
-                                      handleFileDownload(att, selectedEmail.messageId || selectedEmail.id); 
-                                    }} 
-                                    title="Download file"
-                                    disabled={isDownloading}
-                                    style={downloadBtnStyle}
-                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = "#1d4ed8"}
-                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = "#2563eb"}
-                                  >
-                                    {isDownloading ? (
-                                      <>
-                                        <Loader size={16} className="animate-spin" /> Downloading...
-                                      </>
-                                    ) : (
-                                      <>
-                                        <Download size={16} /> Download
-                                      </>
-                                    )}
-                                  </button>
+                                </span>
+                                
+                                {/* --- Download Button (Thread View) --- */}
+                                <button
+                                  onClick={(e) => { 
+                                    e.stopPropagation();
+                                    handleFileDownload(att, att.messageId); 
+                                  }} 
+                                  disabled={isDownloading}
+                                  style={{
+                                    backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
+                                    cursor: isDownloading ? "not-allowed" : "pointer",
+                                    color: "white",
+                                    padding: "6px 12px",
+                                    borderRadius: "6px",
+                                    border: "none",
+                                    display: "flex", alignItems: "center", gap: "6px"
+                                  }}
+                                >
+                                  {isDownloading ? (
+                                    <>
+                                      <Loader size={14} className="animate-spin" /> {downloadProgress}%
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Download size={16} /> Download
+                                    </>
+                                  )}
+                                </button>
 
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </>
-                  ) : (
-                    <div className="single-email-body">
-                      {parsedThread.map((msg, idx) => (
-                        <div key={idx} className="email-body-text">
-                          {msg.content.split('\n').map((l, i) => <p key={i}>{l}</p>)}
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                /* 📩 SINGLE EMAIL */
+                <div className="single-email-body">
+                  {(selectedEmail.body || "No content available")
+                    .split('\n')
+                    .map((line, i) => (
+                      <p key={i}>{line}</p>
+                    ))}
                 </div>
               )}
             </div>
@@ -346,12 +399,31 @@ const DashboardView = ({
                 <Zap size={20} color="#374151" />
               </button>
 
+              {/* ✅ AUTO SYNC TOGGLE BUTTON */}
+              <button
+                className="menu-btn"
+                onClick={() => setAutoSyncEnabled(prev => !prev)}
+                title="Toggle Auto Sync"
+                style={{
+                  backgroundColor: autoSyncEnabled ? "#16a34a" : "#dc2626",
+                  color: "white",
+                  fontSize: "0.75rem",
+                  padding: "4px 10px",
+                  borderRadius: "6px",
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: "600",
+                  transition: "background-color 0.2s ease"
+                }}
+              >
+                {autoSyncEnabled ? "🟢 Auto Sync ON" : "⛔ Auto Sync OFF"}
+              </button>
+
               {lastSyncTime && (
                 <span
                   style={{
                     fontSize: "0.75rem",
-                    color: "var(--text-secondary)",
-                    opacity: 0.8
+                    color: "var(--text-secondary)"
                   }}
                 >
                   Last synced:{" "}
@@ -359,6 +431,11 @@ const DashboardView = ({
                     hour: "2-digit",
                     minute: "2-digit"
                   })}
+                  {isSoftSyncing && (
+                    <span style={{ marginLeft: "8px", color: "#60a5fa" }}>
+                      Syncing quietly…
+                    </span>
+                  )}
                 </span>
               )}
             </div>
@@ -373,8 +450,21 @@ const DashboardView = ({
               <span className="welcome-text" style={{ fontSize: '1.3rem', fontWeight: '700', letterSpacing: '-0.5px' }}>{greetingInfo.greeting}, {username}</span>
               <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px', fontWeight: '500' }}>{greetingInfo.date}</span>
             </div>
-            <div className="avatar">JO</div>
-            {isProfileOpen && (<div className="profile-dropdown"><button onClick={handleLogout} className="dropdown-item text-red"><LogOut size={16} /> Sign Out</button></div>)}
+            {/* ✅ AVATAR CHANGE: Only 1st letter of username */}
+            <div className="avatar">{username.charAt(0).toUpperCase()}</div>
+            {isProfileOpen && (
+              <div className="profile-dropdown">
+                <button 
+                  onClick={(e) => {
+                    e.stopPropagation(); // ✅ Stops event bubbling
+                    handleLogout();
+                  }} 
+                  className="dropdown-item text-red"
+                >
+                  <LogOut size={16} /> Sign Out
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
@@ -411,11 +501,20 @@ const DashboardView = ({
                       <div className="ts-content">
                         {(report.briefing_cards || []).length > 0 ? (
                           <div style={{display: 'flex', flexDirection: 'column', gap: '15px'}}>
-                            {report.briefing_cards.map((card, idx) => {
-                                const threadEmail = emails[idx];
+                            {report.briefing_cards.map((card) => {
+                                const threadEmail = emails.find(
+                                  e =>
+                                    String(e.id).trim() === String(card.id).trim() ||
+                                    String(e.messageId).trim() === String(card.id).trim()
+                                );
+
+                                if (!threadEmail) {
+                                  console.warn("No matching email for briefing card:", card);
+                                }
+
                                 return (
                                   <div 
-                                    key={idx} 
+                                    key={card.id}
                                     className="briefing-card-row"
                                     onClick={() => threadEmail && setSelectedEmail(threadEmail)}
                                     style={{ cursor: "pointer" }}
@@ -481,22 +580,27 @@ const DashboardView = ({
                                         </span>
                                       </span>
                                       
-                                      {/* --- BIG BLUE DOWNLOAD BUTTON 3 --- */}
+                                      {/* --- CHANGED: Download Button (Sender Insights) --- */}
                                       <button 
                                         onClick={(e) => { 
-                                          e.stopPropagation();
-                                          const mid = a.messageId || (mails[0] && (mails[0].messageId || mails[0].id));
-                                          handleFileDownload(a, mid); 
+                                          e.stopPropagation(); 
+                                          // STEP 4: Use a.messageId directly
+                                          handleFileDownload(a, a.messageId); 
                                         }} 
-                                        title="Download file"
                                         disabled={isDownloading}
-                                        style={downloadBtnStyle}
-                                        onMouseOver={(e) => e.currentTarget.style.backgroundColor = "#1d4ed8"}
-                                        onMouseOut={(e) => e.currentTarget.style.backgroundColor = "#2563eb"}
+                                        style={{
+                                          backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
+                                          cursor: isDownloading ? "not-allowed" : "pointer",
+                                          color: "white",
+                                          padding: "6px 12px",
+                                          borderRadius: "6px",
+                                          border: "none",
+                                          display: "flex", alignItems: "center", gap: "6px"
+                                        }}
                                       >
                                         {isDownloading ? (
                                           <>
-                                            <Loader size={16} className="animate-spin" /> Downloading...
+                                              <Loader size={14} className="animate-spin" /> {downloadProgress}%
                                           </>
                                         ) : (
                                           <>
@@ -527,6 +631,7 @@ const DashboardView = ({
                     { name: 'URGENT', emoji: '⚠️' },
                     { name: 'CONFIDENTIAL', emoji: '🔒' },
                     { name: 'MEETING', emoji: '📅' },
+                    { name: 'ZOOM', emoji: '📹' },
                     { name: 'NEWSLETTER', emoji: '📰' }
                   ].map(tab => (
                     <button key={tab.name} className={`tab-btn ${activeTab === tab.name ? 'active' : ''} ${tab.name.toLowerCase()}`} onClick={() => setActiveTab(tab.name)}>
@@ -535,73 +640,109 @@ const DashboardView = ({
                   ))}
                 </div>
                 <div className="email-feed">
-                  {filteredEmails.map((email, idx) => {
-                    const atts = getEmailAttachments(email);
-                    return (
-                      <div key={idx} className={`email-card border-${(email.category || 'normal').toLowerCase()}`} onClick={() => setSelectedEmail(email)}>
-                        <div className="ec-left-border"></div>
-                        <div className="ec-content">
-                          <div className="ec-top">
-                            <h4>{email.subject || "No Subject"}</h4>
-                            <div className="ec-badges">
-                              {(() => {
-                                const cat = (email.category || "PENDING").toUpperCase();
-                                const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL;
-                                return <span className={`cat-tag ${cat.toLowerCase()}`}>{meta.emoji} {meta.label}</span>;
-                              })()}
-                            </div>
-                          </div>
-                          <div className="ec-meta">
-                            <span title={getParticipantDisplay(email)} style={{maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                              <User size={14} /> {getParticipantDisplay(email)}
-                            </span>
-                            <span><Clock size={14} /> {formatDate(getSafeDate(email))}</span>
-                            {(email.cc || email.CC) && <span className="cc-badge"><Users size={12} /> CC</span>}
-                          </div>
-                          <div className="ec-body">{email.summary || "Pending analysis..."}</div>
-                          {atts.length > 0 && (
-                            <div className="ec-atts">
-                              <Paperclip size={14} />
-                              {atts.map((a, k) => (
-                                <div key={k} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
-                                  <span style={{ flex: 1 }}>
-                                    {a.name || a.file_name || "File"}
-                                    <span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>
-                                      {formatFileSize(a.size)}
-                                    </span>
-                                  </span>
-                                  
-                                  {/* --- BIG BLUE DOWNLOAD BUTTON 4 --- */}
-                                  <button
-                                    onClick={(e) => { 
-                                      e.stopPropagation(); 
-                                      handleFileDownload(a, email.messageId || email.id); 
-                                    }} 
-                                    title="Download file"
-                                    disabled={isDownloading}
-                                    style={downloadBtnStyle}
-                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = "#1d4ed8"}
-                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = "#2563eb"}
-                                  >
-                                    {isDownloading ? (
-                                      <>
-                                        <Loader size={16} className="animate-spin" /> Downloading...
-                                      </>
-                                    ) : (
-                                      <>
-                                        <Download size={16} /> Download
-                                      </>
-                                    )}
-                                  </button>
+                  {!inboxReady ? (
+                    <div className="loading-text">Syncing inbox...</div>
+                  ) : filteredEmails.length === 0 ? (
+                    <div className="loading-text">No emails found</div>
+                  ) : (
+                    filteredEmails.map((email) => {
+                      const atts = email.attachments || [];
+                      return (
+                        <div key={email.id || email.messageId} className={`email-card border-${(email.category || 'normal').toLowerCase()}`} onClick={() => setSelectedEmail(email)}>
+                          <div className="ec-left-border"></div>
+                          <div className="ec-content">
+                            <div className="ec-top" style={{ display: "flex", justifyContent: "space-between" }}>
+                              <h4>{email.subject || "No Subject"}</h4>
 
+                              <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                {/* ✅ MARK AS READ BUTTON */}
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();   // Do not open email
+                                    markAsRead(email);     // Call your organization API
+                                  }}
+                                  style={{
+                                    background: email.isRead ? "#22c55e" : "#2563eb",
+                                    color: "white",
+                                    border: "none",
+                                    borderRadius: "5px",
+                                    padding: "3px 8px",
+                                    fontSize: "0.7rem",
+                                    cursor: "pointer",
+                                    fontWeight: "600",
+                                    whiteSpace: "nowrap"
+                                  }}
+                                >
+                                  {email.isRead ? "✓ Read" : "Mark Read"}
+                                </button>
+
+                                <div className="ec-badges">
+                                  {(() => {
+                                    const cat = (email.category || "PENDING").toUpperCase();
+                                    const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL;
+                                    return <span className={`cat-tag ${cat.toLowerCase()}`}>{meta.emoji} {meta.label}</span>;
+                                  })()}
                                 </div>
-                              ))}
+                              </div>
                             </div>
-                          )}
+                            <div className="ec-meta">
+                              <span title={getParticipantDisplay(email)} style={{maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                                <User size={14} /> {getParticipantDisplay(email)}
+                              </span>
+                              <span><Clock size={14} /> {formatDate(getSafeDate(email))}</span>
+                              {(email.cc || email.CC) && <span className="cc-badge"><Users size={12} /> CC</span>}
+                            </div>
+                            <div className="ec-body">{email.summary || "Pending analysis..."}</div>
+                            {atts.length > 0 && (
+                              <div className="ec-atts">
+                                <Paperclip size={14} />
+                                {atts.map((a, k) => (
+                                  <div key={k} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
+                                    <span style={{ flex: 1 }}>
+                                      {a.name || a.file_name || "File"}
+                                      <span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>
+                                        {formatFileSize(a.size)}
+                                      </span>
+                                    </span>
+                                    
+                                    {/* --- CHANGED: Download Button (Feed View) --- */}
+                                    <button
+                                      onClick={(e) => { 
+                                        e.stopPropagation();
+                                        // STEP 4: Use a.messageId directly
+                                        handleFileDownload(a, a.messageId); 
+                                      }} 
+                                      disabled={isDownloading}
+                                      style={{
+                                        backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
+                                        cursor: isDownloading ? "not-allowed" : "pointer",
+                                        color: "white",
+                                        padding: "6px 12px",
+                                        borderRadius: "6px",
+                                        border: "none",
+                                        display: "flex", alignItems: "center", gap: "6px"
+                                      }}
+                                    >
+                                      {isDownloading ? (
+                                        <>
+                                          <Loader size={14} className="animate-spin" /> {downloadProgress}%
+                                        </>
+                                      ) : (
+                                        <>
+                                          <Download size={16} /> Download
+                                        </>
+                                      )}
+                                    </button>
+
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })
+                  )}
                 </div>
               </div>
             )}

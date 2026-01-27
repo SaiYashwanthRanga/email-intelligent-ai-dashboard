@@ -33,6 +33,10 @@ Your job is to strictly classify an email into ONE of the following categories:
 4. MEETING  
    - Meeting invites, schedules, minutes, follow-ups  
 
+5. ZOOM CALLS
+    -  Any email that contains a Zoom meeting link
+    -  URLs like https://zoom.us or https://*.zoom.us
+
 5. NEWSLETTER  
    - Marketing, announcements, automated updates  
 
@@ -50,7 +54,7 @@ Rules:
 JSON format:
 
 {
-  "category": "PRIORITY | URGENT | CONFIDENTIAL | MEETING | NEWSLETTER | NORMAL",
+  "category": "PRIORITY | URGENT | CONFIDENTIAL | MEETING | ZOOM | NEWSLETTER | NORMAL"
   "priority": 1,
   "summary": "short professional summary"
 }
@@ -86,6 +90,8 @@ print(f"✅ Loaded {len(VIP_SENDERS)} VIP senders: {VIP_SENDERS}")
 # --- DATA NORMALIZATION ---
 def normalize_email(e: dict):
     clean_attachments = []
+    
+    email_id = e.get("id") or e.get("_id") or e.get("messageId")
 
     for att in e.get("attachments", []):
         clean_attachments.append({
@@ -94,7 +100,9 @@ def normalize_email(e: dict):
             "size": att.get("size", 0),
             "hash": att.get("hash"),           # already trimmed in main.py
             "full_hash": att.get("full_hash"), # used only for download
-            "storage": att.get("storage", "inline") # Ensure storage type is preserved
+            "storage": att.get("storage", "inline"), # Ensure storage type is preserved
+            "file_path": att.get("file_path"),   # 👈 ADD THIS to preserve disk path
+            "messageId": email_id   # 👈 THIS IS THE KEY LINE
         })
 
     return {
@@ -156,22 +164,44 @@ def get_cached_emails():
 # --- UPDATED FUNCTION HERE ---
 def save_cached_emails(emails):
     """
-    Cache enriched emails but keep full_hash ONLY for inline attachments.
-    Video/remote files never contain base64 anyway.
+    Cache enriched emails safely.
+    Ensures 'file_path' is preserved for disk-based files.
+    Removes 'full_hash' only for remote files.
     """
+    cleaned = []
     for e in emails:
-        # Top-level attachments
+        # Create a shallow copy of the email first
+        email_copy = e.copy()
+        
+        # 1. Process Top-Level Attachments
+        new_atts = []
         for att in e.get("attachments", []):
-            if att.get("storage") == "remote":
-                att.pop("full_hash", None)
+            att_copy = att.copy()
+            # If storage is remote, we don't need full_hash
+            if att_copy.get("storage") == "remote":
+                att_copy.pop("full_hash", None)
+            
+            # Note: We do NOT pop 'file_path'. It stays in att_copy.
+            new_atts.append(att_copy)
+        email_copy["attachments"] = new_atts
 
-        # Thread message attachments
+        # 2. Process Thread Message Attachments
+        new_messages = []
         for msg in e.get("messages", []):
-            for att in msg.get("attachments", []):
-                if att.get("storage") == "remote":
-                    att.pop("full_hash", None)
+            msg_copy = msg.copy()
+            new_msg_atts = []
+            for matt in msg.get("attachments", []):
+                matt_copy = matt.copy()
+                if matt_copy.get("storage") == "remote":
+                    matt_copy.pop("full_hash", None)
+                new_msg_atts.append(matt_copy)
+            msg_copy["attachments"] = new_msg_atts
+            new_messages.append(msg_copy)
+        email_copy["messages"] = new_messages
 
-    save_cache({EMAILS_KEY: emails})
+        cleaned.append(email_copy)
+
+    save_cache({EMAILS_KEY: cleaned})
 # -----------------------------
 
 # --- HELPER FUNCTIONS ---
@@ -304,12 +334,23 @@ Body:{email_body}{CLASSIFICATION_PROMPT}
 
         # --- STEP 3: Enforce VIP rule after AI response ---
         sender = (email.get("from") or "").lower()
-        if sender in VIP_SENDERS:
+        
+        # --- MODIFIED: Enforce ZOOM Logic ---
+        body_text = (email.get("body") or "").lower()
+        subject_text = (email.get("subject") or "").lower()
+
+        has_zoom = "zoom.us" in body_text or "zoom.us" in subject_text
+
+        if has_zoom:
+            email["category"] = "ZOOM"
+            email["priority"] = 4
+        elif sender in VIP_SENDERS:
             email["category"] = "PRIORITY"
             email["priority"] = 5
         else:
             email["category"] = result.get("category", "NORMAL")
             email["priority"] = result.get("priority", 1)
+        # ------------------------------------
 
         email["summary"] = result.get("summary", "No summary")
         email["action"] = result.get("action", "REVIEW")
@@ -450,14 +491,25 @@ async def analyze_single_thread(subject, messages):
         )
         result = json.loads(response.choices[0].message.content)
         
-        # Apply VIP rule to threads (kept as originally provided since user didn't request changes here)
-        if is_priority_sender:
+        # --- MODIFIED: Enforce ZOOM Logic in Threads ---
+        # Detect Zoom inside thread messages
+        has_zoom = False
+        for m in clean_messages:
+            text = (m.get("body") or "").lower()
+            if "zoom.us" in text:
+                has_zoom = True
+                break
+
+        if has_zoom:
+            final_category = "ZOOM"
+            final_priority = 4
+        elif is_priority_sender:
             final_category = "PRIORITY"
             final_priority = 5
-            print(f"✅ VIP THREAD DETECTED: {display_subject}")
         else:
             final_category = result.get("category", "NORMAL")
             final_priority = result.get("priority", 1)
+        # ----------------------------------------------
         
         final_date = result.get("normalized_date") or latest_date
 
@@ -482,16 +534,45 @@ async def analyze_single_thread(subject, messages):
     except:
         return {"subject": display_subject, "category": "NORMAL", "summary": "Error.", "thread_count": len(final_messages)}
 
+# --- ✅ UPDATED: generate_executive_brief WITH ID MAPPING ---
 async def generate_executive_brief(threads):
     active_threads = [t for t in threads if t.get('category') != 'NEWSLETTER' and (t.get('thread_count', 1) > 1 or t.get('category') == 'URGENT')]
     if not active_threads: return {"briefing_cards": []}
 
-    thread_data = [f"Subject: {t.get('subject')} | Status: {t.get('summary')}" for t in active_threads[:10]]
+    # ✅ CHANGED: Include id, subject, summary, category in thread_data
+    thread_data = [
+        {
+            "id": t.get("id"),
+            "subject": t.get("subject"),
+            "summary": t.get("summary"),
+            "category": t.get("category")
+        }
+        for t in active_threads[:10]
+    ]
+
+    # ✅ CHANGED: Updated prompt with clear ID mapping instruction
     prompt = f"""
-    Create Executive Briefing Cards.
-    INPUT: {json.dumps(thread_data)}
-    OUTPUT JSON: {{ "briefing_cards": [ {{ "topic": "Title", "status": "Update", "category": "URGENT" }} ] }}
-    """
+Create Executive Briefing Cards.
+
+INPUT JSON:
+{json.dumps(thread_data)}
+
+For every input item, create one briefing card.
+You MUST copy the same "id" field into the output.
+
+OUTPUT JSON FORMAT:
+{{
+  "briefing_cards": [
+    {{
+      "id": "original id",
+      "topic": "Short title",
+      "status": "Current status",
+      "category": "URGENT | PRIORITY | MEETING | NORMAL"
+    }}
+  ]
+}}
+"""
+
     try:
         response = await client.chat.completions.create(
             model=ACTIVE_MODEL,
