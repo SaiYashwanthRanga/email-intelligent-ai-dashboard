@@ -6,6 +6,7 @@ import io
 import base64
 import json
 import uuid  # Added for unique file naming
+import time  # Added for cleanup task timing
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Body
@@ -45,6 +46,61 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Cache file path
 CACHE_FILE = Path("db_cache.json")
+
+# --- AUTO CLEANUP CONFIG ---
+FILE_TTL_SECONDS = 24 * 60 * 60   # 24 hours
+
+# 🔐 USER-SCOPED ATTACHMENT STORAGE HELPER
+def safe_user_folder(user_email: str) -> str:
+    """
+    Convert email to filesystem-safe folder name.
+    Replaces @ and . with underscores to avoid filesystem conflicts.
+    Example: ramon.romero@hfmg.net → ramon_romero_at_hfmg_net
+    """
+    return user_email.replace("@", "_at_").replace(".", "_")
+
+
+def cleanup_old_attachments():
+    """
+    Deletes attachment files older than 24 hours from temp_attachments folder.
+    🔐 USER-SCOPED: Iterates per user folder to safely isolate cleanup.
+    """
+    if not os.path.exists(TEMP_DIR):
+        return
+
+    now = time.time()
+    deleted = 0
+
+    # 🔐 Iterate through user folders
+    for user_folder in os.listdir(TEMP_DIR):
+        user_dir = os.path.join(TEMP_DIR, user_folder)
+
+        # Skip if not a directory
+        if not os.path.isdir(user_dir):
+            continue
+
+        # Process files in user's directory
+        for filename in os.listdir(user_dir):
+            file_path = os.path.join(user_dir, filename)
+
+            # Skip if not a file
+            if not os.path.isfile(file_path):
+                continue
+
+            try:
+                file_age = now - os.path.getctime(file_path)
+
+                if file_age > FILE_TTL_SECONDS:
+                    os.remove(file_path)
+                    deleted += 1
+                    print(f"🧹 Deleted expired attachment: {file_path}")
+
+            except Exception as e:
+                print(f"⚠️ Cleanup failed for {file_path}: {e}")
+
+    if deleted:
+        print(f"🧹 Cleanup completed. Removed {deleted} expired user-scoped attachment(s)")
+
 
 app = FastAPI()
 
@@ -118,6 +174,14 @@ def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hf
         resp = requests.get(clean_url, timeout=60)
         data = resp.json()
 
+        # 🔐 EXTRACT USER EMAIL FROM URL for scoped storage
+        user_email = clean_url.split("/inbox/")[1].split("/")[0]
+        user_folder = safe_user_folder(user_email)
+        user_dir = os.path.join(TEMP_DIR, user_folder)
+        os.makedirs(user_dir, exist_ok=True)
+
+        print(f"🔐 Using user-scoped storage: {user_dir}")
+
         # STEP 1.1 → Strip heavy Base64 immediately
         for mail in data:
             for att in mail.get("attachments", []):
@@ -125,34 +189,19 @@ def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hf
                     raw_hash = att["hash"]  # Store ORIGINAL complete hash
                     att["size"] = len(raw_hash)
 
-                    file_name = (att.get("name") or "").lower()
+                    # --- STEP: Save ALL attachments to disk (USER-SCOPED) ---
+                    file_id = f"{uuid.uuid4()}.b64"
+                    file_path = os.path.join(user_dir, file_id)
 
-                    # Detect video files
-                    is_video = any(file_name.endswith(ext) for ext in [
-                        ".mp4", ".mov", ".avi", ".mkv", ".webm"
-                    ])
+                    with open(file_path, "w") as f:
+                        f.write(raw_hash)
 
-                    # --- STEP 1: CHANGE STORAGE LOGIC TO DISK ---
-                    if is_video:
-                        # Save large file to disk instead of RAM
-                        file_id = f"{uuid.uuid4()}.b64"
-                        file_path = os.path.join(TEMP_DIR, file_id)
+                    att["hash"] = raw_hash[:16]       # only preview for UI
+                    att["full_hash"] = None           # remove heavy data
+                    att["storage"] = "disk"
+                    att["file_path"] = file_path
 
-                        with open(file_path, "w") as f:
-                            f.write(raw_hash)
-
-                        att["hash"] = raw_hash[:16]
-                        att["full_hash"] = None
-                        att["storage"] = "disk"
-                        att["file_path"] = file_path
-
-                        print(f"💾 Video saved to disk: {att.get('name')} -> {file_path}")
-                    else:
-                        # Safe for PDFs, DOCs, images - KEEP THE FULL ORIGINAL HASH
-                        att["hash"] = raw_hash[:16]  # Keep preview for UI
-                        att["full_hash"] = raw_hash  # Keep COMPLETE data for download
-                        att["storage"] = "inline"
-                        print(f"✅ File processed: {att.get('name')} | preview hash: {att['hash']} | full_hash len: {len(att['full_hash'])}")
+                    print(f"💾 Attachment saved to user-scoped disk: {att.get('name')} -> {file_path}")
         
         # STEP 1.2 → Debug confirmation
         if data and data[0].get("attachments"):
@@ -160,8 +209,9 @@ def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hf
             for att in data[0].get("attachments", [])[:2]:
                 print(f"  Name: {att.get('name')}")
                 print(f"    hash length: {len(att.get('hash', ''))}")
-                print(f"    full_hash length: {len(att.get('full_hash', '') or '')}")
+                print(f"    full_hash: {att.get('full_hash')}")
                 print(f"    storage: {att.get('storage')}")
+                print(f"    file_path: {att.get('file_path')}")
                 print(f"    Keys in att: {list(att.keys())}")
                 print()
 
@@ -371,7 +421,7 @@ def download_remote_file(payload: dict):
         detail="Mailbox attachment download endpoint not configured yet. Need attachment download URL."
     )
 
-# --- STEP 2: UPDATE DOWNLOAD API (DISK SUPPORT) ---
+# --- STEP 2: UPDATE DOWNLOAD API (DISK SUPPORT + USER-SCOPED SAFETY) ---
 @app.post("/api/download-attachment")
 def download_attachment(data: dict):
     name = data.get("name")
@@ -386,21 +436,16 @@ def download_attachment(data: dict):
 
                 if att["name"] == name:
 
-                    # Small files (Inline in Memory)
-                    if att.get("storage") == "inline":
-                        file_bytes = base64.b64decode(att["full_hash"])
-                        return StreamingResponse(
-                            io.BytesIO(file_bytes),
-                            media_type=att.get("type"),
-                            headers={"Content-Disposition": f'attachment; filename="{name}"'}
-                        )
-
-                    # Large files (Saved on Disk)
+                    # Large files (Saved on Disk) - PRIMARY STORAGE METHOD
                     if att.get("storage") == "disk":
                         file_path = att.get("file_path")
 
+                        # 🔐 SAFETY CHECK: Ensure file exists and is readable (user-scoped safe)
                         if not file_path or not os.path.exists(file_path):
-                            raise HTTPException(status_code=404, detail="File not found on disk")
+                            raise HTTPException(
+                                status_code=410,
+                                detail="Attachment expired or no longer available"
+                            )
 
                         print(f"💾 Loading large file from disk: {file_path}")
 
@@ -409,6 +454,15 @@ def download_attachment(data: dict):
 
                         file_bytes = base64.b64decode(base64_data)
 
+                        return StreamingResponse(
+                            io.BytesIO(file_bytes),
+                            media_type=att.get("type"),
+                            headers={"Content-Disposition": f'attachment; filename="{name}"'}
+                        )
+
+                    # Fallback: Small files (Inline in Memory)
+                    if att.get("storage") == "inline":
+                        file_bytes = base64.b64decode(att["full_hash"])
                         return StreamingResponse(
                             io.BytesIO(file_bytes),
                             media_type=att.get("type"),
@@ -534,3 +588,14 @@ async def file_stream(request: Request, mode: str = "preview"):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# --- BACKGROUND CLEANUP TASK ---
+@app.on_event("startup")
+async def start_cleanup_task():
+    async def cleanup_loop():
+        while True:
+            print("🧹 Running scheduled attachment cleanup (user-scoped)...")
+            cleanup_old_attachments()
+            await asyncio.sleep(60 * 60)  # run every 1 hour
+
+    asyncio.create_task(cleanup_loop())

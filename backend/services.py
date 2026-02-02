@@ -514,7 +514,7 @@ async def analyze_single_thread(subject, messages):
         final_date = result.get("normalized_date") or latest_date
 
         final_result = {
-            "id": messages[0].get('id', 'thread'),
+            "id": messages[0].get("messageId") or messages[0].get("id"),
             "subject": display_subject,
             "from": list(participants)[0] if len(participants) == 1 else f"{len(participants)} Participants",
             "participants": list(participants),

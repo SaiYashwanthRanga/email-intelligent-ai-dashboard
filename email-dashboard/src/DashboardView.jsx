@@ -367,13 +367,68 @@ const DashboardView = ({
                   </div>
                 </div>
               ) : (
-                /* 📩 SINGLE EMAIL */
-                <div className="single-email-body">
-                  {(selectedEmail.body || "No content available")
-                    .split('\n')
-                    .map((line, i) => (
-                      <p key={i}>{line}</p>
-                    ))}
+                /* 📩 SINGLE EMAIL – Styled like Thread */
+                <div className="email-thread-container">
+                    <div style={{marginBottom: '10px', fontSize: '1rem', fontWeight: '700', color: '#1e1b4b'}}>
+                    <Mail size={16} style={{display:'inline', marginRight:'5px'}} />
+                    Email Content
+                    </div>
+
+                    <div className="thread-conversation">
+                    <div className="message-item message-thread">
+                        <div className="message-from">
+                        From: {getParticipantDisplay(selectedEmail)} | {formatDate(getSafeDate(selectedEmail))}
+                        </div>
+
+                        <div className="message-body">
+                        {(selectedEmail.body || "No content available")
+                            .split('\n')
+                            .map((line, i) => (
+                            <p key={i}>{line}</p>
+                            ))}
+                        </div>
+
+                        {selectedEmail.attachments && selectedEmail.attachments.length > 0 && (
+                        <div className="ec-atts mt-2">
+                            <Paperclip size={14} />
+                            {selectedEmail.attachments.map((att, aidx) => (
+                            <div key={aidx} className="att-file" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span style={{ flex: 1 }}>
+                                {att.name || "Unnamed file"}
+                                </span>
+
+                                <button
+                                onClick={(e) => { 
+                                    e.stopPropagation();
+                                    handleFileDownload(att, att.messageId);
+                                }}
+                                disabled={isDownloading}
+                                style={{
+                                    backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
+                                    cursor: isDownloading ? "not-allowed" : "pointer",
+                                    color: "white",
+                                    padding: "6px 12px",
+                                    borderRadius: "6px",
+                                    border: "none",
+                                    display: "flex", alignItems: "center", gap: "6px"
+                                }}
+                                >
+                                {isDownloading ? (
+                                    <>
+                                    <Loader size={14} className="animate-spin" /> {downloadProgress}%
+                                    </>
+                                ) : (
+                                    <>
+                                    <Download size={16} /> Download
+                                    </>
+                                )}
+                                </button>
+                            </div>
+                            ))}
+                        </div>
+                        )}
+                    </div>
+                    </div>
                 </div>
               )}
             </div>
@@ -431,10 +486,10 @@ const DashboardView = ({
                     hour: "2-digit",
                     minute: "2-digit"
                   })}
+                  
+                  {/* --- CHANGED: Soft AI Indicator --- */}
                   {isSoftSyncing && (
-                    <span style={{ marginLeft: "8px", color: "#60a5fa" }}>
-                      Syncing quietly…
-                    </span>
+                    <span className="ai-working" style={{ marginLeft: "8px" }}>🤖 AI Updating…</span>
                   )}
                 </span>
               )}
@@ -648,7 +703,17 @@ const DashboardView = ({
                     filteredEmails.map((email) => {
                       const atts = email.attachments || [];
                       return (
-                        <div key={email.id || email.messageId} className={`email-card border-${(email.category || 'normal').toLowerCase()}`} onClick={() => setSelectedEmail(email)}>
+                        <div
+                          key={email.id || email.messageId}
+                          // --- CHANGED: Highlight Unread & Active Email ---
+                          className={`
+                            email-card
+                            ${!email.isRead ? "unread-mail" : ""}
+                            ${(selectedEmail?.id === email.id || selectedEmail?.messageId === email.messageId) ? "active" : ""}
+                            border-${(email.category || 'normal').toLowerCase()}
+                          `}
+                          onClick={() => setSelectedEmail(email)}
+                        >
                           <div className="ec-left-border"></div>
                           <div className="ec-content">
                             <div className="ec-top" style={{ display: "flex", justifyContent: "space-between" }}>

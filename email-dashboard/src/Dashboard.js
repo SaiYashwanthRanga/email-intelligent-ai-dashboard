@@ -39,7 +39,7 @@ function Dashboard() {
   const [username, setUsername] = useState("User"); 
   
   // Kept API URL in state
-  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count10");
+  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count50");
   
   const [toasts, setToasts] = useState([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -65,12 +65,10 @@ function Dashboard() {
 
   // ✅ REPLACED: markUserActive with idle timer
   const markUserActive = () => {
-    console.log("🟢 markUserActive called");
 
     setLastUserActivityTime(Date.now());
 
     if (isIdle) {
-      console.log("🟢 User became active again, stopping auto sync");
     }
 
     setIsIdle(false);
@@ -252,7 +250,6 @@ function Dashboard() {
   // ✅ FIXED: Activity listeners with logging
   useEffect(() => {
     const handleActivity = () => {
-      console.log("🖱️ User activity detected");
       markUserActive();
     };
 
@@ -342,7 +339,9 @@ function Dashboard() {
         }
         setEmails(res.data);
         setInboxReady(true); // ✅ Inbox is now safe to render
-        await runAnalysis(res.data); 
+        
+        // ⬇️ MODIFIED: Pass silent flag to runAnalysis
+        await runAnalysis(res.data, silent); 
 
         // Restore selected email after refresh
         if (currentSelectedId) {
@@ -371,7 +370,8 @@ function Dashboard() {
     }
   };
 
-  const runAnalysis = async (emailsToAnalyze) => {
+  // ⬇️ MODIFIED: Accept silent param and check before UI switch
+  const runAnalysis = async (emailsToAnalyze, silent = false) => {
     const payload = emailsToAnalyze || emails;
     
     // Even if payload is empty, we must ensure loading is turned off
@@ -417,8 +417,12 @@ function Dashboard() {
         localStorage.setItem("emailDashboardMeta", JSON.stringify(metaCache));
       }
       
-      addToast("Insights Updated!", "success");
-      setMainView('INSIGHTS'); 
+      // ⬇️ MODIFIED: Only switch view & toast if NOT silent
+      if (!silent) {
+        addToast("Insights Updated!", "success");
+        setMainView('INSIGHTS'); 
+      }
+
     } catch (err) { 
       console.error(err); 
       addToast("Analysis Failed. Check console.", "error"); 
