@@ -6,6 +6,17 @@ import {
 } from 'lucide-react';
 import TriageSummary from './TriageSummary';
 import ToastContainer from './Toast';
+import ComposeMailModal from "./ComposeMailModal";
+
+// --- ✅ CHANGE 1: DEFINE A SINGLE API BASE (TOP OF FILE) ---
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
+
+// --- ✅ HELPER: Extract email from "Name <email@domain.com>" format ---
+const extractEmail = (value) => {
+  if (!value) return "";
+  const match = value.match(/[\w.-]+@[\w.-]+\.\w+/);
+  return match ? match[0] : value;
+};
 
 // --- CATEGORY META CONFIGURATION ---
 const CATEGORY_META = {
@@ -58,6 +69,10 @@ const DashboardView = ({
   replyLoading,
   copySuccess,
     
+  // --- ✅ INLINE REPLY FROM PARENT (REMOVED - NOW PER-CARD) ---
+  // expandedReplyId,
+  // onReplyClick,
+    
   // Computed Data
   realThreads,
   filteredEmails,
@@ -70,7 +85,7 @@ const DashboardView = ({
   openFiles,
   getAllAttachments,
   getSenderDetails,
-  markAsRead, // <--- ✅ ACCEPTED PROP
+  markAsRead, 
 
   // Helpers
   getParticipantDisplay,
@@ -79,11 +94,42 @@ const DashboardView = ({
   getEmailBody,
   getEmailAttachments
 }) => {
-  // --- 1. NEW STATE FOR DOWNLOADING ---
+  // --- 1. DOWNLOAD STATE ---
   const [isDownloading, setIsDownloading] = useState(false);
-  // --- ADDED: Progress States ---
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [currentFileName, setCurrentFileName] = useState("");
+  
+  // --- 2. COMPOSE MODAL STATE ---
+  const [showCompose, setShowCompose] = useState(false);
+  
+  // --- 3. GLOBAL SENDING STATE (For Button Feedback Only) ---
+  const [isSending, setIsSending] = useState(false);
+
+  // --- 4. ✨ PER-CARD INLINE REPLY STATE ---
+  // Map structure: { [emailId]: { showReply, replyBody, replyTo, replyCc, drafting } }
+  const [inlineReplyState, setInlineReplyState] = useState({});
+
+  // --- HELPER: Get/Set inline reply state for a specific email ---
+  const getEmailReplyState = (emailId) => {
+    return inlineReplyState[emailId] || {
+      showReply: false,
+      replyBody: "",
+      replyTo: "",
+      replyCc: "",
+      drafting: false
+    };
+  };
+
+  const setEmailReplyState = (emailId, updates) => {
+    setInlineReplyState(prev => ({
+      ...prev,
+      [emailId]: { ...getEmailReplyState(emailId), ...updates }
+    }));
+  };
+
+  // --- HELPER: FORMAT EMAIL LISTS ---
+  const formatEmails = (list) =>
+    Array.isArray(list) && list.length ? list.join(", ") : "—";
 
   // --- HELPER: FORMAT FILE SIZE ---
   const formatFileSize = (bytes) => {
@@ -95,7 +141,6 @@ const DashboardView = ({
 
   // --- UPDATED DOWNLOAD FUNCTION (AXIOS + PROGRESS) ---
   const handleFileDownload = async (file, messageId) => {
-    // STEP 2: Debug log added
     console.log("📤 Frontend download request:", {
       fileName: file.name,
       messageIdSent: messageId,
@@ -114,7 +159,7 @@ const DashboardView = ({
       }
   
       const response = await axios.post(
-        `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api'}/download-attachment`,
+        `${API_BASE}/download-attachment`,
         {
           name: file.name,
           messageId: targetMessageId
@@ -150,7 +195,89 @@ const DashboardView = ({
         setIsDownloading(false);
         setDownloadProgress(0);
         setCurrentFileName("");
-      }, 800); // small delay so 100% is visible
+      }, 800); 
+    }
+  };
+
+  // --- ✅ SEND INLINE REPLY (PER-CARD) ---
+  const sendInlineReply = async (email) => {
+    const emailId = email.id || email.messageId;
+    const state = getEmailReplyState(emailId);
+    
+    setEmailReplyState(emailId, { drafting: true });
+    
+    try {
+      const payload = {
+        to: Array.isArray(state.replyTo) 
+          ? state.replyTo.join(",") 
+          : state.replyTo.split(",").map(e => e.trim()).filter(Boolean).join(","),
+        cc: Array.isArray(state.replyCc)
+          ? state.replyCc.join(",")
+          : state.replyCc.split(",").map(e => e.trim()).filter(Boolean).join(","),
+        subject: email.subject?.startsWith("Re:")
+          ? email.subject
+          : `Re: ${email.subject}`,
+        bodyHtml: `<p>${state.replyBody.replace(/\n/g, "<br/>")}</p>`
+      };
+  
+      const res = await fetch(`${API_BASE}/send-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+  
+      if (!res.ok) {
+        throw new Error("Send email failed");
+      }
+  
+      // ✅ Close inline reply after successful send
+      setEmailReplyState(emailId, {
+        showReply: false,
+        replyBody: "",
+        replyTo: "",
+        replyCc: "",
+        drafting: false
+      });
+  
+    } catch (err) {
+      alert("Failed to send reply");
+      console.error(err);
+      setEmailReplyState(emailId, { drafting: false });
+    }
+  };
+
+  // --- ✅ GENERATE AI REPLY (PER-CARD) ---
+  const generateAiReplyForEmail = async (email) => {
+    const emailId = email.id || email.messageId;
+    setEmailReplyState(emailId, { drafting: true });
+
+    try {
+      const res = await fetch(`${API_BASE}/reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sender: email.from || email.sender,
+          subject: email.subject,
+          email_body: email.body || email.summary
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error("AI draft failed");
+      }
+
+      const data = await res.json();
+
+      // ✅ INSERT AI DRAFT INTO THE REPLY BODY DIRECTLY
+      setEmailReplyState(emailId, {
+        replyBody: data.reply || "",
+        drafting: false
+      });
+
+    } catch (err) {
+      alert("Failed to generate AI reply");
+      console.error(err);
+      setEmailReplyState(emailId, { drafting: false });
     }
   };
 
@@ -167,7 +294,6 @@ const DashboardView = ({
             </div>
             
             <div className="file-list-container">
-              {/* --- ADDED: Progress UI inside Modal --- */}
               {isDownloading && (
                 <div style={{ marginBottom: "12px" }}>
                   <div style={{ fontSize: "0.85rem", marginBottom: "4px" }}>
@@ -229,12 +355,9 @@ const DashboardView = ({
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: "6px" }}>
-                    
-                    {/* --- CHANGED: Download Button (Modal) --- */}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        // STEP 1: Correct ID usage
                         handleFileDownload(f, f.messageId);
                       }}
                       disabled={isDownloading}
@@ -258,7 +381,6 @@ const DashboardView = ({
                         </>
                       )}
                     </button>
-
                   </div>
                 </div>
               ))}
@@ -289,7 +411,7 @@ const DashboardView = ({
               <div className="modal-meta-grid">
                 <div className="meta-item"><User size={16} /> <strong>From:</strong> {getParticipantDisplay(selectedEmail)}</div>
                 <div className="meta-item"><Clock size={16} /> <strong>Received:</strong> {formatDate(getSafeDate(selectedEmail))}</div>
-                {(selectedEmail.cc || selectedEmail.CC) && <div className="meta-item" style={{ gridColumn: '1 / -1' }}><Users size={16} /> <strong>CC:</strong> {selectedEmail.cc || selectedEmail.CC}</div>}
+                {(selectedEmail.cc || selectedEmail.CC) && <div className="meta-item" style={{ gridColumn: '1 / -1' }}><Users size={16} /> <strong>CC:</strong> {formatEmails(selectedEmail.cc || selectedEmail.CC)}</div>}
               </div>
               <div className="modal-summary-box"><strong>💡 AI Summary:</strong> {selectedEmail.summary}</div>
               
@@ -329,8 +451,6 @@ const DashboardView = ({
                                     {formatFileSize(att.size)}
                                   </span>
                                 </span>
-                                
-                                {/* --- Download Button (Thread View) --- */}
                                 <button
                                   onClick={(e) => { 
                                     e.stopPropagation();
@@ -357,7 +477,6 @@ const DashboardView = ({
                                     </>
                                   )}
                                 </button>
-
                               </div>
                             ))}
                           </div>
@@ -454,7 +573,6 @@ const DashboardView = ({
                 <Zap size={20} color="#374151" />
               </button>
 
-              {/* ✅ AUTO SYNC TOGGLE BUTTON */}
               <button
                 className="menu-btn"
                 onClick={() => setAutoSyncEnabled(prev => !prev)}
@@ -487,7 +605,6 @@ const DashboardView = ({
                     minute: "2-digit"
                   })}
                   
-                  {/* --- CHANGED: Soft AI Indicator --- */}
                   {isSoftSyncing && (
                     <span className="ai-working" style={{ marginLeft: "8px" }}>🤖 AI Updating…</span>
                   )}
@@ -499,19 +616,36 @@ const DashboardView = ({
               {theme === 'dark' ? <Sun size={20} color="#fbbf24" /> : <Moon size={20} color="#64748b" />}
             </button>
           </div>
+
+          <button
+            onClick={() => setShowCompose(true)}
+            style={{
+              backgroundColor: "#2563eb",
+              color: "white",
+              border: "none",
+              padding: "8px 16px",
+              borderRadius: "6px",
+              cursor: "pointer",
+              fontWeight: "600",
+              fontSize: "0.9rem",
+              marginRight: "15px"
+            }}
+            title="Compose new email"
+          >
+            ✉️ Compose
+          </button>
           
           <div className="user-profile" onClick={() => setIsProfileOpen(!isProfileOpen)}>
             <div className="user-info" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginRight: '10px' }}>
               <span className="welcome-text" style={{ fontSize: '1.3rem', fontWeight: '700', letterSpacing: '-0.5px' }}>{greetingInfo.greeting}, {username}</span>
               <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px', fontWeight: '500' }}>{greetingInfo.date}</span>
             </div>
-            {/* ✅ AVATAR CHANGE: Only 1st letter of username */}
             <div className="avatar">{username.charAt(0).toUpperCase()}</div>
             {isProfileOpen && (
               <div className="profile-dropdown">
                 <button 
                   onClick={(e) => {
-                    e.stopPropagation(); // ✅ Stops event bubbling
+                    e.stopPropagation(); 
                     handleLogout();
                   }} 
                   className="dropdown-item text-red"
@@ -564,7 +698,7 @@ const DashboardView = ({
                                 );
 
                                 if (!threadEmail) {
-                                  console.warn("No matching email for briefing card:", card);
+                                  
                                 }
 
                                 return (
@@ -635,11 +769,9 @@ const DashboardView = ({
                                         </span>
                                       </span>
                                       
-                                      {/* --- CHANGED: Download Button (Sender Insights) --- */}
                                       <button 
                                         onClick={(e) => { 
                                           e.stopPropagation(); 
-                                          // STEP 4: Use a.messageId directly
                                           handleFileDownload(a, a.messageId); 
                                         }} 
                                         disabled={isDownloading}
@@ -702,10 +834,12 @@ const DashboardView = ({
                   ) : (
                     filteredEmails.map((email) => {
                       const atts = email.attachments || [];
+                      const emailId = email.id || email.messageId;
+                      const replyState = getEmailReplyState(emailId);
+
                       return (
                         <div
-                          key={email.id || email.messageId}
-                          // --- CHANGED: Highlight Unread & Active Email ---
+                          key={emailId}
                           className={`
                             email-card
                             ${!email.isRead ? "unread-mail" : ""}
@@ -720,11 +854,10 @@ const DashboardView = ({
                               <h4>{email.subject || "No Subject"}</h4>
 
                               <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                                {/* ✅ MARK AS READ BUTTON */}
                                 <button
                                   onClick={(e) => {
-                                    e.stopPropagation();   // Do not open email
-                                    markAsRead(email);     // Call your organization API
+                                    e.stopPropagation(); 
+                                    markAsRead(email); 
                                   }}
                                   style={{
                                     background: email.isRead ? "#22c55e" : "#2563eb",
@@ -770,11 +903,9 @@ const DashboardView = ({
                                       </span>
                                     </span>
                                     
-                                    {/* --- CHANGED: Download Button (Feed View) --- */}
                                     <button
                                       onClick={(e) => { 
                                         e.stopPropagation();
-                                        // STEP 4: Use a.messageId directly
                                         handleFileDownload(a, a.messageId); 
                                       }} 
                                       disabled={isDownloading}
@@ -803,6 +934,226 @@ const DashboardView = ({
                                 ))}
                               </div>
                             )}
+
+                            {/* ✅ PER-CARD INLINE REPLY UI */}
+                            {replyState.showReply && (
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                style={{
+                                  marginTop: "16px",
+                                  padding: "16px",
+                                  borderTop: "1px solid var(--border-color)",
+                                  background: "var(--bg-card)",
+                                  borderRadius: "8px"
+                                }}
+                              >
+                                {/* 📤 EDITABLE HEADERS WITH EMAIL-ONLY DISPLAY */}
+                                <div style={{ marginBottom: "10px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                                  
+                                  {/* ✅ TO FIELD - EXTRACT EMAIL ONLY */}
+                                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <strong style={{ width: "32px" }}>To</strong>
+                                    <input
+                                      type="text"
+                                      value={replyState.replyTo}
+                                      onClick={(e) => e.stopPropagation()}
+                                      onFocus={(e) => e.stopPropagation()}
+                                      onChange={(e) => setEmailReplyState(emailId, { replyTo: e.target.value })}
+                                      placeholder="recipient@example.com"
+                                      style={{
+                                        flex: 1,
+                                        padding: "6px 8px",
+                                        borderRadius: "4px",
+                                        border: "1px solid var(--border-color)",
+                                        background: "var(--bg-main)",
+                                        color: "var(--text-primary)",
+                                        fontSize: "0.85rem"
+                                      }}
+                                    />
+                                  </div>
+
+                                  {/* ✅ CC FIELD - EXTRACT EMAILS ONLY */}
+                                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <strong style={{ width: "32px" }}>CC</strong>
+                                    <input
+                                      type="text"
+                                      value={replyState.replyCc}
+                                      onClick={(e) => e.stopPropagation()}
+                                      onFocus={(e) => e.stopPropagation()}
+                                      onChange={(e) => setEmailReplyState(emailId, { replyCc: e.target.value })}
+                                      placeholder="cc1@example.com, cc2@example.com"
+                                      style={{
+                                        flex: 1,
+                                        padding: "6px 8px",
+                                        borderRadius: "4px",
+                                        border: "1px solid var(--border-color)",
+                                        background: "var(--bg-main)",
+                                        color: "var(--text-primary)",
+                                        fontSize: "0.85rem"
+                                      }}
+                                    />
+                                  </div>
+
+                                </div>
+
+                                {/* ✍️ REPLY BOX */}
+                                <textarea
+                                  placeholder="Type your reply..."
+                                  value={replyState.replyBody}
+                                  onClick={(e) => e.stopPropagation()}
+                                  onFocus={(e) => e.stopPropagation()}
+                                  onChange={(e) => setEmailReplyState(emailId, { replyBody: e.target.value })}
+                                  style={{
+                                    width: "100%",
+                                    minHeight: "90px",
+                                    padding: "10px",
+                                    borderRadius: "6px",
+                                    border: "1px solid var(--border-color)",
+                                    background: "var(--bg-main)",
+                                    color: "var(--text-primary)",
+                                    resize: "vertical"
+                                  }}
+                                />
+
+                                {/* ✨ AI DRAFT BUTTON - INSIDE REPLY BOX */}
+                                <div style={{ marginTop: "8px", marginBottom: "12px" }}>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      generateAiReplyForEmail(email);
+                                    }}
+                                    disabled={replyState.drafting}
+                                    style={{
+                                      background: replyState.drafting ? "#9ca3af" : "#2563eb",
+                                      color: "white",
+                                      border: "none",
+                                      borderRadius: "6px",
+                                      padding: "6px 14px",
+                                      fontSize: "0.85rem",
+                                      cursor: replyState.drafting ? "not-allowed" : "pointer",
+                                      fontWeight: "600",
+                                      display: "flex",
+                                      alignItems: "center",
+                                      gap: "6px"
+                                    }}
+                                  >
+                                    {replyState.drafting ? (
+                                      <>
+                                        <Loader size={14} className="animate-spin" /> Drafting...
+                                      </>
+                                    ) : (
+                                      <>
+                                        ✨ Auto-Draft
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+
+                                {/* 📜 ORIGINAL MESSAGE */}
+                                <div
+                                  style={{
+                                    marginTop: "12px",
+                                    fontSize: "0.8rem",
+                                    color: "var(--text-secondary)"
+                                  }}
+                                >
+                                  <hr />
+                                  <div
+                                    dangerouslySetInnerHTML={{
+                                      __html: getEmailBody(email)
+                                    }}
+                                  />
+                                </div>
+
+                                {/* 🎯 ACTIONS */}
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    justifyContent: "flex-end",
+                                    gap: "8px",
+                                    marginTop: "10px"
+                                  }}
+                                >
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setEmailReplyState(emailId, {
+                                        showReply: false,
+                                        replyBody: "",
+                                        replyTo: "",
+                                        replyCc: "",
+                                        drafting: false
+                                      });
+                                    }}
+                                    style={{
+                                      background: "transparent",
+                                      border: "1px solid var(--border-color)",
+                                      padding: "6px 12px",
+                                      borderRadius: "6px",
+                                      cursor: "pointer"
+                                    }}
+                                  >
+                                    Cancel
+                                  </button>
+
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      sendInlineReply(email);
+                                    }}
+                                    disabled={replyState.drafting || !replyState.replyBody.trim()}
+                                    style={{
+                                      background: "#16a34a",
+                                      color: "white",
+                                      border: "none",
+                                      padding: "6px 14px",
+                                      borderRadius: "6px",
+                                      fontWeight: "600",
+                                      cursor: replyState.drafting || !replyState.replyBody.trim() ? "not-allowed" : "pointer"
+                                    }}
+                                  >
+                                    {replyState.drafting ? "Sending..." : "Send"}
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+
+                            {/* ✅ REPLY BUTTON - Opens Inline Reply with Email-Only Prefill */}
+                            {!replyState.showReply && (
+                              <div style={{ marginTop: "12px" }}>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    // ✅ EXTRACT EMAIL ONLY FOR TO FIELD
+                                    const toEmail = extractEmail(email.from || email.sender || "");
+                                    
+                                    // ✅ EXTRACT EMAILS ONLY FOR CC FIELD
+                                    const ccEmails = Array.isArray(email.cc)
+                                      ? email.cc.map(extractEmail).join(", ")
+                                      : extractEmail(email.cc || email.CC || "");
+                                    
+                                    setEmailReplyState(emailId, {
+                                      showReply: true,
+                                      replyBody: "",
+                                      replyTo: toEmail,
+                                      replyCc: ccEmails
+                                    });
+                                  }}
+                                  style={{
+                                    background: "#2563eb",
+                                    color: "white",
+                                    border: "none",
+                                    borderRadius: "6px",
+                                    padding: "6px 14px",
+                                    fontSize: "0.8rem",
+                                    cursor: "pointer",
+                                    fontWeight: "600"
+                                  }}
+                                >
+                                  ↩️ Reply
+                                </button>
+                              </div>
+                            )}
                           </div>
                         </div>
                       );
@@ -814,6 +1165,12 @@ const DashboardView = ({
           </>
         )}
       </main>
+
+      {/* ✅ COMPOSE MODAL */}
+      <ComposeMailModal
+        isOpen={showCompose}
+        onClose={() => setShowCompose(false)}
+      />
     </div>
   );
 };

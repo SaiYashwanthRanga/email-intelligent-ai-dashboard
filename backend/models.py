@@ -16,3 +16,9 @@ class ThreadParseRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+class SendEmailRequest(BaseModel):
+    to: List[str]
+    cc: List[str] = []
+    subject: str
+    bodyHtml: str

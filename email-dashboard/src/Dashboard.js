@@ -7,6 +7,13 @@ import { useMemo, useRef } from "react";
 
 const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
 
+// --- ✅ HELPER: Extract email from "Name <email@domain.com>" format ---
+const extractEmail = (value) => {
+  if (!value) return "";
+  const match = value.match(/[\w.-]+@[\w.-]+\.\w+/);
+  return match ? match[0] : value;
+};
+
 function Dashboard() {
   const navigate = useNavigate();
   
@@ -39,7 +46,7 @@ function Dashboard() {
   const [username, setUsername] = useState("User"); 
   
   // Kept API URL in state
-  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count50");
+  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count10");
   
   const [toasts, setToasts] = useState([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -54,6 +61,9 @@ function Dashboard() {
   const [copySuccess, setCopySuccess] = useState(false);
   const [fileModalData, setFileModalData] = useState(null);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(true);
+
+  // ✅ REMOVED: expandedReplyId and related state
+  // DashboardView now manages inline reply state internally per-card
 
   // --- HELPER: Get Safe Date (Moved up for use in Sorting) ---
   const getSafeDate = (emailObj) => {
@@ -310,6 +320,9 @@ function Dashboard() {
     };
   }, [isIdle, autoSyncEnabled]);
 
+  // ✅ REMOVED: Auto-collapse reply when selection changes
+  // DashboardView manages this internally now
+
   // --- STEP 4: UPDATED FETCH FUNCTION TO RESTORE SELECTION ---
   const fetchAndAnalyze = async (arg) => {
     const silent = arg === true;
@@ -494,6 +507,9 @@ function Dashboard() {
     localStorage.removeItem("loggedInUser");
     window.location.href = "/login";
   };
+
+  // ✅ REMOVED: handleInlineReplyToggle 
+  // DashboardView manages inline reply state internally per-card
 
   // ✅ UPDATED FUNCTION: Mark email as read + update backend cache
   const markAsRead = async (emailObj) => {

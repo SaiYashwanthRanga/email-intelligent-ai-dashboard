@@ -88,6 +88,16 @@ VIP_SENDERS = [v.lower() for v in load_vip_list()]
 print(f"✅ Loaded {len(VIP_SENDERS)} VIP senders: {VIP_SENDERS}")
 
 # --- DATA NORMALIZATION ---
+
+# ✅ SAFETY FIX: Ensure email lists are always arrays
+def normalize_list(val):
+    """Convert any email field to a list of emails."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        return [v.strip() for v in val.split(",") if v.strip()]
+    return []
+
 def normalize_email(e: dict):
     clean_attachments = []
     
@@ -109,8 +119,8 @@ def normalize_email(e: dict):
         "id": e.get("id") or e.get("_id") or e.get("messageId") or "mail",
         "subject": e.get("subject", "No Subject"),
         "from": e.get("from") or e.get("sender") or e.get("email") or "Unknown",
-        "to": e.get("to", []),
-        "cc": e.get("cc", []),
+        "to": normalize_list(e.get("to")),      # ✅ ALWAYS LIST
+        "cc": normalize_list(e.get("cc")),      # ✅ ALWAYS LIST
         "body": str(e.get("body") or e.get("content") or e.get("text") or ""),
         "received_at": (
             e.get("receivedDateTime") or 
@@ -513,13 +523,19 @@ async def analyze_single_thread(subject, messages):
         
         final_date = result.get("normalized_date") or latest_date
 
+        # ✅ CHANGED: Real email lists instead of participant counts
+        participant_list = list(participants)
+
         final_result = {
             "id": messages[0].get("messageId") or messages[0].get("id"),
             "subject": display_subject,
-            "from": list(participants)[0] if len(participants) == 1 else f"{len(participants)} Participants",
-            "participants": list(participants),
-            "cc": "", 
-            "connection_type": "DIRECT",
+            
+            # ✅ REAL EMAILS INSTEAD OF COUNTS
+            "from": participant_list[0] if participant_list else "Unknown",
+            "to": participant_list,     # 👈 LIST OF EMAILS
+            "cc": [],                   # 👈 KEEP AS LIST
+            
+            "participants": participant_list,
             "received_at": final_date, 
             "messages": clean_messages, 
             "thread_count": len(clean_messages), 

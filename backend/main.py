@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
 # Updated imports
-from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest
+from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, SendEmailRequest
 from services import (
     group_emails_by_subject, 
     detect_real_threads, 
@@ -363,6 +363,46 @@ async def generate_reply(payload: ReplyRequest):
 @app.post("/api/parse-thread")
 async def parse_email_thread(payload: ThreadParseRequest):
     return {"segments": [{"type": "latest", "header": "Log", "content": payload.body}]}
+
+@app.post("/api/send-email")
+def send_email(payload: SendEmailRequest):
+    """
+    Sends email using organization mail API.
+    ❗ Does NOT touch cache, inbox, threads, or attachments
+    """
+    try:
+        org_api_url = "http://172.22.6.145/api/Values/mail/send"
+
+        print("📤 Sending email:", payload.dict())
+
+        response = requests.post(
+            org_api_url,
+            json={
+                "to": payload.to,
+                "cc": payload.cc,
+                "subject": payload.subject,
+                "bodyHtml": payload.bodyHtml
+            },
+            timeout=20
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=response.text
+            )
+
+        return {
+            "success": True,
+            "message": response.text
+        }
+
+    except requests.exceptions.RequestException as e:
+        print("❌ Send email failed:", e)
+        raise HTTPException(
+            status_code=500,
+            detail="Mail service unreachable"
+        )
 
 # --- OPTIMIZED DOWNLOAD ENDPOINT (Generic) ---
 @app.post("/api/download")
