@@ -29,13 +29,28 @@ function Dashboard() {
   const [inboxReady, setInboxReady] = useState(false);
   const [isSoftSyncing, setIsSoftSyncing] = useState(false);
 
+  // ✅ NEW: Thread-aware received time (latest of parent + messages)
+  const getEffectiveReceivedAt = (email) => {
+    const times = [];
+
+    if (email?.received) times.push(new Date(email.received));
+    if (email?.received_at) times.push(new Date(email.received_at));
+
+    if (Array.isArray(email?.messages)) {
+      email.messages.forEach(m => {
+        if (m?.date) times.push(new Date(m.date));
+        if (m?.received_at) times.push(new Date(m.received_at));
+      });
+    }
+
+    return times.length ? new Date(Math.max(...times)) : new Date(0);
+  };
+
   // --- CHANGED: Stable sorted emails list ---
   const sortedEmails = useMemo(() => {
     if (!emails || emails.length === 0) return [];
     return [...emails].sort(
-      (a, b) =>
-        new Date(b.received || b.received_at) -
-        new Date(a.received || a.received_at)
+      (a, b) => getEffectiveReceivedAt(b) - getEffectiveReceivedAt(a)
     );
   }, [emails]);
 
@@ -123,7 +138,7 @@ function Dashboard() {
   // Separate real threads and single emails (Sorted)
   const realThreads = (emails || [])
     .filter(e => Array.isArray(e.messages) && e.messages.length > 1)
-    .sort((a, b) => new Date(getSafeDate(b)) - new Date(getSafeDate(a))); // ✅ Safe Sort
+    .sort((a, b) => getEffectiveReceivedAt(b) - getEffectiveReceivedAt(a));
   
   // --- CHANGED: Replace filteredEmails logic ---
   const filteredAndSortedEmails = useMemo(() => {
@@ -411,6 +426,10 @@ function Dashboard() {
             }));
           }
 
+          // ✅ ENSURE CC AND TO ARE ALWAYS ARRAYS
+          e.cc = Array.isArray(e.cc) ? e.cc : [];
+          e.to = Array.isArray(e.to) ? e.to : [];
+
           // No need to process e.messages attachments separately
           // Backend should have merged them into e.attachments
           return e;
@@ -510,6 +529,28 @@ function Dashboard() {
 
   // ✅ REMOVED: handleInlineReplyToggle 
   // DashboardView manages inline reply state internally per-card
+
+  // ✅ Optimistically mark email as replied
+  const markAsReplied = (messageId, value = true) => {
+    setEmails(prev =>
+      prev.map(e =>
+        (e.id === messageId || e.messageId === messageId)
+          ? { ...e, hasReplied: value }
+          : e
+      )
+    );
+  };
+
+  // ✅ Helper: Mark email as read by ID (for optimistic reply flow)
+  const markAsReadById = (messageId, value = true) => {
+    setEmails(prev =>
+      prev.map(e =>
+        (e.id === messageId || e.messageId === messageId)
+          ? { ...e, isRead: value }
+          : e
+      )
+    );
+  };
 
   // ✅ UPDATED FUNCTION: Mark email as read + update backend cache
   const markAsRead = async (emailObj) => {
@@ -669,6 +710,9 @@ function Dashboard() {
       getEmailBody={getEmailBody}
       getEmailAttachments={getEmailAttachments}
       emailHasAttachments={emailHasAttachments}
+      getEffectiveReceivedAt={getEffectiveReceivedAt}
+      markAsReplied={markAsReplied}
+      markAsReadById={markAsReadById}
     />
   );
 }

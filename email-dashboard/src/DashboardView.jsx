@@ -11,6 +11,45 @@ import ComposeMailModal from "./ComposeMailModal";
 // --- ✅ CHANGE 1: DEFINE A SINGLE API BASE (TOP OF FILE) ---
 const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
 
+// ✅ NEW: Reply API (for replying to an existing email) - Uses MULTIPART/FORM-DATA
+const replyToMail = async ({ messageItemId, replyBodyHtml, to, cc, attachments = [] }) => {
+  const formData = new FormData();
+
+  formData.append("messageItemId", messageItemId);
+  formData.append("replyBodyHtml", replyBodyHtml);
+
+  // Append arrays for To/Cc
+  to.forEach(e => formData.append("to", e));
+  cc.forEach(e => formData.append("cc", e));
+
+  // Append attachments if any
+  attachments.forEach(file => {
+    formData.append("attachments", file);
+  });
+
+  return axios.post(`${API_BASE}/reply-email`, formData);
+};
+
+// ✅ Persist read status after reply
+const markReadBackend = async (email) => {
+  const userEmail =
+    process.env.REACT_APP_USER_EMAIL ||
+    email?.to?.[0] ||
+    "";
+
+  const messageId = email.id || email.messageId;
+
+  if (!userEmail || !messageId) return;
+
+  await axios.post(
+    `${API_BASE}/mark-read`,
+    {
+      email: userEmail,
+      messageId
+    }
+  );
+};
+
 // --- ✅ HELPER: Extract email from "Name <email@domain.com>" format ---
 const extractEmail = (value) => {
   if (!value) return "";
@@ -69,10 +108,6 @@ const DashboardView = ({
   replyLoading,
   copySuccess,
     
-  // --- ✅ INLINE REPLY FROM PARENT (REMOVED - NOW PER-CARD) ---
-  // expandedReplyId,
-  // onReplyClick,
-    
   // Computed Data
   realThreads,
   filteredEmails,
@@ -85,14 +120,17 @@ const DashboardView = ({
   openFiles,
   getAllAttachments,
   getSenderDetails,
-  markAsRead, 
+  markAsRead,
 
   // Helpers
   getParticipantDisplay,
   formatDate,
   getSafeDate,
   getEmailBody,
-  getEmailAttachments
+  getEmailAttachments,
+  getEffectiveReceivedAt,
+  markAsReplied,
+  markAsReadById
 }) => {
   // --- 1. DOWNLOAD STATE ---
   const [isDownloading, setIsDownloading] = useState(false);
@@ -106,7 +144,7 @@ const DashboardView = ({
   const [isSending, setIsSending] = useState(false);
 
   // --- 4. ✨ PER-CARD INLINE REPLY STATE ---
-  // Map structure: { [emailId]: { showReply, replyBody, replyTo, replyCc, drafting } }
+  // Map structure: { [emailId]: { showReply, replyBody, replyTo, replyCc, drafting, attachments: [] } }
   const [inlineReplyState, setInlineReplyState] = useState({});
 
   // --- HELPER: Get/Set inline reply state for a specific email ---
@@ -116,7 +154,8 @@ const DashboardView = ({
       replyBody: "",
       replyTo: "",
       replyCc: "",
-      drafting: false
+      drafting: false,
+      attachments: [] // ✅ NEW: Attachments array
     };
   };
 
@@ -125,6 +164,40 @@ const DashboardView = ({
       ...prev,
       [emailId]: { ...getEmailReplyState(emailId), ...updates }
     }));
+  };
+
+  // --- 📎 ATTACHMENT HANDLERS (NEW) ---
+  const handleReplyAttachmentSelect = (emailId, files) => {
+    if (!files || !files.length) return;
+    
+    setEmailReplyState(emailId, {
+      attachments: [
+        ...getEmailReplyState(emailId).attachments,
+        ...Array.from(files)
+      ]
+    });
+  };
+
+  const removeReplyAttachment = (emailId, index) => {
+    const current = getEmailReplyState(emailId).attachments;
+    setEmailReplyState(emailId, {
+      attachments: current.filter((_, i) => i !== index)
+    });
+  };
+
+  // --- HELPER: Get sender display (MAIL-CARD SAFE) ---
+  const getEmailSender = (email) => {
+    if (!email) return "Unknown Sender";
+
+    if (typeof email.from === "string") {
+      return email.from;
+    }
+
+    if (Array.isArray(email.from) && email.from.length > 0) {
+      return email.from[0];
+    }
+
+    return "Unknown Sender";
   };
 
   // --- HELPER: FORMAT EMAIL LISTS ---
@@ -141,6 +214,7 @@ const DashboardView = ({
 
   // --- UPDATED DOWNLOAD FUNCTION (AXIOS + PROGRESS) ---
   const handleFileDownload = async (file, messageId) => {
+    // ... (No change to download logic)
     console.log("📤 Frontend download request:", {
       fileName: file.name,
       messageIdSent: messageId,
@@ -199,49 +273,58 @@ const DashboardView = ({
     }
   };
 
-  // --- ✅ SEND INLINE REPLY (PER-CARD) ---
+  // --- ✅ SEND INLINE REPLY (PER-CARD) using REPLY API with OPTIMISTIC UI & BACKEND PERSISTENCE ---
   const sendInlineReply = async (email) => {
     const emailId = email.id || email.messageId;
     const state = getEmailReplyState(emailId);
-    
+
+    // 🔥 OPTIMISTIC UI
+    markAsReplied(emailId, true);
+    markAsReadById(emailId);
+
     setEmailReplyState(emailId, { drafting: true });
-    
+
     try {
-      const payload = {
-        to: Array.isArray(state.replyTo) 
-          ? state.replyTo.join(",") 
-          : state.replyTo.split(",").map(e => e.trim()).filter(Boolean).join(","),
-        cc: Array.isArray(state.replyCc)
-          ? state.replyCc.join(",")
-          : state.replyCc.split(",").map(e => e.trim()).filter(Boolean).join(","),
-        subject: email.subject?.startsWith("Re:")
-          ? email.subject
-          : `Re: ${email.subject}`,
-        bodyHtml: `<p>${state.replyBody.replace(/\n/g, "<br/>")}</p>`
-      };
-  
-      const res = await fetch(`${API_BASE}/send-email`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-  
-      if (!res.ok) {
-        throw new Error("Send email failed");
+      const messageItemId = email.messageId || email.id;
+      if (!messageItemId) {
+        throw new Error("Missing messageItemId");
       }
-  
-      // ✅ Close inline reply after successful send
+
+      // 1️⃣ Send reply (UPDATED to use new Multipart structure with attachments)
+      await replyToMail({
+        messageItemId,
+        replyBodyHtml: `<p>${state.replyBody.replace(/\n/g, "<br/>")}</p>`,
+        to: Array.isArray(state.replyTo)
+          ? state.replyTo
+          : state.replyTo.split(",").map(e => e.trim()).filter(Boolean),
+        cc: Array.isArray(state.replyCc)
+          ? state.replyCc
+          : state.replyCc.split(",").map(e => e.trim()).filter(Boolean),
+        attachments: state.attachments   // ✅ SEND ATTACHMENTS
+      });
+
+      // 2️⃣ Persist READ state in backend
+      console.log("📌 Marking read after reply:", email.id || email.messageId);
+      await markReadBackend(email);
+
+      // ✅ Close reply UI & Reset State
       setEmailReplyState(emailId, {
         showReply: false,
         replyBody: "",
         replyTo: "",
         replyCc: "",
-        drafting: false
+        drafting: false,
+        attachments: [] // ✅ Clear attachments
       });
-  
+
     } catch (err) {
+      console.error("❌ Reply failed:", err);
+
+      // 🔁 ROLLBACK UI
+      markAsReplied(emailId, false);
+      markAsReadById(emailId, false);
+
       alert("Failed to send reply");
-      console.error(err);
       setEmailReplyState(emailId, { drafting: false });
     }
   };
@@ -286,6 +369,7 @@ const DashboardView = ({
       <ToastContainer toasts={toasts} removeToast={removeToast} />
 
       {fileModalData && (
+        /* ... File Modal Code (No changes) ... */
         <div className="modal-overlay" onClick={() => setFileModalData(null)}>
           <div className="modal-content file-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
@@ -407,11 +491,12 @@ const DashboardView = ({
               </div>
             </div>
             <div className="modal-body-scroll">
+              {/* ... Modal content ... */}
               <h2 className="modal-subject">{selectedEmail.subject}</h2>
               <div className="modal-meta-grid">
-                <div className="meta-item"><User size={16} /> <strong>From:</strong> {getParticipantDisplay(selectedEmail)}</div>
-                <div className="meta-item"><Clock size={16} /> <strong>Received:</strong> {formatDate(getSafeDate(selectedEmail))}</div>
-                {(selectedEmail.cc || selectedEmail.CC) && <div className="meta-item" style={{ gridColumn: '1 / -1' }}><Users size={16} /> <strong>CC:</strong> {formatEmails(selectedEmail.cc || selectedEmail.CC)}</div>}
+                <div className="meta-item"><User size={16} /> <strong>From:</strong> {getEmailSender(selectedEmail)}</div>
+                <div className="meta-item"><Clock size={16} /> <strong>Received:</strong> {formatDate(getEffectiveReceivedAt(selectedEmail))}</div>
+                {Array.isArray(selectedEmail.cc) && selectedEmail.cc.length > 0 && <div className="meta-item" style={{ gridColumn: '1 / -1' }}><Users size={16} /> <strong>CC:</strong> {formatEmails(selectedEmail.cc)}</div>}
               </div>
               <div className="modal-summary-box"><strong>💡 AI Summary:</strong> {selectedEmail.summary}</div>
               
@@ -434,6 +519,7 @@ const DashboardView = ({
                   <div className="thread-conversation">
                     {parsedThread.map((msg, idx) => (
                       <div key={idx} className="message-item message-thread">
+                        {/* ... Thread Items ... */}
                         {msg.header && <div className="message-from">{msg.header}</div>}
                         <div className="message-body">
                           {msg.content.split('\n').map((l, i) => (
@@ -445,6 +531,7 @@ const DashboardView = ({
                             <Paperclip size={14} />
                             {msg.attachments.map((att, aidx) => (
                               <div key={aidx} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
+                                {/* ... Att items ... */}
                                 <span style={{ flex: 1 }}>
                                   {att.name || "Unnamed file"}
                                   <span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>
@@ -467,15 +554,7 @@ const DashboardView = ({
                                     display: "flex", alignItems: "center", gap: "6px"
                                   }}
                                 >
-                                  {isDownloading ? (
-                                    <>
-                                      <Loader size={14} className="animate-spin" /> {downloadProgress}%
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Download size={16} /> Download
-                                    </>
-                                  )}
+                                  {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
                                 </button>
                               </div>
                             ))}
@@ -488,6 +567,7 @@ const DashboardView = ({
               ) : (
                 /* 📩 SINGLE EMAIL – Styled like Thread */
                 <div className="email-thread-container">
+                    {/* ... Single Email Content ... */}
                     <div style={{marginBottom: '10px', fontSize: '1rem', fontWeight: '700', color: '#1e1b4b'}}>
                     <Mail size={16} style={{display:'inline', marginRight:'5px'}} />
                     Email Content
@@ -496,7 +576,7 @@ const DashboardView = ({
                     <div className="thread-conversation">
                     <div className="message-item message-thread">
                         <div className="message-from">
-                        From: {getParticipantDisplay(selectedEmail)} | {formatDate(getSafeDate(selectedEmail))}
+                        From: {getParticipantDisplay(selectedEmail)} | {formatDate(getEffectiveReceivedAt(selectedEmail))}
                         </div>
 
                         <div className="message-body">
@@ -532,16 +612,9 @@ const DashboardView = ({
                                     display: "flex", alignItems: "center", gap: "6px"
                                 }}
                                 >
-                                {isDownloading ? (
-                                    <>
-                                    <Loader size={14} className="animate-spin" /> {downloadProgress}%
-                                    </>
-                                ) : (
-                                    <>
-                                    <Download size={16} /> Download
-                                    </>
-                                )}
+                                {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
                                 </button>
+
                             </div>
                             ))}
                         </div>
@@ -557,6 +630,7 @@ const DashboardView = ({
 
       <main className="main-content">
         <header className="top-bar">
+          {/* ... Header Content ... */}
           <div className="top-left">
             <div className="brand" style={{marginRight: '20px'}}>
               <div className="logo-box"><LayoutDashboard size={20} color="white" /></div>
@@ -668,6 +742,7 @@ const DashboardView = ({
         ) : (
           <>
             {mainView === 'INSIGHTS' && (
+              /* ... Insights View ... */
               <div className="dashboard-grid">
                 <div className="col-left">
                   <TriageSummary 
@@ -696,10 +771,6 @@ const DashboardView = ({
                                     String(e.id).trim() === String(card.id).trim() ||
                                     String(e.messageId).trim() === String(card.id).trim()
                                 );
-
-                                if (!threadEmail) {
-                                  
-                                }
 
                                 return (
                                   <div 
@@ -732,6 +803,7 @@ const DashboardView = ({
                         const { mails, attachments } = getSenderDetails(s.name);
                         return (
                           <div key={i} className="sender-card-large">
+                            {/* ... Sender Card Content ... */}
                             <div className="sender-top">
                               <div className="avatar-small">
                                 {s.name.charAt(0).toUpperCase()}
@@ -785,15 +857,7 @@ const DashboardView = ({
                                           display: "flex", alignItems: "center", gap: "6px"
                                         }}
                                       >
-                                        {isDownloading ? (
-                                          <>
-                                              <Loader size={14} className="animate-spin" /> {downloadProgress}%
-                                          </>
-                                        ) : (
-                                          <>
-                                            <Download size={16} /> Download
-                                          </>
-                                        )}
+                                        {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
                                       </button>
 
                                     </div>
@@ -848,6 +912,7 @@ const DashboardView = ({
                           `}
                           onClick={() => setSelectedEmail(email)}
                         >
+                          {/* ... Email Card Content ... */}
                           <div className="ec-left-border"></div>
                           <div className="ec-content">
                             <div className="ec-top" style={{ display: "flex", justifyContent: "space-between" }}>
@@ -859,6 +924,7 @@ const DashboardView = ({
                                     e.stopPropagation(); 
                                     markAsRead(email); 
                                   }}
+                                  disabled={email.isRead}
                                   style={{
                                     background: email.isRead ? "#22c55e" : "#2563eb",
                                     color: "white",
@@ -866,15 +932,32 @@ const DashboardView = ({
                                     borderRadius: "5px",
                                     padding: "3px 8px",
                                     fontSize: "0.7rem",
-                                    cursor: "pointer",
+                                    cursor: email.isRead ? "not-allowed" : "pointer",
                                     fontWeight: "600",
-                                    whiteSpace: "nowrap"
+                                    whiteSpace: "nowrap",
+                                    opacity: email.isRead ? 0.6 : 1
                                   }}
                                 >
                                   {email.isRead ? "✓ Read" : "Mark Read"}
                                 </button>
 
                                 <div className="ec-badges">
+                                  {email.hasReplied && (
+                                    <span
+                                      style={{
+                                        background: "#16a34a",
+                                        color: "white",
+                                        padding: "2px 8px",
+                                        borderRadius: "999px",
+                                        fontSize: "0.65rem",
+                                        fontWeight: "700",
+                                        marginLeft: "6px",
+                                        whiteSpace: "nowrap"
+                                      }}
+                                    >
+                                      ↩️ Replied
+                                    </span>
+                                  )}
                                   {(() => {
                                     const cat = (email.category || "PENDING").toUpperCase();
                                     const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL;
@@ -884,11 +967,18 @@ const DashboardView = ({
                               </div>
                             </div>
                             <div className="ec-meta">
-                              <span title={getParticipantDisplay(email)} style={{maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                                <User size={14} /> {getParticipantDisplay(email)}
+                              <span title={getEmailSender(email)} style={{maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                                <User size={14} /> {getEmailSender(email)}
                               </span>
-                              <span><Clock size={14} /> {formatDate(getSafeDate(email))}</span>
-                              {(email.cc || email.CC) && <span className="cc-badge"><Users size={12} /> CC</span>}
+                              <span><Clock size={14} /> {formatDate(getEffectiveReceivedAt(email))}</span>
+                              {Array.isArray(email.cc) && email.cc.length > 0 && (
+                                <span
+                                  className="cc-badge"
+                                  title={email.cc.join(", ")}
+                                >
+                                  <Users size={12} /> CC
+                                </span>
+                              )}
                             </div>
                             <div className="ec-body">{email.summary || "Pending analysis..."}</div>
                             {atts.length > 0 && (
@@ -919,15 +1009,7 @@ const DashboardView = ({
                                         display: "flex", alignItems: "center", gap: "6px"
                                       }}
                                     >
-                                      {isDownloading ? (
-                                        <>
-                                          <Loader size={14} className="animate-spin" /> {downloadProgress}%
-                                        </>
-                                      ) : (
-                                        <>
-                                          <Download size={16} /> Download
-                                        </>
-                                      )}
+                                      {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
                                     </button>
 
                                   </div>
@@ -1015,8 +1097,78 @@ const DashboardView = ({
                                   }}
                                 />
 
+                                {/* 📎 ATTACH FILES BUTTON AND LIST */}
+                                <div style={{ marginTop: "10px", marginBottom: "10px" }}>
+                                  <input
+                                    type="file"
+                                    multiple
+                                    id={`reply-attach-${emailId}`}
+                                    style={{ display: "none" }}
+                                    onChange={(e) => handleReplyAttachmentSelect(emailId, e.target.files)}
+                                  />
+
+                                  <label
+                                    htmlFor={`reply-attach-${emailId}`}
+                                    onClick={(e) => e.stopPropagation()} 
+                                    style={{
+                                      background: "#f3f4f6",
+                                      border: "1px solid var(--border-color)",
+                                      padding: "6px 12px",
+                                      borderRadius: "6px",
+                                      cursor: "pointer",
+                                      fontSize: "0.8rem",
+                                      fontWeight: "600",
+                                      color: "#374151",
+                                      display: "inline-flex",
+                                      alignItems: "center",
+                                      gap: "5px"
+                                    }}
+                                  >
+                                    <Paperclip size={14} /> Attach Files
+                                  </label>
+                                </div>
+
+                                {/* 📄 SELECTED ATTACHMENTS LIST */}
+                                {replyState.attachments.length > 0 && (
+                                  <div style={{ marginBottom: "10px", padding: "8px", background: "var(--bg-main)", borderRadius: "6px" }}>
+                                    {replyState.attachments.map((f, idx) => (
+                                      <div
+                                        key={idx}
+                                        style={{
+                                          display: "flex",
+                                          justifyContent: "space-between",
+                                          alignItems: "center",
+                                          fontSize: "0.8rem",
+                                          padding: "4px 0",
+                                          borderBottom: idx < replyState.attachments.length - 1 ? "1px solid var(--border-color)" : "none"
+                                        }}
+                                      >
+                                        <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                          <Paperclip size={12} color="#6b7280" /> {f.name}
+                                        </span>
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            removeReplyAttachment(emailId, idx);
+                                          }}
+                                          style={{
+                                            background: "none",
+                                            border: "none",
+                                            cursor: "pointer",
+                                            color: "#ef4444",
+                                            padding: "2px 6px"
+                                          }}
+                                          title="Remove attachment"
+                                        >
+                                          <X size={14} />
+                                        </button>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+
                                 {/* ✨ AI DRAFT BUTTON - INSIDE REPLY BOX */}
-                                <div style={{ marginTop: "8px", marginBottom: "12px" }}>
+                                <div style={{ marginBottom: "12px" }}>
                                   <button
                                     onClick={(e) => {
                                       e.stopPropagation();
@@ -1082,7 +1234,8 @@ const DashboardView = ({
                                         replyBody: "",
                                         replyTo: "",
                                         replyCc: "",
-                                        drafting: false
+                                        drafting: false,
+                                        attachments: [] // Clear on cancel
                                       });
                                     }}
                                     style={{
@@ -1130,13 +1283,14 @@ const DashboardView = ({
                                     // ✅ EXTRACT EMAILS ONLY FOR CC FIELD
                                     const ccEmails = Array.isArray(email.cc)
                                       ? email.cc.map(extractEmail).join(", ")
-                                      : extractEmail(email.cc || email.CC || "");
+                                      : "";
                                     
                                     setEmailReplyState(emailId, {
                                       showReply: true,
                                       replyBody: "",
                                       replyTo: toEmail,
-                                      replyCc: ccEmails
+                                      replyCc: ccEmails,
+                                      attachments: []
                                     });
                                   }}
                                   style={{

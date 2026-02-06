@@ -485,6 +485,21 @@ async def analyze_single_thread(subject, messages):
     for m in clean_messages:
         thread_attachments.extend(m.get("attachments", []))
 
+    # 🔥 SORT MESSAGES SO LATEST IS FIRST (by timestamp, descending)
+    def safe_dt(val):
+        try:
+            dt = datetime.fromisoformat(val)
+            if dt.tzinfo:
+                dt = dt.astimezone(tz=None).replace(tzinfo=None)
+            return dt
+        except:
+            return datetime(1970, 1, 1)
+
+    clean_messages.sort(
+        key=lambda m: safe_dt(m.get("date")),
+        reverse=True
+    )
+
     prompt = f"""
     Analyze this thread.
     THREAD: {display_subject}
@@ -523,24 +538,26 @@ async def analyze_single_thread(subject, messages):
         
         final_date = result.get("normalized_date") or latest_date
 
-        # ✅ CHANGED: Real email lists instead of participant counts
-        participant_list = list(participants)
+        # ✅ FIXED: Use latest message for sender fields (now truly latest after sort)
+        latest_message = clean_messages[0]  # latest reply after timestamp sort
 
         final_result = {
             "id": messages[0].get("messageId") or messages[0].get("id"),
             "subject": display_subject,
-            
-            # ✅ REAL EMAILS INSTEAD OF COUNTS
-            "from": participant_list[0] if participant_list else "Unknown",
-            "to": participant_list,     # 👈 LIST OF EMAILS
-            "cc": [],                   # 👈 KEEP AS LIST
-            
-            "participants": participant_list,
-            "received_at": final_date, 
-            "messages": clean_messages, 
-            "thread_count": len(clean_messages), 
-            "attachments": thread_attachments, 
-            "category": final_category, 
+
+            # ✅ FIXED SENDER FIELDS (from truly latest message)
+            "from": latest_message.get("from", "Unknown"),
+            "to": normalize_list(messages[0].get("to")),
+            "cc": normalize_list(messages[0].get("cc")),
+
+            # ✅ PARTICIPANTS KEPT SEPARATE
+            "participants": list(participants),
+
+            "received_at": final_date,
+            "messages": clean_messages,
+            "thread_count": len(clean_messages),
+            "attachments": thread_attachments,
+            "category": final_category,
             "priority": final_priority,
             "summary": result.get("summary", "Analysis failed."),
             "action": result.get("action", "REVIEW")

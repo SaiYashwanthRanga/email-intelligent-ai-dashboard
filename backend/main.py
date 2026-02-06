@@ -5,17 +5,18 @@ import uvicorn
 import io
 import base64
 import json
-import uuid  # Added for unique file naming
-import time  # Added for cleanup task timing
+import uuid   # Added for unique file naming
+import time   # Added for cleanup task timing
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, Body
+from fastapi import FastAPI, HTTPException, Request, Body, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
+from typing import List
 
 # Updated imports
-from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, SendEmailRequest
+from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest
 from services import (
     group_emails_by_subject, 
     detect_real_threads, 
@@ -365,44 +366,130 @@ async def parse_email_thread(payload: ThreadParseRequest):
     return {"segments": [{"type": "latest", "header": "Log", "content": payload.body}]}
 
 @app.post("/api/send-email")
-def send_email(payload: SendEmailRequest):
-    """
-    Sends email using organization mail API.
-    ❗ Does NOT touch cache, inbox, threads, or attachments
-    """
+async def send_email(
+    to: List[str] = Form(...),
+    cc: List[str] = Form([]),
+    subject: str = Form(...),
+    bodyHtml: str = Form(...),
+    attachments: List[UploadFile] = File([])
+):
     try:
         org_api_url = "http://172.22.6.145/api/Values/mail/send"
 
-        print("📤 Sending email:", payload.dict())
+        # ---- form fields ----
+        data = []
+
+        for t in to:
+            data.append(("To", t))
+
+        for c in cc:
+            data.append(("Cc", c))
+
+        data.append(("Subject", subject))
+        data.append(("BodyHtml", bodyHtml))
+
+        # ---- files ----
+        files = []
+
+        for file in attachments:
+            file_bytes = await file.read()
+            if file_bytes:
+                files.append(
+                    (
+                        "Attachments",
+                        (file.filename, file_bytes, file.content_type)
+                    )
+                )
+                print(f"✅ Forwarding attachment: {file.filename}")
+
+        # ⭐ CRITICAL FIX FOR YOUR .NET MODEL
+        # send EMPTY attachments field if no files
+        if not files:
+            files.append(("Attachments", ("", b"", "application/octet-stream")))
+            print("⚠️ Sending empty multipart Attachments field (not visible to user)")
+
+        print("📤 Sending email")
+        print("To:", to)
+        print("Cc:", cc)
+        print("Subject:", subject)
+        print("Attachment count:", len(files))
 
         response = requests.post(
             org_api_url,
-            json={
-                "to": payload.to,
-                "cc": payload.cc,
-                "subject": payload.subject,
-                "bodyHtml": payload.bodyHtml
-            },
-            timeout=20
+            data=data,
+            files=files,
+            timeout=30
         )
 
         if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=response.text
-            )
+            print("❌ Org API error:", response.text)
+            raise HTTPException(status_code=response.status_code, detail=response.text)
 
-        return {
-            "success": True,
-            "message": response.text
-        }
+        return {"success": True, "message": "Mail sent"}
 
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print("❌ Send email failed:", e)
-        raise HTTPException(
-            status_code=500,
-            detail="Mail service unreachable"
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/reply-email")
+async def reply_email(
+    messageItemId: str = Form(...),
+    replyBodyHtml: str = Form(...),
+    to: List[str] = Form(...),
+    cc: List[str] = Form([]),
+    attachments: List[UploadFile] = File([])
+):
+    try:
+        org_api_url = "http://172.22.6.145/api/Values/mail/reply"
+
+        data = []
+        data.append(("MessageItemId", messageItemId))
+        data.append(("ReplyBodyHtml", replyBodyHtml))
+
+        for t in to:
+            data.append(("To", t))
+
+        for c in cc:
+            data.append(("Cc", c))
+
+        files = []
+
+        for file in attachments:
+            file_bytes = await file.read()
+            if file_bytes:
+                files.append(
+                    (
+                        "Attachments",
+                        (file.filename, file_bytes, file.content_type)
+                    )
+                )
+                print(f"📎 Reply attachment: {file.filename}")
+
+        # ⭐ REQUIRED FOR ASP.NET MULTIPART
+        if not files:
+            files.append(("Attachments", ("", b"", "application/octet-stream")))
+            print("⚠️ Empty multipart Attachments field added for reply")
+
+        print("↩️ Sending reply")
+        print("To:", to)
+        print("Cc:", cc)
+
+        response = requests.post(
+            org_api_url,
+            data=data,
+            files=files,
+            timeout=30
         )
+
+        if response.status_code != 200:
+            print("❌ Reply API error:", response.text)
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        return {"success": True, "message": "Reply sent"}
+
+    except Exception as e:
+        print("❌ Reply failed:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- OPTIMIZED DOWNLOAD ENDPOINT (Generic) ---
 @app.post("/api/download")
