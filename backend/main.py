@@ -5,8 +5,7 @@ import uvicorn
 import io
 import base64
 import json
-import uuid   # Added for unique file naming
-import time   # Added for cleanup task timing
+import time
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Body, Form, File, UploadFile
@@ -15,14 +14,13 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
 from typing import List
 
-# Updated imports
 from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest
 from services import (
-    group_emails_by_subject, 
-    detect_real_threads, 
-    analyze_single_thread, 
-    analyze_single_email, 
-    generate_executive_brief, 
+    group_emails_by_subject,
+    detect_real_threads,
+    analyze_single_thread,
+    analyze_single_email,
+    generate_executive_brief,
     generate_sender_report,
     draft_email_reply,
     calculate_triage_stats,
@@ -33,7 +31,8 @@ from services import (
     get_cached_emails,
     save_cached_emails,
     normalize_email,
-    get_attachment_bytes
+    get_last_email_count,
+    set_last_email_count
 )
 
 # 1. LOAD CONFIGURATION
@@ -41,66 +40,26 @@ load_dotenv()
 origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
 origins = [origin.strip() for origin in origins_str.split(",")]
 
-# Create temporary directory for heavy attachments
-TEMP_DIR = "temp_attachments"
-os.makedirs(TEMP_DIR, exist_ok=True)
-
 # Cache file path
 CACHE_FILE = Path("db_cache.json")
 
-# --- AUTO CLEANUP CONFIG ---
-FILE_TTL_SECONDS = 24 * 60 * 60   # 24 hours
+# ─── ORG SERVER CONFIG ───
+ORG_BASE = "http://172.22.6.145"
 
-# 🔐 USER-SCOPED ATTACHMENT STORAGE HELPER
-def safe_user_folder(user_email: str) -> str:
-    """
-    Convert email to filesystem-safe folder name.
-    Replaces @ and . with underscores to avoid filesystem conflicts.
-    Example: ramon.romero@hfmg.net → ramon_romero_at_hfmg_net
-    """
-    return user_email.replace("@", "_at_").replace(".", "_")
-
-
-def cleanup_old_attachments():
-    """
-    Deletes attachment files older than 24 hours from temp_attachments folder.
-    🔐 USER-SCOPED: Iterates per user folder to safely isolate cleanup.
-    """
-    if not os.path.exists(TEMP_DIR):
-        return
-
-    now = time.time()
-    deleted = 0
-
-    # 🔐 Iterate through user folders
-    for user_folder in os.listdir(TEMP_DIR):
-        user_dir = os.path.join(TEMP_DIR, user_folder)
-
-        # Skip if not a directory
-        if not os.path.isdir(user_dir):
-            continue
-
-        # Process files in user's directory
-        for filename in os.listdir(user_dir):
-            file_path = os.path.join(user_dir, filename)
-
-            # Skip if not a file
-            if not os.path.isfile(file_path):
-                continue
-
-            try:
-                file_age = now - os.path.getctime(file_path)
-
-                if file_age > FILE_TTL_SECONDS:
-                    os.remove(file_path)
-                    deleted += 1
-                    print(f"🧹 Deleted expired attachment: {file_path}")
-
-            except Exception as e:
-                print(f"⚠️ Cleanup failed for {file_path}: {e}")
-
-    if deleted:
-        print(f"🧹 Cleanup completed. Removed {deleted} expired user-scoped attachment(s)")
+# =====================================================
+# 🔧 CONFIGURE THIS: Your org server's endpoint to
+# fetch a single email (with full attachment base64)
+# by messageId.
+#
+# OPTION A — Single-message endpoint (preferred):
+#   GET /api/Values/inbox/{email}/message/{messageId}
+#
+# OPTION B — Dedicated attachment endpoint:
+#   GET /api/Values/mail/attachment?email={email}&messageId={messageId}&fileName={name}
+#
+# Update the function `fetch_attachment_from_api()`
+# below to match whichever your .NET server supports.
+# =====================================================
 
 
 app = FastAPI()
@@ -108,63 +67,200 @@ app = FastAPI()
 # 2. SECURITY (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, 
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # --- HELPER FUNCTIONS ---
 
 def update_cache_mark_read(message_id: str):
-    """
-    Update the backend cache to mark an email as read.
-    This ensures the email doesn't reappear on next refresh.
-    """
     if not CACHE_FILE.exists():
-        print(f"⚠️  Cache file not found: {CACHE_FILE}")
         return
 
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # Update in enriched emails
-        emails = data.get("meta_last_enriched_emails", [])
         updated = False
-        
-        for e in emails:
+        for e in data.get("meta_last_enriched_emails", []):
             if e.get("id") == message_id or e.get("messageId") == message_id:
                 e["isRead"] = True
                 updated = True
-                print(f"✅ Cache: Marked email {message_id} as read in enriched emails")
                 break
 
-        # Update in threads if present
-        threads = data.get("threads", [])
-        for t in threads:
+        for t in data.get("threads", []):
             if t.get("id") == message_id or t.get("messageId") == message_id:
                 t["isRead"] = True
                 updated = True
-                print(f"✅ Cache: Marked email {message_id} as read in threads")
                 break
 
-        # Save updated cache only if we made changes
         if updated:
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            print(f"💾 Cache file updated successfully")
-        else:
-            print(f"⚠️  Email {message_id} not found in cache")
 
     except Exception as e:
         print(f"❌ Failed to update cache: {e}")
 
 
+def fetch_attachment_from_api(user_email: str, message_id: str, file_name: str) -> bytes:
+    """
+    🔑 Fetch a specific attachment directly from the org mail API.
+    
+    Strategy:
+      1. Try single-message endpoint first (fast, if your .NET server supports it)
+      2. Fallback: fetch recent inbox and search for the matching messageId
+    
+    The mail API returns attachments with full base64 in the "hash" field.
+    """
+
+    # ── ATTEMPT 1: Try single-message endpoint (FAST PATH) ──
+    # 🔧 If your .NET server supports this, it's the best option.
+    #    If it returns 404, we fall through to the inbox search.
+    single_msg_url = f"{ORG_BASE}/api/Values/inbox/{user_email}/message/{message_id}"
+
+    print(f"📥 Attempting single-message fetch: {single_msg_url}")
+    print(f"   Looking for file: {file_name}")
+
+    try:
+        resp = requests.get(single_msg_url, timeout=30)
+
+        if resp.status_code == 200:
+            mail_data = resp.json()
+            if isinstance(mail_data, list):
+                mail_data = mail_data[0] if mail_data else None
+
+            if mail_data:
+                result = _extract_attachment(mail_data, file_name)
+                if result:
+                    return result
+
+            print("⚠️ Single-message endpoint returned data but attachment not found, trying inbox search...")
+
+        else:
+            print(f"⚠️ Single-message endpoint returned {resp.status_code}, falling back to inbox search...")
+
+    except requests.exceptions.ConnectionError:
+        print("⚠️ Single-message endpoint not available, falling back to inbox search...")
+    except Exception as e:
+        print(f"⚠️ Single-message attempt failed ({e}), falling back to inbox search...")
+
+    # ── ATTEMPT 2: Fetch inbox and search for the messageId (FALLBACK) ──
+    inbox_url = f"{ORG_BASE}/api/Values/inbox/{user_email}/count200"
+    print(f"📥 Fetching inbox to find attachment: {inbox_url}")
+
+    try:
+        resp = requests.get(inbox_url, timeout=60)
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Mail server error: {resp.text}"
+            )
+
+        inbox_data = resp.json()
+
+        if not isinstance(inbox_data, list):
+            raise HTTPException(status_code=500, detail="Unexpected inbox format")
+
+        # Search through all emails for matching messageId
+        for mail in inbox_data:
+            if mail.get("messageId") == message_id:
+                print(f"✅ Found email with messageId: {message_id}")
+
+                result = _extract_attachment(mail, file_name)
+                if result:
+                    return result
+
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Email found but attachment '{file_name}' not in it"
+                )
+
+        raise HTTPException(
+            status_code=404,
+            detail=f"Email with messageId '{message_id}' not found in inbox"
+        )
+
+    except HTTPException:
+        raise
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Mail server timeout")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=503, detail="Cannot reach mail server")
+    except Exception as e:
+        print(f"❌ fetch_attachment_from_api error: {e}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+
+def _extract_attachment(mail_data: dict, file_name: str) -> bytes | None:
+    """
+    Search for a named attachment in an email object and return decoded bytes.
+    Searches both root-level attachments and thread message attachments.
+    Returns None if not found.
+    """
+    all_attachments = []
+
+    # Root-level attachments
+    if isinstance(mail_data.get("attachments"), list):
+        all_attachments.extend(mail_data["attachments"])
+
+    # Thread message attachments
+    if isinstance(mail_data.get("messages"), list):
+        for msg in mail_data["messages"]:
+            if isinstance(msg.get("attachments"), list):
+                all_attachments.extend(msg["attachments"])
+
+    # Find by filename
+    for att in all_attachments:
+        if att.get("name") == file_name:
+            raw_hash = att.get("hash")
+            if not raw_hash or len(raw_hash) < 20:
+                print(f"⚠️ Attachment '{file_name}' found but hash is empty/truncated")
+                return None
+
+            print(f"✅ Extracted attachment: {file_name} ({len(raw_hash)} chars base64)")
+            return base64.b64decode(raw_hash)
+
+    return None
+
+
 # --- ENDPOINTS ---
 
+@app.post("/api/login")
+async def login(credentials: LoginRequest):
+    try:
+        org_login_url = f"{ORG_BASE}/login"
+        print(f"🔐 Login attempt for: {credentials.email}")
+
+        response = requests.post(
+            org_login_url,
+            json={"email": credentials.email, "password": credentials.password},
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        user_data = response.json()
+        print(f"✅ Login successful for: {credentials.email}")
+        return user_data
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Login server timeout.")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=503, detail="Cannot connect to login server.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Login error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed.")
+
+
 @app.get("/api/fetch-inbox")
-def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count10"):
+def fetch_inbox(url: str = f"{ORG_BASE}/api/Values/inbox/ramon.romero@hfmg.net/count10"):
     try:
         clean_url = url.replace("[", "").replace("]", "").split("(")[0]
         if not clean_url.startswith("http"):
@@ -175,67 +271,42 @@ def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hf
         resp = requests.get(clean_url, timeout=60)
         data = resp.json()
 
-        # 🔐 EXTRACT USER EMAIL FROM URL for scoped storage
-        user_email = clean_url.split("/inbox/")[1].split("/")[0]
-        user_folder = safe_user_folder(user_email)
-        user_dir = os.path.join(TEMP_DIR, user_folder)
-        os.makedirs(user_dir, exist_ok=True)
-
-        print(f"🔐 Using user-scoped storage: {user_dir}")
-
-        # STEP 1.1 → Strip heavy Base64 immediately
+        # ─── STEP 1: Strip heavy base64 from attachments (NO DISK SAVE) ───
         for mail in data:
             for att in mail.get("attachments", []):
                 if "hash" in att:
-                    raw_hash = att["hash"]  # Store ORIGINAL complete hash
-                    att["size"] = len(raw_hash)
+                    raw_hash = att["hash"]
+                    att["size"] = len(raw_hash)       # preserve size info
+                    att["hash"] = raw_hash[:16]        # preview only for UI
+                    att["full_hash"] = None             # stripped — will fetch from API on download
+                    att["storage"] = "api"              # 🆕 indicates "fetch from mail API"
 
-                    # --- STEP: Save ALL attachments to disk (USER-SCOPED) ---
-                    file_id = f"{uuid.uuid4()}.b64"
-                    file_path = os.path.join(user_dir, file_id)
+                    print(f"📎 Stripped attachment: {att.get('name')} (was {len(raw_hash)} chars)")
 
-                    with open(file_path, "w") as f:
-                        f.write(raw_hash)
-
-                    att["hash"] = raw_hash[:16]       # only preview for UI
-                    att["full_hash"] = None           # remove heavy data
-                    att["storage"] = "disk"
-                    att["file_path"] = file_path
-
-                    print(f"💾 Attachment saved to user-scoped disk: {att.get('name')} -> {file_path}")
-        
-        # STEP 1.2 → Debug confirmation
-        if data and data[0].get("attachments"):
-            print("\n🔍 FIRST EMAIL ATTACHMENTS AFTER PROCESSING:")
-            for att in data[0].get("attachments", [])[:2]:
-                print(f"  Name: {att.get('name')}")
-                print(f"    hash length: {len(att.get('hash', ''))}")
-                print(f"    full_hash: {att.get('full_hash')}")
-                print(f"    storage: {att.get('storage')}")
-                print(f"    file_path: {att.get('file_path')}")
-                print(f"    Keys in att: {list(att.keys())}")
-                print()
-
-        # 🔁 STEP 1.3 → FORCE ATTACHMENTS TO EXIST AT EMAIL ROOT LEVEL
+        # ─── STEP 2: Merge thread message attachments to root level ───
         for mail in data:
-            combined_attachments = []
+            combined = []
 
-            # 1. Normal single email attachments
             if "attachments" in mail and isinstance(mail["attachments"], list):
-                combined_attachments.extend(mail["attachments"])
+                combined.extend(mail["attachments"])
 
-            # 2. If this mail is a thread, pull attachments from messages
             if "messages" in mail and isinstance(mail["messages"], list):
                 for msg in mail["messages"]:
                     if "attachments" in msg and isinstance(msg["attachments"], list):
-                        combined_attachments.extend(msg["attachments"])
+                        for att in msg["attachments"]:
+                            if "hash" in att:
+                                raw_hash = att["hash"]
+                                att["size"] = len(raw_hash)
+                                att["hash"] = raw_hash[:16]
+                                att["full_hash"] = None
+                                att["storage"] = "api"
+                            combined.append(att)
 
-            # 3. Overwrite root attachments with unified list
-            mail["attachments"] = combined_attachments
+            mail["attachments"] = combined
 
-        print(f"\n✅ UNIFICATION COMPLETE: All {len(data)} emails now have attachments at root level")
+        print(f"✅ Processed {len(data)} emails (attachments stripped, will fetch from API on download)")
 
-        # Sort mails by received time (newest first)
+        # Sort by received time
         data.sort(
             key=lambda x: datetime.fromisoformat(x.get("received", "1970-01-01T00:00:00")),
             reverse=True
@@ -246,100 +317,56 @@ def fetch_inbox(url: str = "http://172.22.6.145/api/Values/inbox/ramon.romero@hf
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/api/login")
-def login(credentials: LoginRequest):
-    if credentials.username == "Ramon" and credentials.password == "hfmg@2026":
-        return{"success": True, "token": "ramon-secure-token-v1"}
-    else:
-        raise HTTPException(status_code=401, detail="Invalid Credentials")
 
 @app.post("/api/analyze")
 async def analyze_emails(payload: AnalysisRequest):
-    # 1. IMMEDIATE NORMALIZATION (Fixes inconsistent keys like messageId vs id)
     emails = [normalize_email(e) for e in payload.emails]
-    if not emails: return {"emails": [], "report": None}
-    
-    # --- DEBUG: CONFIRM ATTACHMENTS ---
-    for e in emails:
-        if e.get("attachments"):
-            print("MAIL WITH ATTACHMENTS:", e.get("subject"), e.get("attachments"))
-    # ----------------------------------
-    
-    # --- LEVEL 3: GLOBAL GATEKEEPER ---
-    
-    # ✅ CHANGE 1: Helper to parse dates for comparison (with timezone handling)
-    def get_date_obj(e):
-        try:
-            dt = datetime.fromisoformat(e["received_at"])
-            if dt.tzinfo:
-                dt = dt.astimezone(tz=None).replace(tzinfo=None)
-            return dt
-        except:
-            return datetime(1970, 1, 1)
 
-    # Calculate latest timestamp using Objects, not Strings
-    latest_email_ts = max((get_date_obj(e) for e in emails), default=datetime(1970, 1, 1))
-    
-    last_run_str = get_last_processed_timestamp()
-    last_run_ts = None
-    
-    if last_run_str:
-        try:
-            last_run_ts = datetime.fromisoformat(last_run_str)
-        except:
-            last_run_ts = None
-    
-    # Try to load cached enriched emails
-    cached_emails = get_cached_emails()
+    current_count = len(emails)
+    last_count = get_last_email_count()
+    cached_emails = get_cached_emails() or []
 
-    # 2. Compare: If newest email is NOT newer than last run, AND we have valid cached data
-    if last_run_ts and latest_email_ts <= last_run_ts and cached_emails:
-        print("⏳ No new emails detected. Returning cached enriched data.")
+    if last_count == current_count and cached_emails:
+        print(f"⚡ No change in email count ({current_count}). Using cache.")
         cached_report = get_cached_report()
         return {"emails": cached_emails, "report": cached_report}
 
-    print(f"🚀 New Data (or missing cache) Detected. Running Analysis...")
+    if not emails:
+        save_cached_emails([])
+        set_last_email_count(0)
+        return {"emails": [], "report": None}
 
-    # --- STANDARD ANALYSIS LOGIC ---
-    
-    # 3. REAL THREAD DETECTION (Replaces Subject Grouping)
+    print(f"🆕 Email count changed ({last_count} → {current_count}). Running AI analysis...")
+
     real_threads, single_emails = detect_real_threads(emails)
 
     tasks = []
-
-    # Process Real Threads ONLY (for AI analysis)
     for e in real_threads:
         subject = e.get("subject", "No Subject")
         tasks.append(analyze_single_thread(subject, [e]))
 
-    # Analyze single emails normally (no thread structure)
     for e in single_emails:
-        tasks.append(analyze_single_email(e)) 
+        tasks.append(analyze_single_email(e))
 
     analyzed_results = await asyncio.gather(*tasks)
-    
-    # Briefing only for Real Threads
+
     threads_only = [t for t in analyzed_results if t.get("thread_count", 1) > 1]
-    
-    brief_task = generate_executive_brief(threads_only)  
+
+    brief_task = generate_executive_brief(threads_only)
     sender_task = generate_sender_report(emails)
-    
     brief, sender_summaries = await asyncio.gather(brief_task, sender_task)
-    
-    # Stats calculated on ALL results
+
     triage_data = calculate_triage_stats(emails, analyzed_results, demo_mode=False)
-    
+
     brief["thread_email_count"] = len(emails)
     brief["thread_attachment_count"] = triage_data["att_total"]
     brief["sender_summaries"] = sender_summaries
-    brief["triage_stats"] = triage_data 
+    brief["triage_stats"] = triage_data
 
-    # --- LEVEL 3: SAVE STATE ---
-    set_last_processed_timestamp(latest_email_ts.isoformat())
     save_cached_report(brief)
     save_cached_emails(analyzed_results)
+    set_last_email_count(current_count)
 
-    # ✅ CHANGE 2: Safe datetime helper for sorting (with timezone handling)
     def safe_datetime(val):
         try:
             dt = datetime.fromisoformat(val)
@@ -354,16 +381,19 @@ async def analyze_emails(payload: AnalysisRequest):
         reverse=True
     )
 
-    return {"emails": analyzed_results, "report": brief} 
+    return {"emails": analyzed_results, "report": brief}
+
 
 @app.post("/api/reply")
 async def generate_reply(payload: ReplyRequest):
     reply_text = await draft_email_reply(payload.sender, payload.email_body)
     return {"reply": reply_text}
 
+
 @app.post("/api/parse-thread")
 async def parse_email_thread(payload: ThreadParseRequest):
     return {"segments": [{"type": "latest", "header": "Log", "content": payload.body}]}
+
 
 @app.post("/api/send-email")
 async def send_email(
@@ -374,62 +404,35 @@ async def send_email(
     attachments: List[UploadFile] = File([])
 ):
     try:
-        org_api_url = "http://172.22.6.145/api/Values/mail/send"
+        org_api_url = f"{ORG_BASE}/api/Values/mail/send"
 
-        # ---- form fields ----
         data = []
-
         for t in to:
             data.append(("To", t))
-
         for c in cc:
             data.append(("Cc", c))
-
         data.append(("Subject", subject))
         data.append(("BodyHtml", bodyHtml))
 
-        # ---- files ----
         files = []
-
         for file in attachments:
             file_bytes = await file.read()
             if file_bytes:
-                files.append(
-                    (
-                        "Attachments",
-                        (file.filename, file_bytes, file.content_type)
-                    )
-                )
-                print(f"✅ Forwarding attachment: {file.filename}")
+                files.append(("Attachments", (file.filename, file_bytes, file.content_type)))
 
-        # ⭐ CRITICAL FIX FOR YOUR .NET MODEL
-        # send EMPTY attachments field if no files
         if not files:
             files.append(("Attachments", ("", b"", "application/octet-stream")))
-            print("⚠️ Sending empty multipart Attachments field (not visible to user)")
 
-        print("📤 Sending email")
-        print("To:", to)
-        print("Cc:", cc)
-        print("Subject:", subject)
-        print("Attachment count:", len(files))
-
-        response = requests.post(
-            org_api_url,
-            data=data,
-            files=files,
-            timeout=30
-        )
+        response = requests.post(org_api_url, data=data, files=files, timeout=30)
 
         if response.status_code != 200:
-            print("❌ Org API error:", response.text)
             raise HTTPException(status_code=response.status_code, detail=response.text)
 
         return {"success": True, "message": "Mail sent"}
 
     except Exception as e:
-        print("❌ Send email failed:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/reply-email")
 async def reply_email(
@@ -440,174 +443,83 @@ async def reply_email(
     attachments: List[UploadFile] = File([])
 ):
     try:
-        org_api_url = "http://172.22.6.145/api/Values/mail/reply"
+        org_api_url = f"{ORG_BASE}/api/Values/mail/reply"
 
         data = []
         data.append(("MessageItemId", messageItemId))
         data.append(("ReplyBodyHtml", replyBodyHtml))
-
         for t in to:
             data.append(("To", t))
-
         for c in cc:
             data.append(("Cc", c))
 
         files = []
-
         for file in attachments:
             file_bytes = await file.read()
             if file_bytes:
-                files.append(
-                    (
-                        "Attachments",
-                        (file.filename, file_bytes, file.content_type)
-                    )
-                )
-                print(f"📎 Reply attachment: {file.filename}")
+                files.append(("Attachments", (file.filename, file_bytes, file.content_type)))
 
-        # ⭐ REQUIRED FOR ASP.NET MULTIPART
         if not files:
             files.append(("Attachments", ("", b"", "application/octet-stream")))
-            print("⚠️ Empty multipart Attachments field added for reply")
 
-        print("↩️ Sending reply")
-        print("To:", to)
-        print("Cc:", cc)
-
-        response = requests.post(
-            org_api_url,
-            data=data,
-            files=files,
-            timeout=30
-        )
+        response = requests.post(org_api_url, data=data, files=files, timeout=30)
 
         if response.status_code != 200:
-            print("❌ Reply API error:", response.text)
             raise HTTPException(status_code=response.status_code, detail=response.text)
 
         return {"success": True, "message": "Reply sent"}
 
     except Exception as e:
-        print("❌ Reply failed:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- OPTIMIZED DOWNLOAD ENDPOINT (Generic) ---
-@app.post("/api/download")
-def download_file(payload: dict):
-    try:
-        file_name = payload.get("name")
-        storage = payload.get("storage", "inline")
-        file_type = payload.get("type", "application/octet-stream")
-        file_hash = payload.get("full_hash")
 
-        # Block remote/video files
-        if storage == "remote":
-            raise HTTPException(
-                status_code=403,
-                detail="Video files cannot be downloaded. Please use the original email."
-            )
-
-        if not file_hash:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File data missing for {file_name}"
-            )
-
-        # Decode base64 safely
-        try:
-            file_bytes = base64.b64decode(file_hash)
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid file data"
-            )
-
-        file_stream = io.BytesIO(file_bytes)
-
-        return StreamingResponse(
-            file_stream,
-            media_type=file_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{file_name}"',
-                "Cache-Control": "no-store"
-            }
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Download failed")
-
-# --- REMOTE FILE DOWNLOAD ENDPOINT ---
-@app.post("/api/download-remote-file")
-def download_remote_file(payload: dict):
-    print("📦 Remote download payload:", payload)
-
-    raise HTTPException(
-        status_code=400,
-        detail="Mailbox attachment download endpoint not configured yet. Need attachment download URL."
-    )
-
-# --- STEP 2: UPDATE DOWNLOAD API (DISK SUPPORT + USER-SCOPED SAFETY) ---
+# ─────────────────────────────────────────────────────
+# 🆕 UPDATED: Download attachment via org mail API
+# No more disk storage — fetches directly from source
+# ─────────────────────────────────────────────────────
 @app.post("/api/download-attachment")
 def download_attachment(data: dict):
     name = data.get("name")
     message_id = data.get("messageId")
+    # 🔧 TESTING: Hardcoded email — replace with dynamic user later
+    user_email = data.get("userEmail", "ramon.romero@hfmg.net")
 
-    cached_emails = get_cached_emails()
+    if not name or not message_id:
+        raise HTTPException(status_code=400, detail="Missing 'name' or 'messageId'")
+
+    print(f"📥 Download request: '{name}' from message {message_id}")
+
+    # Get the attachment content type from cache (for proper Content-Type header)
+    content_type = "application/octet-stream"
+    cached_emails = get_cached_emails() or []
 
     for mail in cached_emails:
-        # Check both id fields for robustness
         if mail.get("id") == message_id or mail.get("messageId") == message_id:
             for att in mail.get("attachments", []):
+                if att.get("name") == name:
+                    content_type = att.get("type", "application/octet-stream")
+                    break
+            break
 
-                if att["name"] == name:
+    # 🔑 Fetch attachment bytes directly from org mail API
+    file_bytes = fetch_attachment_from_api(user_email, message_id, name)
 
-                    # Large files (Saved on Disk) - PRIMARY STORAGE METHOD
-                    if att.get("storage") == "disk":
-                        file_path = att.get("file_path")
+    print(f"✅ Streaming {name} ({len(file_bytes)} bytes) to client")
 
-                        # 🔐 SAFETY CHECK: Ensure file exists and is readable (user-scoped safe)
-                        if not file_path or not os.path.exists(file_path):
-                            raise HTTPException(
-                                status_code=410,
-                                detail="Attachment expired or no longer available"
-                            )
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "Content-Length": str(len(file_bytes)),
+            "Cache-Control": "no-store"
+        }
+    )
 
-                        print(f"💾 Loading large file from disk: {file_path}")
 
-                        with open(file_path, "r") as f:
-                            base64_data = f.read()
-
-                        file_bytes = base64.b64decode(base64_data)
-
-                        return StreamingResponse(
-                            io.BytesIO(file_bytes),
-                            media_type=att.get("type"),
-                            headers={"Content-Disposition": f'attachment; filename="{name}"'}
-                        )
-
-                    # Fallback: Small files (Inline in Memory)
-                    if att.get("storage") == "inline":
-                        file_bytes = base64.b64decode(att["full_hash"])
-                        return StreamingResponse(
-                            io.BytesIO(file_bytes),
-                            media_type=att.get("type"),
-                            headers={"Content-Disposition": f'attachment; filename="{name}"'}
-                        )
-
-    raise HTTPException(status_code=404, detail="Attachment not found")
-
-# --- MARK AS READ ENDPOINT (CORS-SAFE PROXY) ---
+# --- MARK AS READ ENDPOINT ---
 @app.post("/api/mark-read")
 def mark_mail_as_read(payload: dict = Body(...)):
-    """
-    Mark an email as read in the organization mailbox.
-    Updates:
-    1. Organization mailbox (source of truth)
-    2. Backend cache (so it doesn't reappear on refresh)
-    3. Returns success to frontend (which already updated its state)
-    """
     try:
         email = payload.get("email")
         message_id = payload.get("messageId")
@@ -615,114 +527,86 @@ def mark_mail_as_read(payload: dict = Body(...)):
         if not email or not message_id:
             raise HTTPException(status_code=400, detail="Missing email or messageId")
 
-        org_api_url = "http://172.22.6.145/api/Values/mail/read-status"
+        org_api_url = f"{ORG_BASE}/api/Values/mail/read-status"
+        params = {"email": email, "messageId": message_id, "isRead": True}
 
-        params = {
-            "email": email,
-            "messageId": message_id,
-            "isRead": True
-        }
-
-        print(f"📩 Calling org mailbox API with params: {params}")
-
-        # Call organization mailbox API
         resp = requests.post(org_api_url, params=params, timeout=20)
 
-        print(f"📬 Org API response: {resp.status_code} | {resp.text}")
-
         if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Organization API error: {resp.text}"
-            )
+            raise HTTPException(status_code=resp.status_code, detail=f"Org API error: {resp.text}")
 
-        # 🔥 STEP 2: Update backend cache to match organization mailbox
-        print(f"🔄 Updating backend cache for message {message_id}...")
         update_cache_mark_read(message_id)
 
-        return {
-            "success": True,
-            "message": "Email marked as read in organization inbox and cache updated"
-        }
+        return {"success": True, "message": "Email marked as read"}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error in mark-read endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- FILE STREAMING ENDPOINT ---
-@app.post("/api/file-stream")
-async def file_stream(request: Request, mode: str = "preview"):
-    payload = None
-    content_type = request.headers.get("content-type", "")
-    print("📥 file-stream Content-Type:", content_type)
 
-    # Try FORM first (Preview)
+@app.get("/api/search-contacts")
+async def search_contacts(q: str = ""):
+    """
+    Search contacts from the organization mail server.
+    Returns a list of contacts matching the query string.
+    """
     try:
-        form = await request.form()
-        if form:
-            print("📄 Form keys:", list(form.keys()))
-            raw = form.get("payload")
-            print("📄 Raw payload from form:", raw)
+        if not q or len(q) < 2:
+            return []
 
-            if raw and raw.strip():
-                payload = json.loads(raw)
+        # Fetch all contacts from the org server
+        contacts_url = f"{ORG_BASE}/get"
+        print(f"🔍 Searching contacts: {contacts_url}")
+        
+        response = requests.get(contacts_url, timeout=10)
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Failed to fetch contacts: {response.text}"
+            )
+        
+        all_contacts = response.json()
+        
+        if not isinstance(all_contacts, list):
+            return []
+        
+        # Filter contacts based on search query (case-insensitive)
+        query_lower = q.lower()
+        filtered = []
+        
+        for contact in all_contacts:
+            mail_id = contact.get("mailId", "")
+            
+            # Skip system mailboxes
+            if "SystemMailbox" in mail_id:
+                continue
+            
+            # Check if query matches the email
+            if query_lower in mail_id.lower():
+                # Extract name from email (part before @)
+                name_part = mail_id.split("@")[0] if "@" in mail_id else mail_id
+                # Convert "First.Last" to "First Last"
+                display_name = name_part.replace(".", " ").title()
+                
+                filtered.append({
+                    "email": mail_id,
+                    "name": display_name,
+                    "group": contact.get("groupName", "user")
+                })
+        
+        # Limit results to 10 for performance
+        return filtered[:10]
+    
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Contact server timeout")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=503, detail="Cannot reach contact server")
     except Exception as e:
-        print("⚠️ Form parse failed:", e)
+        print(f"❌ search_contacts error: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
-    # If no payload yet, try JSON (Download)
-    if payload is None:
-        try:
-            payload = await request.json()
-            print("📦 Payload from JSON:", payload)
-        except Exception as e:
-            print("⚠️ JSON parse failed:", e)
-
-    # Final guard
-    if not payload:
-        raise HTTPException(status_code=400, detail="No payload received in request")
-
-    filename = payload.get("name", "file")
-    filetype = payload.get("type", "application/octet-stream")
-
-    # Determine disposition
-    is_video_or_audio = filetype.startswith("video/") or filetype.startswith("audio/")
-    disposition = "attachment" if is_video_or_audio or mode == "download" else "inline" if mode == "preview" else "attachment"
-
-    headers = {
-        "Content-Type": filetype,
-        "Content-Disposition": f'{disposition}; filename="{filename}"'
-    }
-
-    # Get file data
-    file_hash = payload.get("hash") or payload.get("full_hash")
-
-    if not file_hash:
-        raise HTTPException(status_code=400, detail="File hash missing")
-
-    try:
-        binary = base64.b64decode(file_hash)
-        print(f"✅ Decoded {filename} ({len(binary)} bytes)")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Base64 decode failed: {e}")
-
-    return StreamingResponse(
-        io.BytesIO(binary),
-        headers=headers,
-        media_type=filetype
-    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-# --- BACKGROUND CLEANUP TASK ---
-@app.on_event("startup")
-async def start_cleanup_task():
-    async def cleanup_loop():
-        while True:
-            print("🧹 Running scheduled attachment cleanup (user-scoped)...")
-            cleanup_old_attachments()
-            await asyncio.sleep(60 * 60)  # run every 1 hour
-
-    asyncio.create_task(cleanup_loop())

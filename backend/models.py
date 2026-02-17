@@ -12,9 +12,9 @@ class ReplyRequest(BaseModel):
 class ThreadParseRequest(BaseModel):
     body: str
 
-# NEW: Added for secure login
+# Login: matches the org server payload { email, password }
 class LoginRequest(BaseModel):
-    username: str
+    email: str
     password: str
 
 class SendEmailRequest(BaseModel):

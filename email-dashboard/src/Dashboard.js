@@ -21,6 +21,9 @@ function Dashboard() {
   const IDLE_TIMEOUT = 20 * 1000; // use 20 sec for testing
   const idleTimerRef = useRef(null);
   
+  // ✅ FIX: Prevent double fetch on mount
+  const hasInitiallyFetched = useRef(false);
+  
   // --- STATE ---
   const [emails, setEmails] = useState([]);
   const [lastUserActivityTime, setLastUserActivityTime] = useState(Date.now());
@@ -46,13 +49,104 @@ function Dashboard() {
     return times.length ? new Date(Math.max(...times)) : new Date(0);
   };
 
-  // --- CHANGED: Stable sorted emails list ---
-  const sortedEmails = useMemo(() => {
+  // --- HELPER: Normalize subject by stripping reply/forward prefixes ---
+  const normalizeSubject = (subject) => {
+    if (!subject) return "";
+    // Strip Re:, RE:, Fwd:, FW:, AW: etc. repeatedly (handles "Re: Re: ..." chains)
+    let s = subject.trim();
+    const prefixPattern = /^(re|fwd|fw|aw|tr)\s*:\s*/i;
+    while (prefixPattern.test(s)) {
+      s = s.replace(prefixPattern, "").trim();
+    }
+    return s.toLowerCase();
+  };
+
+  // --- GROUP EMAILS BY THREAD: merge Re:/RE: replies under one thread card ---
+  const groupedEmails = useMemo(() => {
     if (!emails || emails.length === 0) return [];
-    return [...emails].sort(
+
+    const groups = {};
+
+    emails.forEach(email => {
+      const baseSubject = normalizeSubject(email.subject);
+      if (!groups[baseSubject]) groups[baseSubject] = [];
+      groups[baseSubject].push(email);
+    });
+
+    const result = [];
+
+    Object.values(groups).forEach(group => {
+      if (group.length === 1) {
+        result.push(group[0]);
+        return;
+      }
+
+      // Sort group newest-first
+      const sorted = [...group].sort(
+        (a, b) => getEffectiveReceivedAt(b) - getEffectiveReceivedAt(a)
+      );
+
+      // Newest email becomes the thread parent
+      const threadParent = { ...sorted[0] };
+
+      // Build unified messages array from all emails in the group
+      const allMessages = [];
+      sorted.forEach(email => {
+        if (Array.isArray(email.messages) && email.messages.length > 0) {
+          allMessages.push(...email.messages);
+        } else {
+          allMessages.push({
+            from: email.from || email.sender || "Unknown",
+            date: email.received || email.received_at || email.date,
+            body: email.body || "",
+            attachments: email.attachments || []
+          });
+        }
+      });
+
+      // Deduplicate messages by from+date key
+      const seen = new Set();
+      threadParent.messages = allMessages.filter(msg => {
+        const key = `${msg.from}|${msg.date}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      // Merge all attachments from every email in the group
+      const allAtts = [];
+      sorted.forEach(e => {
+        if (Array.isArray(e.attachments)) allAtts.push(...e.attachments);
+      });
+      threadParent.attachments = allAtts;
+
+      // Unread if ANY email in the group is unread
+      threadParent.isRead = sorted.every(e => e.isRead);
+
+      // Store count for the UI thread-count badge
+      threadParent.threadCount = sorted.length;
+
+      // ✅ Store ALL original message IDs so markAsRead can fire for every reply
+      threadParent.allMessageIds = sorted
+        .map(e => e.id || e.messageId)
+        .filter(Boolean);
+
+      // Use the latest summary
+      threadParent.summary = sorted.find(e => e.summary)?.summary || "";
+
+      result.push(threadParent);
+    });
+
+    return result;
+  }, [emails]);
+
+  // --- CHANGED: Stable sorted emails list (now uses grouped data) ---
+  const sortedEmails = useMemo(() => {
+    if (!groupedEmails || groupedEmails.length === 0) return [];
+    return [...groupedEmails].sort(
       (a, b) => getEffectiveReceivedAt(b) - getEffectiveReceivedAt(a)
     );
-  }, [emails]);
+  }, [groupedEmails]);
 
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -60,8 +154,12 @@ function Dashboard() {
   const [mainView, setMainView] = useState('INSIGHTS');
   const [username, setUsername] = useState("User"); 
   
-  // Kept API URL in state
-  const [apiUrl, setApiUrl] = useState("http://172.22.6.145/api/Values/inbox/ramon.romero@hfmg.net/count10");
+  // 🔧 TESTING: Hardcode Ramon's email for inbox API calls
+  const TESTING_EMAIL = "ramon.romero@hfmg.net";
+  const [apiUrl] = useState(
+    `http://172.22.6.145/api/Values/inbox/${TESTING_EMAIL}/count200`
+  );
+  
   
   const [toasts, setToasts] = useState([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -135,18 +233,21 @@ function Dashboard() {
 
   // --- DERIVED STATE: Filter & Safe Sort ---
 
-  // Separate real threads and single emails (Sorted)
-  const realThreads = (emails || [])
+  // Separate real threads and single emails (Sorted) — uses grouped data
+  const realThreads = (groupedEmails || [])
     .filter(e => Array.isArray(e.messages) && e.messages.length > 1)
     .sort((a, b) => getEffectiveReceivedAt(b) - getEffectiveReceivedAt(a));
   
   // --- CHANGED: Replace filteredEmails logic ---
   const filteredAndSortedEmails = useMemo(() => {
     if (!sortedEmails.length) return [];
-    if (activeTab === "ALL") return sortedEmails;
-  
+
+    if (activeTab === "ALL") {
+      return sortedEmails;
+    }
+
     return sortedEmails.filter(
-      (e) => (e.category || "").toUpperCase() === activeTab
+      e => e.category === activeTab
     );
   }, [sortedEmails, activeTab]);
 
@@ -293,6 +394,13 @@ function Dashboard() {
 
   // --- INITIAL LOAD (First time dashboard opens) ---
   useEffect(() => {
+    // ✅ FIX: Guard against double execution (React.StrictMode + multiple useEffects)
+    if (hasInitiallyFetched.current) {
+      console.log("⏭️ Skipping duplicate initial fetch");
+      return;
+    }
+    
+    hasInitiallyFetched.current = true;
     console.log("🚀 Initial dashboard load");
     fetchAndAnalyze(false);
 
@@ -302,7 +410,7 @@ function Dashboard() {
 
   // ✅ START IDLE TIMER WHEN DASHBOARD MOUNTS
   useEffect(() => {
-    console.log("🚀 Dashboard mounted, starting idle timer");
+    console.log("⏱️ Starting idle timer");
     markUserActive();
   }, []);
 
@@ -363,22 +471,28 @@ function Dashboard() {
       
       if (Array.isArray(res.data)) {
         if (!silent) {
-            addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
+          addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
         }
-        setEmails(res.data);
-        setInboxReady(true); // ✅ Inbox is now safe to render
-        
-        // ⬇️ MODIFIED: Pass silent flag to runAnalysis
-        await runAnalysis(res.data, silent); 
+
+        // 🟢 SILENT AUTO-SYNC → DO NOT overwrite UI yet
+        if (silent) {
+          await runAnalysis(res.data, true);
+        } 
+        // 🔵 MANUAL REFRESH → normal behavior
+        else {
+          setEmails(res.data);
+          setInboxReady(true);
+          await runAnalysis(res.data, false);
+        }
 
         // Restore selected email after refresh
         if (currentSelectedId) {
-            const updatedEmail = res.data.find(
-              e => (e.id || e.messageId) === currentSelectedId
-            );
-            if (updatedEmail) {
-              setSelectedEmail(updatedEmail);
-            }
+          const updatedEmail = res.data.find(
+            e => (e.id || e.messageId) === currentSelectedId
+          );
+          if (updatedEmail) {
+            setSelectedEmail(updatedEmail);
+          }
         }
 
         const now = new Date().toISOString();
@@ -430,12 +544,25 @@ function Dashboard() {
           e.cc = Array.isArray(e.cc) ? e.cc : [];
           e.to = Array.isArray(e.to) ? e.to : [];
 
+          // 🔥 NORMALIZE CATEGORY: No undefined, always uppercase
+          e.category = (e.category || "NORMAL").toUpperCase();
+
           // No need to process e.messages attachments separately
           // Backend should have merged them into e.attachments
           return e;
         });
 
-        setEmails(sanitized);
+        // 🔥 THIS updates UI ONLY after AI completes
+        // Deduplicate by ID to ensure clean state
+        const unique = Object.values(
+          sanitized.reduce((acc, e) => {
+            const id = e.id || e.messageId;
+            acc[id] = e;
+            return acc;
+          }, {})
+        );
+
+        setEmails(unique);
         
         // Update report
         setReport(res.data.report);
@@ -521,9 +648,11 @@ function Dashboard() {
   };
 
   const handleLogout = () => {
-    localStorage.removeItem("jimAuthSession"); 
+    localStorage.removeItem("jimAuthSession");
     localStorage.removeItem("emailDashboardMeta");
     localStorage.removeItem("loggedInUser");
+    localStorage.removeItem("sessionUser");
+    localStorage.removeItem("userEmail");
     window.location.href = "/login";
   };
 
@@ -555,49 +684,76 @@ function Dashboard() {
   // ✅ UPDATED FUNCTION: Mark email as read + update backend cache
   const markAsRead = async (emailObj) => {
     try {
-      const userEmail = apiUrl.split("/inbox/")[1].split("/")[0];
-      
-      // 🔥 DEFINE messageId HERE (BEFORE using it in setEmails)
-      const messageId = emailObj.id || emailObj.messageId;
+      const userEmail = "ramon.romero@hfmg.net";
 
-      // STEP 1: Update frontend state IMMEDIATELY (optimistic update)
+      // For threaded emails, get ALL message IDs; for singles, just the one
+      const messageIds = Array.isArray(emailObj.allMessageIds) && emailObj.allMessageIds.length > 0
+        ? emailObj.allMessageIds
+        : [emailObj.id || emailObj.messageId].filter(Boolean);
+
+      if (messageIds.length === 0) {
+        console.warn("⚠️ markAsRead: no messageIds found");
+        return;
+      }
+
+      // STEP 1: Optimistically update frontend for ALL IDs immediately
       setEmails(prev =>
-        prev.map(e =>
-          (e.id === messageId || e.messageId === messageId)
-            ? { ...e, isRead: true }
-            : e
+        prev.map(e => {
+          const eId = e.id || e.messageId;
+          return messageIds.includes(eId) ? { ...e, isRead: true } : e;
+        })
+      );
+      console.log(`✅ Frontend updated: marked as read (${messageIds.length} messages):`, messageIds);
+
+      // STEP 2: Fire backend call for every message ID (in parallel)
+      const results = await Promise.allSettled(
+        messageIds.map(messageId =>
+          axios.post(
+            `${process.env.REACT_APP_API_URL || "http://localhost:8000/api"}/mark-read`,
+            { email: userEmail, messageId }
+          )
         )
       );
 
-      console.log("✅ Frontend updated: marked as read:", messageId);
+      const failed = results.filter(r => r.status === "rejected");
+      const succeeded = results.length - failed.length;
 
-      // STEP 2: Call backend to mark as read in the actual inbox
-      await axios.post(
-        `${process.env.REACT_APP_API_URL || "http://localhost:8000/api"}/mark-read`,
-        {
-          email: userEmail,
-          messageId: messageId
-        }
-      );
+      if (failed.length === 0) {
+        console.log(`✅ Backend updated: all ${succeeded} messages marked as read`);
+        addToast(
+          messageIds.length > 1
+            ? `Thread marked as read (${succeeded} messages)`
+            : "Email marked as read",
+          "success"
+        );
+      } else {
+        console.warn(`⚠️ ${failed.length} of ${results.length} mark-read calls failed`);
+        addToast(`Marked ${succeeded} of ${results.length} messages as read`, "info");
 
-      console.log("✅ Backend inbox updated:", messageId);
-
-      addToast("Email marked as read", "success");
+        // Revert only the ones that failed
+        const failedIds = failed.map((_, i) => messageIds[i]).filter(Boolean);
+        setEmails(prev =>
+          prev.map(e => {
+            const eId = e.id || e.messageId;
+            return failedIds.includes(eId) ? { ...e, isRead: false } : e;
+          })
+        );
+      }
 
     } catch (err) {
       console.error("❌ Failed to mark as read:", err);
       addToast("Failed to mark email as read", "error");
-      
-      // 🔥 Revert frontend state if backend call failed
-      // messageId is still in scope here from the try block
-      const messageId = emailObj.id || emailObj.messageId;
-      
+
+      // Revert all
+      const messageIds = Array.isArray(emailObj.allMessageIds) && emailObj.allMessageIds.length > 0
+        ? emailObj.allMessageIds
+        : [emailObj.id || emailObj.messageId].filter(Boolean);
+
       setEmails(prev =>
-        prev.map(e =>
-          (e.id === messageId || e.messageId === messageId)
-            ? { ...e, isRead: false }
-            : e
-        )
+        prev.map(e => {
+          const eId = e.id || e.messageId;
+          return messageIds.includes(eId) ? { ...e, isRead: false } : e;
+        })
       );
     }
   };

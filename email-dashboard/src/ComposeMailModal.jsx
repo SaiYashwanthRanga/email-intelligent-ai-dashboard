@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import EmailAutocomplete from "./EmailAutocomplete";
 
 const ComposeMailModal = ({ isOpen, onClose }) => {
   const [to, setTo] = useState("");
@@ -102,31 +103,30 @@ const ComposeMailModal = ({ isOpen, onClose }) => {
         style={styles.modal} 
         onClick={(e) => e.stopPropagation()} // Prevent closing when clicking inside
       >
-        <h3 style={{ marginBottom: "20px", fontSize: "1.2rem" }}>Compose Email</h3>
+        <h3 style={{
+          marginBottom: "18px",
+          fontSize: "1.2rem",
+          fontWeight: "700",
+          letterSpacing: "-0.3px"
+        }}>
+          ✉️ Compose Email
+        </h3>
 
         {/* To Field */}
-        <div style={styles.fieldContainer}>
-          <label style={styles.label}>To</label>
-          <input
-            type="text"
-            placeholder="email@domain.com, email2@domain.com"
-            value={to}
-            onChange={e => setTo(e.target.value)}
-            style={styles.input}
-          />
-        </div>
+        <EmailAutocomplete
+          label="To"
+          value={to}
+          onChange={(newValue) => setTo(newValue)}
+          placeholder="Search contacts or enter email addresses..."
+        />
 
         {/* CC Field */}
-        <div style={styles.fieldContainer}>
-          <label style={styles.label}>CC</label>
-          <input
-            type="text"
-            placeholder="optional"
-            value={cc}
-            onChange={e => setCc(e.target.value)}
-            style={styles.input}
-          />
-        </div>
+        <EmailAutocomplete
+          label="CC"
+          value={cc}
+          onChange={(newValue) => setCc(newValue)}
+          placeholder="Optional - Search contacts or enter email addresses..."
+        />
 
         {/* Subject Field */}
         <div style={styles.fieldContainer}>
@@ -219,124 +219,141 @@ const styles = {
   overlay: {
     position: "fixed",
     inset: 0,
-    background: "rgba(0,0,0,0.5)",
+    background: "rgba(0,0,0,0.45)",
+    backdropFilter: "blur(4px)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    zIndex: 1000,
-    backdropFilter: "blur(2px)"
+    zIndex: 2000
   },
+
   modal: {
-    background: "#fff",
+    background: "var(--bg-card)",
+    color: "var(--text-primary)",
+    borderRadius: "14px",
+    border: "1px solid var(--border-color)",
+    boxShadow: "0 25px 60px rgba(0,0,0,0.35)",
+    width: "75vw",
+    maxWidth: "950px",
+    height: "78vh",
+    maxHeight: "850px",
     padding: "24px",
-    borderRadius: "12px",
-    boxShadow: "0 20px 50px rgba(0,0,0,0.3)",
-    width: "70vw",
-    maxWidth: "900px",
-    height: "75vh",
-    maxHeight: "800px",
     display: "flex",
     flexDirection: "column",
     overflowY: "auto"
   },
+
   fieldContainer: {
-    marginBottom: "14px"
+    marginBottom: "16px"
   },
+
   label: {
-    display: "block",
+    fontSize: "0.75rem",
+    fontWeight: "700",
+    color: "var(--text-secondary)",
     marginBottom: "6px",
-    fontWeight: "600",
-    fontSize: "0.85rem",
-    color: "#374151"
+    display: "block",
+    textTransform: "uppercase",
+    letterSpacing: "0.6px"
   },
+
   input: {
     width: "100%",
     padding: "10px",
-    borderRadius: "6px",
-    border: "1px solid #d1d5db",
-    fontSize: "0.95rem",
-    outline: "none",
-    transition: "border-color 0.2s"
+    borderRadius: "8px",
+    border: "1px solid var(--border-color)",
+    background: "var(--bg-main)",
+    color: "var(--text-primary)",
+    fontSize: "0.9rem",
+    outline: "none"
   },
+
   textarea: {
     width: "100%",
-    minHeight: "300px",
+    minHeight: "260px",
     padding: "12px",
-    borderRadius: "6px",
-    border: "1px solid #d1d5db",
+    borderRadius: "10px",
+    border: "1px solid var(--border-color)",
+    background: "var(--bg-main)",
+    color: "var(--text-primary)",
     fontSize: "0.95rem",
-    lineHeight: "1.6",
-    outline: "none",
     resize: "vertical",
-    fontFamily: "inherit"
+    fontFamily: "inherit",
+    lineHeight: "1.6"
   },
+
   attachBtn: {
-    display: "inline-block",
-    padding: "8px 12px",
-    background: "#f3f4f6",
-    border: "1px solid #d1d5db",
-    borderRadius: "6px",
+    background: "var(--bg-main)",
+    border: "1px solid var(--border-color)",
+    padding: "7px 12px",
+    borderRadius: "8px",
     cursor: "pointer",
-    fontWeight: "500",
-    fontSize: "0.9rem",
-    color: "#374151",
-    transition: "background-color 0.2s",
-    userSelect: "none"
+    fontWeight: "600",
+    fontSize: "0.85rem",
+    color: "var(--text-primary)",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px"
   },
+
   attachmentsList: {
     marginTop: "10px",
     padding: "10px",
-    background: "#f9fafb",
-    borderRadius: "6px",
-    border: "1px solid #e5e7eb"
+    borderRadius: "8px",
+    background: "var(--bg-main)",
+    border: "1px solid var(--border-color)"
   },
+
   attachmentItem: {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "center",
-    padding: "8px 0",
-    fontSize: "0.9rem",
-    color: "#374151",
-    borderBottom: "1px solid #e5e7eb"
+    padding: "6px 0",
+    fontSize: "0.85rem",
+    borderBottom: "1px solid var(--border-color)"
   },
+
   removeBtn: {
     background: "none",
     border: "none",
     cursor: "pointer",
-    padding: "4px 8px",
-    fontSize: "1rem",
-    transition: "opacity 0.2s"
+    color: "#ef4444",
+    fontSize: "0.9rem"
   },
+
   actions: {
     display: "flex",
     justifyContent: "flex-end",
-    gap: "12px",
+    gap: "10px",
     marginTop: "auto",
-    paddingTop: "20px"
+    paddingTop: "16px",
+    borderTop: "1px solid var(--border-color)"
   },
+
   cancelBtn: {
     padding: "8px 16px",
-    border: "1px solid #d1d5db",
-    background: "white",
-    borderRadius: "6px",
+    borderRadius: "8px",
+    border: "1px solid var(--border-color)",
+    background: "transparent",
+    color: "var(--text-primary)",
     cursor: "pointer",
-    fontWeight: "500",
-    color: "#374151"
+    fontWeight: "600"
   },
+
   sendBtn: {
-    padding: "8px 20px",
+    padding: "8px 18px",
+    borderRadius: "8px",
     border: "none",
-    background: "#2563eb",
+    background: "linear-gradient(135deg,#2563eb,#4f46e5)",
     color: "white",
-    borderRadius: "6px",
+    fontWeight: "700",
     cursor: "pointer",
-    fontWeight: "600",
-    boxShadow: "0 2px 4px rgba(37, 99, 235, 0.2)"
+    boxShadow: "0 6px 18px rgba(37,99,235,0.35)"
   },
+
   error: {
-    color: "#dc2626",
-    fontSize: "14px",
-    marginTop: "10px",
-    textAlign: "center"
+    color: "#ef4444",
+    fontSize: "0.85rem",
+    marginTop: "8px"
   }
 };
