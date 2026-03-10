@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { X, Loader } from "lucide-react";
 
-const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.REACT_APP_API_URL || "http://172.22.6.145:8080/api";
 
 /**
  * EmailAutocomplete — Reusable email input with contact search dropdown.
@@ -24,9 +24,10 @@ const EmailAutocomplete = ({ value, onChange, placeholder = "Search contacts..."
   const debounceRef = useRef(null);
 
   // Parse value into array of selected emails
-  const selectedEmails = value
-    ? value.split(",").map(e => e.trim()).filter(Boolean)
-    : [];
+  const selectedEmails = useMemo(() =>
+    value ? value.split(",").map(e => e.trim()).filter(Boolean) : [],
+    [value]
+  );
 
   // ─── SEARCH CONTACTS ───
   const searchContacts = useCallback(async (query) => {

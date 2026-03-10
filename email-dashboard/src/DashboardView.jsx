@@ -1,25 +1,28 @@
-import React, { useState } from 'react'; 
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom'; 
 import axios from 'axios';
 import {
-  LayoutDashboard, User, Paperclip, BarChart3, X, PieChart, Mail, Clock, ArrowLeft,
-  FileText, Download, Users, LogOut, Hash, Copy, Check, Sun, Moon, Bot, ArrowRight, Zap, Loader
+  User, Paperclip, BarChart3, X, PieChart, Mail, Clock, ArrowLeft, Calendar,
+  FileText, Download, Users, LogOut, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader
 } from 'lucide-react';
 import TriageSummary from './TriageSummary';
 import ToastContainer from './Toast';
 import ComposeMailModal from "./ComposeMailModal";
 import EmailAutocomplete from "./EmailAutocomplete";
+import AILoadingScreen from "./Ailoadingscreen";
 
 // --- API BASE ---
-const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.REACT_APP_API_URL || "http://172.22.6.145:8080/api";
 
-// 🔧 TESTING: Hardcoded user email — replace with dynamic user later
-const ACTIVE_USER_EMAIL = "ramon.romero@hfmg.net";
+// Always read the logged-in user's email at call-time
+const getActiveUserEmail = () => localStorage.getItem("userEmail") || "";
 
 // ✅ Reply API (multipart/form-data)
 const replyToMail = async ({ messageItemId, replyBodyHtml, to, cc, attachments = [] }) => {
   const formData = new FormData();
   formData.append("messageItemId", messageItemId);
   formData.append("replyBodyHtml", replyBodyHtml);
+  formData.append("targetUserEmail", getActiveUserEmail());
   to.forEach(e => formData.append("to", e));
   cc.forEach(e => formData.append("cc", e));
   attachments.forEach(file => formData.append("attachments", file));
@@ -30,7 +33,7 @@ const replyToMail = async ({ messageItemId, replyBodyHtml, to, cc, attachments =
 const markReadBackend = async (email) => {
   const messageId = email.id || email.messageId;
   if (!messageId) return;
-  await axios.post(`${API_BASE}/mark-read`, { email: ACTIVE_USER_EMAIL, messageId });
+  await axios.post(`${API_BASE}/mark-read`, { email: getActiveUserEmail(), messageId });
 };
 
 // --- Helper: Extract email from "Name <email@domain.com>" ---
@@ -52,6 +55,52 @@ const CATEGORY_META = {
   PENDING: { emoji: "⏳", label: "PENDING" }
 };
 
+// --- CUSTOM ROUNDED CHECKBOX (theme-aware) ---
+const RoundCheckbox = ({ checked, onChange, onClick }) => (
+  <div
+    onClick={onClick}
+    onChange={onChange}
+    style={{
+      width: '13px', height: '13px', borderRadius: '4px', flexShrink: 0,
+      border: checked ? '2px solid #3b82f6' : '2px solid rgba(148,163,184,0.4)',
+      background: checked ? 'linear-gradient(135deg, #2563eb, #4f46e5)' : 'rgba(255,255,255,0.05)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      cursor: 'pointer', transition: 'all 0.15s ease',
+      boxShadow: checked ? '0 0 0 2px rgba(59,130,246,0.2)' : 'none'
+    }}
+  >
+    {checked && (
+      <svg width="7" height="6" viewBox="0 0 10 8" fill="none">
+        <path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+      </svg>
+    )}
+  </div>
+);
+
+// --- INDETERMINATE ROUNDED CHECKBOX (select-all) ---
+const RoundCheckboxIndeterminate = ({ checked, indeterminate, onChange }) => (
+  <div
+    onClick={onChange}
+    style={{
+      width: '13px', height: '13px', borderRadius: '4px', flexShrink: 0,
+      border: (checked || indeterminate) ? '2px solid #3b82f6' : '2px solid rgba(148,163,184,0.4)',
+      background: (checked || indeterminate) ? 'linear-gradient(135deg, #2563eb, #4f46e5)' : 'rgba(255,255,255,0.05)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      cursor: 'pointer', transition: 'all 0.15s ease',
+      boxShadow: (checked || indeterminate) ? '0 0 0 2px rgba(59,130,246,0.2)' : 'none'
+    }}
+  >
+    {indeterminate && !checked && (
+      <div style={{ width: '6px', height: '2px', background: 'white', borderRadius: '1px' }} />
+    )}
+    {checked && (
+      <svg width="7" height="6" viewBox="0 0 10 8" fill="none">
+        <path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+      </svg>
+    )}
+  </div>
+);
+
 const DashboardView = ({
   emails, report, loading, mainView, setMainView, activeTab, setActiveTab,
   username, greetingInfo, theme, toggleTheme, toasts, removeToast,
@@ -59,25 +108,47 @@ const DashboardView = ({
   lastSyncTime, inboxReady, isSoftSyncing, autoSyncEnabled, setAutoSyncEnabled,
   selectedEmail, setSelectedEmail, fileModalData, setFileModalData,
   parsedThread, threadLoading, replyDraft, setReplyDraft, replyLoading, copySuccess,
-  realThreads, filteredEmails,
+  realThreads, filteredEmails, groupedEmails,
   fetchAndAnalyze, handleLogout, handleCopy, generateAiReply, openFiles,
   getAllAttachments, getSenderDetails, markAsRead,
   getParticipantDisplay, formatDate, getSafeDate, getEmailBody, getEmailAttachments,
   getEffectiveReceivedAt, markAsReplied, markAsReadById
 }) => {
-  // --- DOWNLOAD STATE ---
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const [currentFileName, setCurrentFileName] = useState("");
+  const navigate = useNavigate();
+  // --- DOWNLOAD STATE (per-file, parallel) ---
+  const [downloadingFiles, setDownloadingFiles] = useState({});
+
+  const getFileKey = (file, messageId) =>
+    `${messageId || file.messageId || ""}__${file.name}`;
+
+  const isFileDownloading = (file, messageId) =>
+    !!(downloadingFiles[getFileKey(file, messageId)]);
+
+  const getFileProgress = (file, messageId) =>
+    downloadingFiles[getFileKey(file, messageId)]?.progress || 0;
 
   // --- COMPOSE MODAL STATE ---
   const [showCompose, setShowCompose] = useState(false);
 
-  // --- GLOBAL SENDING STATE ---
-  const [isSending, setIsSending] = useState(false);
-
   // --- PER-CARD INLINE REPLY STATE ---
   const [inlineReplyState, setInlineReplyState] = useState({});
+
+  // --- CHECKBOX SELECTION STATE ---
+  const [selectedCards, setSelectedCards] = useState(new Set());
+
+  const toggleCardSelection = (emailId) => {
+    setSelectedCards(prev => {
+      const next = new Set(prev);
+      next.has(emailId) ? next.delete(emailId) : next.add(emailId);
+      return next;
+    });
+  };
+
+  const selectAll = (emailList) => {
+    setSelectedCards(new Set(emailList.map(e => e.id || e.messageId)));
+  };
+
+  const clearSelection = () => setSelectedCards(new Set());
 
   const getEmailReplyState = (emailId) => {
     return inlineReplyState[emailId] || {
@@ -120,9 +191,6 @@ const DashboardView = ({
     return "Unknown Sender";
   };
 
-  const formatEmails = (list) =>
-    Array.isArray(list) && list.length ? list.join(", ") : "—";
-
   const formatFileSize = (bytes) => {
     if (!bytes) return "";
     const mb = bytes / (1024 * 1024);
@@ -130,41 +198,36 @@ const DashboardView = ({
     return ` (${mb.toFixed(2)} MB)`;
   };
 
+  // Render email body: HTML emails rendered as-is, plain text gets line breaks
+  const renderEmailBody = (body) => {
+    if (!body) return "";
+    if (/<[a-zA-Z][^>]*>/i.test(body)) return body;
+    return body.split("\n").join("<br/>");
+  };
+
   // ─────────────────────────────────────────────────
   // 🆕 UPDATED: Download via org mail API (no disk)
   // ─────────────────────────────────────────────────
   const handleFileDownload = async (file, messageId) => {
-    console.log("📤 Download request:", {
-      fileName: file.name,
-      messageId: messageId || file.messageId
-    });
+    const key = getFileKey(file, messageId);
+    const targetMessageId = messageId || file.messageId;
+
+    if (!targetMessageId) { alert("Missing messageId for this file"); return; }
+    if (downloadingFiles[key]) return; // already downloading this file
+
+    // Mark this specific file as downloading
+    setDownloadingFiles(prev => ({ ...prev, [key]: { progress: 0 } }));
 
     try {
-      setIsDownloading(true);
-      setDownloadProgress(0);
-      setCurrentFileName(file.name);
-
-      const targetMessageId = messageId || file.messageId;
-      if (!targetMessageId) {
-        alert("Missing messageId for this file");
-        return;
-      }
-
       const response = await axios.post(
         `${API_BASE}/download-attachment`,
-        {
-          name: file.name,
-          messageId: targetMessageId,
-          userEmail: ACTIVE_USER_EMAIL
-        },
+        { name: file.name, messageId: targetMessageId, userEmail: getActiveUserEmail() },
         {
           responseType: "blob",
-          onDownloadProgress: (progressEvent) => {
-            if (progressEvent.total) {
-              const percent = Math.round(
-                (progressEvent.loaded * 100) / progressEvent.total
-              );
-              setDownloadProgress(percent);
+          onDownloadProgress: (e) => {
+            if (e.total) {
+              const pct = Math.round((e.loaded * 100) / e.total);
+              setDownloadingFiles(prev => ({ ...prev, [key]: { progress: pct } }));
             }
           }
         }
@@ -173,21 +236,20 @@ const DashboardView = ({
       const blob = new Blob([response.data]);
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url;
-      a.download = file.name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      a.href = url; a.download = file.name;
+      document.body.appendChild(a); a.click(); a.remove();
       window.URL.revokeObjectURL(url);
 
-    } catch (error) {
-      console.error(error);
-      alert("Download failed");
+    } catch (err) {
+      console.error(err);
+      alert(`Download failed: ${file.name}`);
     } finally {
       setTimeout(() => {
-        setIsDownloading(false);
-        setDownloadProgress(0);
-        setCurrentFileName("");
+        setDownloadingFiles(prev => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
       }, 800);
     }
   };
@@ -239,13 +301,15 @@ const DashboardView = ({
     setEmailReplyState(emailId, { drafting: true });
 
     try {
+      const userName = localStorage.getItem("loggedInUser") || "User";
       const res = await fetch(`${API_BASE}/reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sender: email.from || email.sender,
           subject: email.subject,
-          email_body: email.body || email.summary
+          email_body: email.body || email.summary,
+          user_name: userName
         })
       });
 
@@ -277,17 +341,7 @@ const DashboardView = ({
             </div>
 
             <div className="file-list-container">
-              {isDownloading && (
-                <div style={{ marginBottom: "12px" }}>
-                  <div style={{ fontSize: "0.85rem", marginBottom: "4px" }}>
-                    Downloading: <strong>{currentFileName}</strong>
-                  </div>
-                  <div style={{ width: "100%", height: "8px", background: "#e5e7eb", borderRadius: "5px", overflow: "hidden" }}>
-                    <div style={{ width: `${downloadProgress}%`, height: "100%", background: "#2563eb", transition: "width 0.2s ease" }} />
-                  </div>
-                  <div style={{ fontSize: "0.8rem", marginTop: "4px", textAlign: "right", fontWeight: "600" }}>{downloadProgress}%</div>
-                </div>
-              )}
+{/* Per-file progress bars shown inline on each row */}
 
               {fileModalData.files.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '40px' }}>No files found.</div>
@@ -313,16 +367,16 @@ const DashboardView = ({
                   <div style={{ display: "flex", gap: "6px" }}>
                     <button
                       onClick={(e) => { e.stopPropagation(); handleFileDownload(f, f.messageId); }}
-                      disabled={isDownloading}
+                      disabled={isFileDownloading(f, f.messageId)}
                       style={{
-                        backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
-                        cursor: isDownloading ? "not-allowed" : "pointer",
+                        backgroundColor: isFileDownloading(f, f.messageId) ? "#9ca3af" : "#2563eb",
+                        cursor: isFileDownloading(f, f.messageId) ? "not-allowed" : "pointer",
                         color: "white", padding: "6px 12px", borderRadius: "6px", border: "none",
                         display: "flex", alignItems: "center", gap: "6px"
                       }}
                     >
-                      {isDownloading
-                        ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</>
+                      {isFileDownloading(f, f.messageId)
+                        ? <><Loader size={14} className="animate-spin" /> {getFileProgress(f, f.messageId)}%</>
                         : <><Download size={16} /> Download</>}
                     </button>
                   </div>
@@ -339,22 +393,67 @@ const DashboardView = ({
           <div className="modal-content" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <button className="btn-close" onClick={() => setSelectedEmail(null)}><ArrowLeft size={18} /> Back</button>
-              <div className="modal-actions">
+              <div className="modal-actions" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                 {(() => {
                   const cat = (selectedEmail.category || "NORMAL").toUpperCase();
                   const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL;
                   return <span className={`cat-tag ${cat.toLowerCase()}`}>{meta.emoji} {meta.label}</span>;
                 })()}
+                {/* Mark as Read button inside modal */}
+                <button
+                  onClick={() => markAsRead(selectedEmail)}
+                  disabled={selectedEmail.isRead}
+                  style={{
+                    background: selectedEmail.isRead ? '#16a34a' : '#2563eb',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '6px',
+                    padding: '5px 12px',
+                    fontSize: '0.78rem',
+                    fontWeight: '700',
+                    cursor: selectedEmail.isRead ? 'not-allowed' : 'pointer',
+                    opacity: selectedEmail.isRead ? 0.65 : 1,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '5px',
+                    whiteSpace: 'nowrap',
+                    transition: 'background 0.2s ease'
+                  }}
+                >
+                  {selectedEmail.isRead ? '✓ Read' : '✉ Mark Read'}
+                </button>
               </div>
             </div>
             <div className="modal-body-scroll">
               <h2 className="modal-subject">{selectedEmail.subject}</h2>
-              <div className="modal-meta-grid">
-                <div className="meta-item"><User size={16} /> <strong>From:</strong> {getEmailSender(selectedEmail)}</div>
-                <div className="meta-item"><Clock size={16} /> <strong>Received:</strong> {formatDate(getEffectiveReceivedAt(selectedEmail))}</div>
-                {Array.isArray(selectedEmail.cc) && selectedEmail.cc.length > 0 && (
-                  <div className="meta-item" style={{ gridColumn: '1 / -1' }}><Users size={16} /> <strong>CC:</strong> {formatEmails(selectedEmail.cc)}</div>
-                )}
+              <div style={{
+                display: 'grid', gridTemplateColumns: '1fr 1fr',
+                gap: '10px', marginBottom: '16px'
+              }}>
+                {/* FROM */}
+                <div style={{ background: 'rgba(59,130,246,0.07)', border: '1px solid rgba(59,130,246,0.15)', borderRadius: '8px', padding: '10px 14px' }}>
+                  <div style={{ fontSize: '0.68rem', fontWeight: '800', letterSpacing: '1.2px', color: '#3b82f6', marginBottom: '4px' }}>🔵 FROM</div>
+                  <div style={{ fontSize: '0.88rem', color: 'var(--text-primary)', fontWeight: '500', wordBreak: 'break-word' }}>{getEmailSender(selectedEmail)}</div>
+                </div>
+                {/* RECEIVED */}
+                <div style={{ background: 'rgba(168,85,247,0.07)', border: '1px solid rgba(168,85,247,0.15)', borderRadius: '8px', padding: '10px 14px' }}>
+                  <div style={{ fontSize: '0.68rem', fontWeight: '800', letterSpacing: '1.2px', color: '#a855f7', marginBottom: '4px' }}>🟣 RECEIVED</div>
+                  <div style={{ fontSize: '0.88rem', color: 'var(--text-primary)', fontWeight: '500' }}>{formatDate(getEffectiveReceivedAt(selectedEmail))}</div>
+                </div>
+                {/* TO */}
+                <div style={{ background: 'rgba(34,197,94,0.07)', border: '1px solid rgba(34,197,94,0.15)', borderRadius: '8px', padding: '10px 14px' }}>
+                  <div style={{ fontSize: '0.68rem', fontWeight: '800', letterSpacing: '1.2px', color: '#22c55e', marginBottom: '4px' }}>🟢 TO</div>
+                  <div style={{ fontSize: '0.88rem', color: 'var(--text-primary)', fontWeight: '500', wordBreak: 'break-word' }}>
+                    {Array.isArray(selectedEmail.to) ? selectedEmail.to.join(', ') : selectedEmail.to || '—'}
+                  </div>
+                </div>
+                {/* CC */}
+                <div style={{ background: 'rgba(245,158,11,0.07)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: '8px', padding: '10px 14px' }}>
+                  <div style={{ fontSize: '0.68rem', fontWeight: '800', letterSpacing: '1.2px', color: '#f59e0b', marginBottom: '4px' }}>🟡 CC</div>
+                  <div style={{ fontSize: '0.88rem', color: 'var(--text-primary)', fontWeight: '500', wordBreak: 'break-word' }}>
+                    {Array.isArray(selectedEmail.cc) && selectedEmail.cc.length > 0 ? selectedEmail.cc.join(', ') : '—'}
+                  </div>
+                </div>
               </div>
               <div className="modal-summary-box"><strong>💡 AI Summary:</strong> {selectedEmail.summary}</div>
 
@@ -395,9 +494,7 @@ const DashboardView = ({
                     {parsedThread.map((msg, idx) => (
                       <div key={idx} className="message-item message-thread">
                         {msg.header && <div className="message-from">{msg.header}</div>}
-                        <div className="message-body">
-                          {msg.content.split('\n').map((l, i) => <p key={i}>{l}</p>)}
-                        </div>
+                        <div className="message-body" dangerouslySetInnerHTML={{ __html: renderEmailBody(msg.content) }} />
                         {msg.attachments && msg.attachments.length > 0 && (
                           <div className="ec-atts mt-2">
                             <Paperclip size={14} />
@@ -409,15 +506,15 @@ const DashboardView = ({
                                 </span>
                                 <button
                                   onClick={(e) => { e.stopPropagation(); handleFileDownload(att, att.messageId); }}
-                                  disabled={isDownloading}
+                                  disabled={isFileDownloading(att, att.messageId)}
                                   style={{
-                                    backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
-                                    cursor: isDownloading ? "not-allowed" : "pointer",
+                                    backgroundColor: isFileDownloading(att, att.messageId) ? "#9ca3af" : "#2563eb",
+                                    cursor: isFileDownloading(att, att.messageId) ? "not-allowed" : "pointer",
                                     color: "white", padding: "6px 12px", borderRadius: "6px", border: "none",
                                     display: "flex", alignItems: "center", gap: "6px"
                                   }}
                                 >
-                                  {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
+                                  {isFileDownloading(att, att.messageId) ? <><Loader size={14} className="animate-spin" /> {getFileProgress(att, att.messageId)}%</> : <><Download size={16} /> Download</>}
                                 </button>
                               </div>
                             ))}
@@ -437,9 +534,7 @@ const DashboardView = ({
                       <div className="message-from">
                         From: {getParticipantDisplay(selectedEmail)} | {formatDate(getEffectiveReceivedAt(selectedEmail))}
                       </div>
-                      <div className="message-body">
-                        {(selectedEmail.body || "No content available").split('\n').map((line, i) => <p key={i}>{line}</p>)}
-                      </div>
+                      <div className="message-body" dangerouslySetInnerHTML={{ __html: renderEmailBody(selectedEmail.body || "No content available") }} />
                       {selectedEmail.attachments && selectedEmail.attachments.length > 0 && (
                         <div className="ec-atts mt-2">
                           <Paperclip size={14} />
@@ -448,15 +543,15 @@ const DashboardView = ({
                               <span style={{ flex: 1 }}>{att.name || "Unnamed file"}</span>
                               <button
                                 onClick={(e) => { e.stopPropagation(); handleFileDownload(att, att.messageId); }}
-                                disabled={isDownloading}
+                                disabled={isFileDownloading(att, att.messageId)}
                                 style={{
-                                  backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
-                                  cursor: isDownloading ? "not-allowed" : "pointer",
+                                  backgroundColor: isFileDownloading(att, att.messageId) ? "#9ca3af" : "#2563eb",
+                                  cursor: isFileDownloading(att, att.messageId) ? "not-allowed" : "pointer",
                                   color: "white", padding: "6px 12px", borderRadius: "6px", border: "none",
                                   display: "flex", alignItems: "center", gap: "6px"
                                 }}
                               >
-                                {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
+                                {isFileDownloading(att, att.messageId) ? <><Loader size={14} className="animate-spin" /> {getFileProgress(att, att.messageId)}%</> : <><Download size={16} /> Download</>}
                               </button>
                             </div>
                           ))}
@@ -476,13 +571,23 @@ const DashboardView = ({
         <header className="top-bar">
           <div className="top-left">
             <div className="brand" style={{ marginRight: '20px' }}>
-              <div className="logo-box"><LayoutDashboard size={20} color="white" /></div>
-              <div className="brand-info"><h2>Email Intelligent</h2><span className="brand-tag">AI HUB</span></div>
+              <img
+                src="https://cdn.prod.website-files.com/65943a67d00c014c2d920492/65943bb45991d7c7423aada3_logo.webp"
+                alt="Horizon Family Medical Group"
+                style={{
+                  height: '36px',
+                  width: 'auto',
+                  objectFit: 'contain',
+                  filter: 'brightness(1.05)',
+                  display: 'block'
+                }}
+              />
             </div>
 
             <div className="view-switcher">
               <button className={`view-btn ${mainView === 'INSIGHTS' ? 'active' : ''}`} onClick={() => setMainView('INSIGHTS')}><PieChart size={18} /> Insights</button>
               <button className={`view-btn ${mainView === 'THREADS' ? 'active' : ''}`} onClick={() => setMainView('THREADS')}><Mail size={18} /> Inbox</button>
+              <button className="view-btn" onClick={() => navigate('/calendar')} title="Open Calendar"><Calendar size={18} /> Calendar</button>
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginLeft: "20px" }}>
@@ -548,11 +653,7 @@ const DashboardView = ({
 
         {loading ? (
           <div className="ai-loading-container">
-            <div className="ai-loading-content">
-              <Bot size={80} className="loading-spinner" color="#00f3ff" />
-              <h2 className="loading-title">AI is getting your inbox ready...</h2>
-              <p className="loading-subtitle">Analyzing conversations, detecting priority, and drafting briefs.</p>
-            </div>
+            <AILoadingScreen emailCount={emails?.length || 0} />
           </div>
         ) : (
           <>
@@ -587,20 +688,92 @@ const DashboardView = ({
                         {(report.briefing_cards || []).length > 0 ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
                             {report.briefing_cards.map((card) => {
-                              const threadEmail = emails.find(
-                                e => String(e.id).trim() === String(card.id).trim() || String(e.messageId).trim() === String(card.id).trim()
-                              );
+                              // Backend now injects card.subject (real email subject) and card.thread_count.
+                              // Match by ID first, then by exact real subject — no more fuzzy topic matching.
+                              const searchPool = groupedEmails || emails;
+
+                              const threadEmail =
+                                searchPool.find(
+                                  e => String(e.id).trim() === String(card.id).trim() ||
+                                       String(e.messageId).trim() === String(card.id).trim()
+                                ) ||
+                                (card.subject && searchPool.find(
+                                  e => e.subject?.trim().toLowerCase() === card.subject.trim().toLowerCase()
+                                ));
+
+                              const isRead = threadEmail?.isRead ?? false;
+                              // card.subject = real subject injected by backend; card.topic = GPT paraphrase (fallback only)
+                              const displaySubject = card.subject || threadEmail?.subject || card.topic;
+                              const msgCount = card.thread_count || threadEmail?.threadCount || threadEmail?.thread_count || threadEmail?.messages?.length || 0;
                               return (
                                 <div
                                   key={card.id}
                                   className="briefing-card-row"
                                   onClick={() => threadEmail && setSelectedEmail(threadEmail)}
-                                  style={{ cursor: "pointer" }}
+                                  style={{ cursor: "pointer", opacity: isRead ? 0.7 : 1 }}
                                   title="Click to view full conversation"
                                 >
                                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <div className="briefing-topic">{card.topic}</div>
-                                    <ArrowRight size={16} color="var(--accent-blue)" />
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: 0 }}>
+                                      {/* Unread dot */}
+                                      {!isRead && (
+                                        <span style={{
+                                          width: '8px', height: '8px', borderRadius: '50%',
+                                          background: '#3b82f6', flexShrink: 0, display: 'inline-block'
+                                        }} title="Unread" />
+                                      )}
+                                      <div style={{ flex: 1, minWidth: 0 }}>
+                                        {/* Real subject line */}
+                                        <div className="briefing-topic" style={{
+                                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+                                        }}>
+                                          {displaySubject}
+                                        </div>
+                                        {/* Thread count badge — only when > 1 message */}
+                                        {msgCount > 1 && (
+                                          <span style={{
+                                            display: 'inline-block',
+                                            marginTop: '4px',
+                                            background: 'linear-gradient(135deg, #2563eb, #7c3aed)',
+                                            color: 'white',
+                                            fontSize: '0.62rem',
+                                            fontWeight: '700',
+                                            padding: '2px 8px',
+                                            borderRadius: '999px',
+                                            letterSpacing: '0.3px'
+                                          }}>
+                                            🧵 {msgCount} messages
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                                      {/* Mark as Read — only show when unread */}
+                                      {threadEmail && !isRead && (
+                                        <button
+                                          onClick={(e) => { e.stopPropagation(); markAsRead(threadEmail); }}
+                                          title="Mark as read"
+                                          style={{
+                                            background: '#2563eb',
+                                            color: 'white',
+                                            border: 'none',
+                                            borderRadius: '5px',
+                                            padding: '3px 9px',
+                                            fontSize: '0.7rem',
+                                            fontWeight: '700',
+                                            cursor: 'pointer',
+                                            whiteSpace: 'nowrap',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '4px',
+                                            transition: 'background 0.2s ease'
+                                          }}
+                                        >
+                                          ✉ Mark Read
+                                        </button>
+                                      )}
+                                      <ArrowRight size={16} color="var(--accent-blue)" />
+                                    </div>
                                   </div>
                                   <div className="briefing-status">{card.status}</div>
                                 </div>
@@ -653,15 +826,15 @@ const DashboardView = ({
                                       </span>
                                       <button
                                         onClick={(e) => { e.stopPropagation(); handleFileDownload(a, a.messageId); }}
-                                        disabled={isDownloading}
+                                        disabled={isFileDownloading(a, a.messageId)}
                                         style={{
-                                          backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
-                                          cursor: isDownloading ? "not-allowed" : "pointer",
+                                          backgroundColor: isFileDownloading(a, a.messageId) ? "#9ca3af" : "#2563eb",
+                                          cursor: isFileDownloading(a, a.messageId) ? "not-allowed" : "pointer",
                                           color: "white", padding: "6px 12px", borderRadius: "6px", border: "none",
                                           display: "flex", alignItems: "center", gap: "6px"
                                         }}
                                       >
-                                        {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
+                                        {isFileDownloading(a, a.messageId) ? <><Loader size={14} className="animate-spin" /> {getFileProgress(a, a.messageId)}%</> : <><Download size={16} /> Download</>}
                                       </button>
                                     </div>
                                   ))}
@@ -714,19 +887,95 @@ const DashboardView = ({
                   ) : filteredEmails.length === 0 ? (
                     <div className="loading-text">No emails found</div>
                   ) : (
-                    filteredEmails.map((email) => {
-                      const atts = email.attachments || [];
-                      const emailId = email.id || email.messageId;
-                      const replyState = getEmailReplyState(emailId);
+                    <>
+                      {/* ── BULK ACTION BAR ── */}
+                      <div style={{
+                        display: 'flex', alignItems: 'center', gap: '10px',
+                        padding: '8px 16px', marginBottom: '8px',
+                        background: 'var(--bg-card)',
+                        borderRadius: '10px',
+                        border: '1px solid var(--border-color)'
+                      }}>
+                        {/* Spacer to align with card left-border stripe */}
+                        <div style={{ width: '4px', flexShrink: 0 }} />
+                        {/* Select All checkbox — aligned with card checkboxes */}
+                        <RoundCheckboxIndeterminate
+                          checked={selectedCards.size === filteredEmails.length && filteredEmails.length > 0}
+                          indeterminate={selectedCards.size > 0 && selectedCards.size < filteredEmails.length}
+                          onChange={() => selectedCards.size === filteredEmails.length ? clearSelection() : selectAll(filteredEmails)}
+                        />
+                        <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', fontWeight: '600' }}>
+                          {selectedCards.size > 0 ? `${selectedCards.size} selected` : 'Select all'}
+                        </span>
 
-                      return (
-                        <div
-                          key={emailId}
-                          className={`email-card ${!email.isRead ? "unread-mail" : ""} ${(selectedEmail?.id === email.id || selectedEmail?.messageId === email.messageId) ? "active" : ""} border-${(email.category || 'normal').toLowerCase()}`}
-                          onClick={() => setSelectedEmail(email)}
-                        >
-                          <div className="ec-left-border"></div>
-                          <div className="ec-content">
+                        {/* Bulk Mark as Read button — only visible when something is selected */}
+                        {selectedCards.size > 0 && (
+                          <>
+                            <div style={{ width: '1px', height: '18px', background: 'var(--border-color)' }} />
+                            <button
+                              onClick={async () => {
+                                const toMark = filteredEmails.filter(e =>
+                                  selectedCards.has(e.id || e.messageId) && !e.isRead
+                                );
+                                await Promise.all(toMark.map(e => markAsRead(e)));
+                                clearSelection();
+                              }}
+                              style={{
+                                background: 'linear-gradient(135deg, #2563eb, #4f46e5)',
+                                color: 'white', border: 'none', borderRadius: '7px',
+                                padding: '6px 14px', fontSize: '0.82rem', fontWeight: '700',
+                                cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px',
+                                boxShadow: '0 4px 12px rgba(37,99,235,0.3)'
+                              }}
+                            >
+                              ✉ Mark {selectedCards.size} as Read
+                            </button>
+                            <button
+                              onClick={clearSelection}
+                              style={{
+                                background: 'transparent', border: '1px solid var(--border-color)',
+                                borderRadius: '7px', padding: '6px 12px', fontSize: '0.82rem',
+                                fontWeight: '600', cursor: 'pointer', color: 'var(--text-secondary)'
+                              }}
+                            >
+                              Clear
+                            </button>
+                          </>
+                        )}
+                      </div>
+
+                      {/* ── EMAIL CARDS ── */}
+                      {filteredEmails.map((email) => {
+                        const atts = email.attachments || [];
+                        const emailId = email.id || email.messageId;
+                        const replyState = getEmailReplyState(emailId);
+                        const isChecked = selectedCards.has(emailId);
+
+                        return (
+                          <div
+                            key={emailId}
+                            className={`email-card ${!email.isRead ? "unread-mail" : ""} ${(selectedEmail?.id === email.id || selectedEmail?.messageId === email.messageId) ? "active" : ""} border-${(email.category || 'normal').toLowerCase()}`}
+                            style={{ display: 'flex', alignItems: 'stretch', padding: 0, overflow: 'hidden' }}
+                            onClick={() => setSelectedEmail(email)}
+                          >
+                            {/* LEFT BORDER STRIPE */}
+                            <div className="ec-left-border" style={{ flexShrink: 0 }}></div>
+
+                            {/* CHECKBOX — vertically centered in its column */}
+                            <div
+                              style={{
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                padding: '0 10px', flexShrink: 0, alignSelf: 'center'
+                              }}
+                              onClick={e => { e.stopPropagation(); toggleCardSelection(emailId); }}
+                            >
+                              <RoundCheckbox
+                                checked={isChecked}
+                                onClick={e => { e.stopPropagation(); toggleCardSelection(emailId); }}
+                              />
+                            </div>
+
+                          <div className="ec-content" style={{ flex: 1, minWidth: 0, padding: '14px 16px 14px 0' }}>
                             {/* TOP ROW */}
                             <div className="ec-top" style={{ display: "flex", justifyContent: "space-between" }}>
                               <h4 style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
@@ -806,15 +1055,15 @@ const DashboardView = ({
                                     </span>
                                     <button
                                       onClick={(e) => { e.stopPropagation(); handleFileDownload(a, a.messageId); }}
-                                      disabled={isDownloading}
+                                      disabled={isFileDownloading(a, a.messageId)}
                                       style={{
-                                        backgroundColor: isDownloading ? "#9ca3af" : "#2563eb",
-                                        cursor: isDownloading ? "not-allowed" : "pointer",
+                                        backgroundColor: isFileDownloading(a, a.messageId) ? "#9ca3af" : "#2563eb",
+                                        cursor: isFileDownloading(a, a.messageId) ? "not-allowed" : "pointer",
                                         color: "white", padding: "6px 12px", borderRadius: "6px", border: "none",
                                         display: "flex", alignItems: "center", gap: "6px"
                                       }}
                                     >
-                                      {isDownloading ? <><Loader size={14} className="animate-spin" /> {downloadProgress}%</> : <><Download size={16} /> Download</>}
+                                      {isFileDownloading(a, a.messageId) ? <><Loader size={14} className="animate-spin" /> {getFileProgress(a, a.messageId)}%</> : <><Download size={16} /> Download</>}
                                     </button>
                                   </div>
                                 ))}
@@ -988,9 +1237,10 @@ const DashboardView = ({
                               </div>
                             )}
                           </div>
-                        </div>
-                      );
-                    })
+                          </div>
+                        );
+                      })}
+                    </>
                   )}
                 </div>
               </div>

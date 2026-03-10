@@ -3,11 +3,10 @@ import { Lock, User, ChevronRight, AlertTriangle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import './App.css';
 
-// Always call YOUR FastAPI backend — never the org server directly from the browser (CORS)
-const LOGIN_URL = (process.env.REACT_APP_API_URL || "http://localhost:8000/api") + "/login";
+const LOGIN_URL = process.env.REACT_APP_API_URL + "/login";
 
 const Login = () => {
-  const [email, setEmail]       = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError]       = useState("");
   const [loading, setLoading]   = useState(false);
@@ -23,12 +22,11 @@ const Login = () => {
       const response = await fetch(LOGIN_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password })
+        body: JSON.stringify({ email: username, password })
       });
 
       if (!response.ok) {
-        // Try to extract a message from the error body, fall back to generic text
-        let msg = "Invalid email or password";
+        let msg = "Invalid credentials";
         try {
           const errData = await response.json();
           if (errData.message) msg = errData.message;
@@ -36,30 +34,21 @@ const Login = () => {
         throw new Error(msg);
       }
 
-      // Expected shape: { account, name, mail, role }
       const user = await response.json();
 
-      // ─── Persist session ────────────────────────────────────────────────
-      // 🔧 HARDCODED FOR TESTING: Always use ramon.romero@hfmg.net
-      const TESTING_EMAIL = "ramon.romero@hfmg.net";
-      
-      // "jimAuthSession" is what PrivateRoute in App.js checks
+      // Server returns: { account, name, mail, role }
+      const resolvedEmail = user.mail;
+      const resolvedName  = user.name || resolvedEmail.split("@")[0];
+
+      if (!resolvedEmail) {
+        throw new Error("Login failed: no email returned from server.");
+      }
+
       localStorage.setItem("jimAuthSession", "true");
+      localStorage.setItem("sessionUser",  JSON.stringify(user));
+      localStorage.setItem("loggedInUser", resolvedName);
+      localStorage.setItem("userEmail",    resolvedEmail);
 
-      // Full user object – used anywhere we need account/role info
-      localStorage.setItem("sessionUser", JSON.stringify(user));
-
-      // Display name for the greeting in Dashboard
-      // Falls back to the part of the email before '@'
-      const displayName = user.name || user.mail?.split("@")[0] || "User";
-      localStorage.setItem("loggedInUser", displayName);
-
-      // 🔧 TESTING: Hardcode Ramon's email for all API calls
-      localStorage.setItem("userEmail", TESTING_EMAIL);
-      console.log(`🔧 TESTING MODE: Using hardcoded email: ${TESTING_EMAIL}`);
-      // ─────────────────────────────────────────────────────────────────────
-
-      // "/" is the only protected route defined in App.js → Dashboard
       navigate("/");
 
     } catch (err) {
@@ -70,39 +59,43 @@ const Login = () => {
   };
 
   return (
-    <div className="login-container p-10 bg-white">
+    <div className="login-page">
       <div className="login-card">
 
-        <div className="login-header">
-          <div className="login-icon"><Lock size={24} color="white" /></div>
-          <h2>Executive Access</h2>
-          <p>Please sign in</p>
+        <div className="login-card-header">
+          <div className="login-card-icon">
+            <Lock size={20} color="white" strokeWidth={2.5} />
+          </div>
+          <h2 className="login-card-title">Executive Access</h2>
+          <p className="login-card-sub">HFMG Internal Portal</p>
         </div>
 
-        <form onSubmit={handleLogin} className="login-form">
+        <form onSubmit={handleLogin} className="login-fields">
 
-          <div className="input-group">
-            <label>Email</label>
-            <div className="input-wrapper">
-              <User size={18} className="input-icon" />
+          <div className="lf-group">
+            <label className="lf-label">Username</label>
+            <div className="lf-input-wrap">
+              <User size={15} className="lf-icon" />
               <input
                 type="text"
-                placeholder="Enter email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                className="lf-input"
+                placeholder="Enter your username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
                 required
-                autoComplete="email"
+                autoComplete="username"
               />
             </div>
           </div>
 
-          <div className="input-group">
-            <label>Password</label>
-            <div className="input-wrapper">
-              <Lock size={18} className="input-icon"   color='black' />
+          <div className="lf-group">
+            <label className="lf-label">Password</label>
+            <div className="lf-input-wrap">
+              <Lock size={15} className="lf-icon" />
               <input
                 type="password"
-                placeholder="Enter password"
+                className="lf-input"
+                placeholder="Enter your password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
@@ -112,24 +105,29 @@ const Login = () => {
           </div>
 
           {error && (
-            <div className="error-msg">
-              <AlertTriangle size={14} /> {error}
+            <div className="lf-error">
+              <AlertTriangle size={13} />
+              <span>{error}</span>
             </div>
           )}
 
           <button
             type="submit"
-            className="btn-login"
-            disabled={loading || !email || !password}
+            className="lf-submit"
+            disabled={loading || !username || !password}
           >
-            {loading ? "Verifying..." : "Sign In"} <ChevronRight size={16} />
+            {loading ? (
+              <span className="lf-loading-dots">
+                <span /><span /><span />
+              </span>
+            ) : (
+              <>Sign In <ChevronRight size={16} /></>
+            )}
           </button>
 
         </form>
 
-        <div className="login-footer">
-          Protected System • HFMG Internal Only
-        </div>
+        <p className="lf-footer-note">Protected System · Authorized Personnel Only</p>
 
       </div>
     </div>

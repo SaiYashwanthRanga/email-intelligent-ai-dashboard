@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useMemo, useRef } from "react";
 
-const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.REACT_APP_API_URL;
 
 // --- ✅ HELPER: Extract email from "Name <email@domain.com>" format ---
 const extractEmail = (value) => {
@@ -154,12 +154,8 @@ function Dashboard() {
   const [mainView, setMainView] = useState('INSIGHTS');
   const [username, setUsername] = useState("User"); 
   
-  // 🔧 TESTING: Hardcode Ramon's email for inbox API calls
-  const TESTING_EMAIL = "ramon.romero@hfmg.net";
-  const [apiUrl] = useState(
-    `http://172.22.6.145/api/Values/inbox/${TESTING_EMAIL}/count200`
-  );
-  
+  // Use the logged-in user's email (set during login)
+  const userEmail = localStorage.getItem("userEmail") || "";
   
   const [toasts, setToasts] = useState([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -290,9 +286,9 @@ function Dashboard() {
     if (!dateString || dateString === "Unknown Date") return "Unknown Date";
     try {
       const date = new Date(dateString);
-      if (isNaN(date.getTime())) return dateString; 
+      if (isNaN(date.getTime())) return "Unknown Date"; 
       return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    } catch (e) { return dateString; }
+    } catch (e) { return "Unknown Date"; }
   };
 
   const getParticipantDisplay = (email) => {
@@ -467,7 +463,12 @@ function Dashboard() {
     }
     
     try {
-      const res = await axios.get(`${API_BASE}/fetch-inbox`, { params: { url: apiUrl } });
+      // ✅ FIXED: Send email as param; backend builds the full API URL
+      const userEmail = localStorage.getItem("userEmail");
+
+      const res = await axios.get(`${API_BASE}/fetch-inbox`, {
+        params: { email: userEmail }
+      });
       
       if (Array.isArray(res.data)) {
         if (!silent) {
@@ -523,7 +524,8 @@ function Dashboard() {
     }
 
     try {
-      const res = await axios.post(`${API_BASE}/analyze`, { emails: payload });
+      const userEmail = localStorage.getItem("userEmail") || "default";
+      const res = await axios.post(`${API_BASE}/analyze`, { emails: payload, user_email: userEmail });
       
       if (res.data.emails && Array.isArray(res.data.emails)) {
         // Sanitize attachments structure for UI
@@ -626,10 +628,12 @@ function Dashboard() {
     setReplyLoading(true);
     setReplyDraft("");
     try {
+      const userName = localStorage.getItem("loggedInUser") || "User";
       const res = await axios.post(`${API_BASE}/reply`, {
         email_body: selectedEmail.body || (selectedEmail.messages ? selectedEmail.messages[0].body : ""),
         sender: selectedEmail.from || "Unknown",
-        subject: selectedEmail.subject || ""
+        subject: selectedEmail.subject || "",
+        user_name: userName
       });
       setReplyDraft(res.data.reply);
       addToast("Draft Generated!", "success");
@@ -684,7 +688,7 @@ function Dashboard() {
   // ✅ UPDATED FUNCTION: Mark email as read + update backend cache
   const markAsRead = async (emailObj) => {
     try {
-      const userEmail = "ramon.romero@hfmg.net";
+      const userEmail = localStorage.getItem("userEmail") || "";
 
       // For threaded emails, get ALL message IDs; for singles, just the one
       const messageIds = Array.isArray(emailObj.allMessageIds) && emailObj.allMessageIds.length > 0
@@ -709,7 +713,7 @@ function Dashboard() {
       const results = await Promise.allSettled(
         messageIds.map(messageId =>
           axios.post(
-            `${process.env.REACT_APP_API_URL || "http://localhost:8000/api"}/mark-read`,
+            `${process.env.REACT_APP_API_URL || "http://172.22.6.145:8080/api"}/mark-read`,
             { email: userEmail, messageId }
           )
         )
@@ -847,6 +851,7 @@ function Dashboard() {
       // Computed Data
       realThreads={realThreads}
       filteredEmails={filteredAndSortedEmails}
+      groupedEmails={sortedEmails}
       
       // Functions / Handlers
       fetchAndAnalyze={fetchAndAnalyze}

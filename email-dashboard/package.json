@@ -12,6 +12,7 @@
     "lucide-react": "^0.562.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-loader-spinner": "^8.0.2",
     "react-router-dom": "^7.11.0",
     "react-scripts": "5.0.1",
     "web-vitals": "^2.1.4"
@@ -34,6 +35,7 @@
       "not dead",
       "not op_mini all"
     ],
+    "homepage": "/MyReactApp",
     "development": [
       "last 1 chrome version",
       "last 1 firefox version",

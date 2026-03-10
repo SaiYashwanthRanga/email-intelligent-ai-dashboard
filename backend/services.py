@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import html
 import base64
+import threading
 from collections import defaultdict, Counter
 from datetime import datetime
 from openai import AsyncOpenAI
@@ -69,7 +70,6 @@ if not api_key:
     print("❌ CRITICAL ERROR: OPENAI_API_KEY is missing from .env file!")
 
 client = AsyncOpenAI(api_key=api_key)
-CACHE_FILE = "db_cache.json"
 VIP_FILE = "vip_list.json"
 
 # --- CONFIGURATION: PRIORITY SENDERS ---
@@ -135,69 +135,102 @@ def normalize_email(e: dict):
 
 
 # --- CACHE SYSTEM ---
+# Each user gets their own cache file: cache_<sanitized_email>.json
+# This ensures simultaneous users never read/write each other's data.
 
-def load_cache():
-    if os.path.exists(CACHE_FILE):
+import re as _re
+
+def _cache_file_for(user_email: str) -> str:
+    """Return a safe, user-specific cache filename."""
+    safe = _re.sub(r"[^\w@.-]", "_", user_email.lower().strip())
+    return f"cache_{safe}.json"
+
+def load_cache(user_email: str = "default"):
+    path = _cache_file_for(user_email)
+    if os.path.exists(path):
         try:
-            with open(CACHE_FILE, "r") as f:
+            with open(path, "r") as f:
                 return json.load(f)
         except:
             return {}
     return {}
 
-def save_cache(new_data):
-    current_cache = load_cache()
-    current_cache.update(new_data)
-    with open(CACHE_FILE, "w") as f:
-        json.dump(current_cache, f, indent=2)
+# Per-user file locks — prevents two concurrent requests corrupting
+# the same cache file when requests arrive simultaneously.
+_cache_locks: dict = {}
+_cache_locks_mutex = threading.Lock()
 
-TIMESTAMP_KEY = "meta_last_processed_timestamp"
-REPORT_KEY = "meta_last_full_report"
-EMAILS_KEY = "meta_last_enriched_emails"
-COUNT_KEY = "meta_last_email_count"
+def _get_lock(user_email: str) -> threading.Lock:
+    """Return (creating if needed) a per-user write lock."""
+    with _cache_locks_mutex:
+        if user_email not in _cache_locks:
+            _cache_locks[user_email] = threading.Lock()
+        return _cache_locks[user_email]
 
-def get_last_processed_timestamp():
-    return load_cache().get(TIMESTAMP_KEY)
+def save_cache(new_data: dict, user_email: str = "default"):
+    path = _cache_file_for(user_email)
+    with _get_lock(user_email):           # ← serialises writes per user
+        current = load_cache(user_email)
+        current.update(new_data)
+        with open(path, "w") as f:
+            json.dump(current, f, indent=2)
 
-def set_last_processed_timestamp(ts):
-    save_cache({TIMESTAMP_KEY: ts})
+TIMESTAMP_KEY     = "meta_last_processed_timestamp"
+REPORT_KEY        = "meta_last_full_report"
+EMAILS_KEY        = "meta_last_enriched_emails"
+COUNT_KEY         = "meta_last_email_count"
+EMAIL_ID_CACHE_KEY = "meta_emails_by_id"
 
-def get_cached_report():
-    return load_cache().get(REPORT_KEY)
+def get_last_processed_timestamp(user_email: str):
+    return load_cache(user_email).get(TIMESTAMP_KEY)
 
-def save_cached_report(report):
-    save_cache({REPORT_KEY: report})
+def set_last_processed_timestamp(ts, user_email: str):
+    save_cache({TIMESTAMP_KEY: ts}, user_email)
 
-def get_cached_emails():
-    return load_cache().get(EMAILS_KEY)
+def get_cached_report(user_email: str):
+    return load_cache(user_email).get(REPORT_KEY)
 
-def get_last_email_count():
-    return load_cache().get(COUNT_KEY)
+def save_cached_report(report, user_email: str):
+    save_cache({REPORT_KEY: report}, user_email)
 
-def set_last_email_count(count):
-    save_cache({COUNT_KEY: count})
+def get_cached_emails(user_email: str):
+    return load_cache(user_email).get(EMAILS_KEY)
+
+def get_last_email_count(user_email: str):
+    return load_cache(user_email).get(COUNT_KEY)
+
+def set_last_email_count(count, user_email: str):
+    save_cache({COUNT_KEY: count}, user_email)
+
+def get_cached_emails_by_id(user_email: str) -> dict:
+    return load_cache(user_email).get(EMAIL_ID_CACHE_KEY, {})
+
+def save_emails_to_id_cache(emails: list, user_email: str):
+    existing = get_cached_emails_by_id(user_email)
+    for e in emails:
+        eid = e.get("id") or e.get("messageId")
+        if eid:
+            entry = e.copy()
+            entry.pop("full_hash", None)
+            existing[eid] = entry
+    save_cache({EMAIL_ID_CACHE_KEY: existing}, user_email)
 
 
-def save_cached_emails(emails):
-    """
-    Cache enriched emails.
-    🆕 UPDATED: No file_path or full_hash cleanup needed — attachments are API-backed.
-    """
+def save_cached_emails(emails, user_email: str):
+    """Cache enriched emails for a specific user."""
     emails = [e for e in emails if not e.get("isRead")]
 
     cleaned = []
     for e in emails:
         email_copy = e.copy()
 
-        # Clean top-level attachments (remove any leftover full_hash)
         new_atts = []
         for att in e.get("attachments", []):
             att_copy = att.copy()
-            att_copy.pop("full_hash", None)   # never needed in cache
+            att_copy.pop("full_hash", None)
             new_atts.append(att_copy)
         email_copy["attachments"] = new_atts
 
-        # Clean thread message attachments
         new_messages = []
         for msg in e.get("messages", []):
             msg_copy = msg.copy()
@@ -212,7 +245,7 @@ def save_cached_emails(emails):
 
         cleaned.append(email_copy)
 
-    save_cache({EMAILS_KEY: cleaned})
+    save_cache({EMAILS_KEY: cleaned}, user_email)
 
 
 # --- HELPER FUNCTIONS ---
@@ -357,6 +390,148 @@ Body:{body}{CLASSIFICATION_PROMPT}
         return email
 
 
+# 🆕 BATCH: Analyze up to 20 single emails in ONE OpenAI call
+async def analyze_emails_batch(emails: list) -> list:
+    """
+    Sends multiple emails to OpenAI in one request instead of one-per-email.
+    Dramatically reduces API round trips and total wait time.
+    """
+    if not emails:
+        return []
+
+    # Pre-classify without AI: VIP senders and Zoom links
+    pre_classified = []
+    needs_ai = []
+
+    for email in emails:
+        sender = (email.get("from") or "").lower()
+        body_text = (email.get("body") or "").lower()
+        subject_text = (email.get("subject") or "").lower()
+        has_zoom = "zoom.us" in body_text or "zoom.us" in subject_text
+
+        if has_zoom:
+            email["category"] = "ZOOM"
+            email["priority"] = 4
+            email["summary"] = email.get("summary") or "Zoom meeting invitation."
+            email["action"] = "REVIEW"
+            pre_classified.append(email)
+        elif sender in VIP_SENDERS:
+            email["category"] = "PRIORITY"
+            email["priority"] = 5
+            email["summary"] = email.get("summary") or "Message from a VIP sender."
+            email["action"] = "REVIEW"
+            pre_classified.append(email)
+        elif email.get("category") and email.get("summary"):
+            # Already analyzed — skip
+            pre_classified.append(email)
+        else:
+            needs_ai.append(email)
+
+    if not needs_ai:
+        return pre_classified
+
+    # Build a single prompt with all emails
+    emails_input = []
+    for i, e in enumerate(needs_ai):
+        emails_input.append({
+            "index": i,
+            "subject": e.get("subject", "No Subject"),
+            "from": e.get("from", "Unknown"),
+            "body_preview": (e.get("body") or "")[:400]
+        })
+
+    batch_prompt = f"""
+You are an enterprise email triage assistant. Classify each email below.
+
+Categories: PRIORITY | URGENT | CONFIDENTIAL | MEETING | ZOOM | NEWSLETTER | NORMAL
+
+Rules:
+- ZOOM: contains zoom.us link
+- PRIORITY: from executives/leadership/VIP, financial/legal topics
+- URGENT: time-sensitive, deadlines today/tomorrow, outages
+- CONFIDENTIAL: sensitive HR/legal/financial approvals
+- MEETING: meeting invites, schedules, minutes
+- NEWSLETTER: marketing, automated updates
+- NORMAL: everything else
+
+For each email return one object with: index, category, priority (1-5), summary (one professional sentence).
+
+INPUT:
+{json.dumps(emails_input)}
+
+OUTPUT JSON FORMAT:
+{{"results": [{{"index": 0, "category": "...", "priority": 1, "summary": "..."}}]}}
+"""
+
+    # Split into chunks of 20 to avoid token limits
+    BATCH_SIZE = 20
+    all_ai_results = []
+
+    for chunk_start in range(0, len(needs_ai), BATCH_SIZE):
+        chunk_emails = needs_ai[chunk_start:chunk_start + BATCH_SIZE]
+        chunk_input = [
+            {
+                "index": i,
+                "subject": e.get("subject", "No Subject"),
+                "from": e.get("from", "Unknown"),
+                "body_preview": (e.get("body") or "")[:400]
+            }
+            for i, e in enumerate(chunk_emails)
+        ]
+
+        chunk_prompt = f"""
+You are an enterprise email triage assistant. Classify each email below.
+
+Categories: PRIORITY | URGENT | CONFIDENTIAL | MEETING | ZOOM | NEWSLETTER | NORMAL
+
+Rules:
+- ZOOM: contains zoom.us link
+- PRIORITY: from executives/leadership/VIP, financial/legal topics  
+- URGENT: time-sensitive, deadlines today/tomorrow, outages
+- CONFIDENTIAL: sensitive HR/legal/financial approvals
+- MEETING: meeting invites, schedules, minutes
+- NEWSLETTER: marketing, automated updates
+- NORMAL: everything else
+
+For each email return one object with: index, category, priority (1-5), summary (one professional sentence).
+
+INPUT:
+{json.dumps(chunk_input)}
+
+OUTPUT JSON:
+{{"results": [{{"index": 0, "category": "...", "priority": 1, "summary": "..."}}]}}
+"""
+        try:
+            response = await client.chat.completions.create(
+                model=ACTIVE_MODEL,
+                messages=[
+                    {"role": "system", "content": "Output JSON only."},
+                    {"role": "user", "content": chunk_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            parsed = json.loads(response.choices[0].message.content)
+            results_map = {r["index"]: r for r in parsed.get("results", [])}
+
+            for i, email in enumerate(chunk_emails):
+                ai = results_map.get(i, {})
+                email["category"] = ai.get("category", "NORMAL")
+                email["priority"] = ai.get("priority", 1)
+                email["summary"] = ai.get("summary", "No summary")
+                email["action"] = "REVIEW"
+                all_ai_results.append(email)
+
+        except Exception as ex:
+            print(f"⚠️ Batch chunk failed: {ex}")
+            for email in chunk_emails:
+                email["category"] = "NORMAL"
+                email["summary"] = "Pending analysis"
+                all_ai_results.append(email)
+
+    return pre_classified + all_ai_results
+
+
 async def generate_sender_report(emails):
     print("🔹 Generating Sender Summaries...")
     sender_groups = defaultdict(list)
@@ -410,7 +585,7 @@ async def generate_sender_report(emails):
         return []
 
 
-async def analyze_single_thread(subject, messages):
+async def analyze_single_thread(subject, messages, user_email: str = "default"):
     final_messages = []
 
     if len(messages) == 1:
@@ -438,8 +613,8 @@ async def analyze_single_thread(subject, messages):
                 "attachments": m.get('attachments', [])
             })
 
-    thread_id = f"{subject}_{len(final_messages)}"
-    cache = load_cache()
+    thread_id = f"thread__{subject}_{len(final_messages)}"
+    cache = load_cache(user_email)
     if thread_id in cache:
         return cache[thread_id]
 
@@ -531,7 +706,7 @@ async def analyze_single_thread(subject, messages):
             "summary": result.get("summary", "Analysis failed."),
             "action": result.get("action", "REVIEW")
         }
-        save_cache({thread_id: final_result})
+        save_cache({thread_id: final_result}, user_email)
         return final_result
     except:
         return {"subject": display_subject, "category": "NORMAL", "summary": "Error.", "thread_count": len(final_messages)}
@@ -585,16 +760,19 @@ OUTPUT JSON FORMAT:
         return {"briefing_cards": []}
 
 
-async def draft_email_reply(sender, context):
+async def draft_email_reply(sender, context, user_name: str = "User"):
     is_internal = "hfmg.net" in sender.lower()
     tone_desc = "Brief, direct, and internal" if is_internal else "Professional, partnership-focused, and polite"
 
+    # Extract first name for the sign-off (e.g. "Ramon Romero" → "Ramon")
+    first_name = user_name.strip().split()[0] if user_name.strip() else "User"
+
     system_prompt = f"""
-    You are Jim Olver-Goshen, the CEO. You are writing a reply to {sender}.
+    You are {user_name}. You are writing a reply to {sender}.
     YOUR STYLE GUIDE:
     - Tone: {tone_desc}.
     - Be decisive. No fluff.
-    - Sign off: "Thanks, Jim" or "Best, Jim".
+    - Sign off: "Thanks, {first_name}" or "Best, {first_name}".
     """
     user_prompt = f"CONTEXT: {context}. TASK: Draft reply body only."
 
@@ -609,7 +787,7 @@ async def draft_email_reply(sender, context):
         return "Drafting failed."
 
 
-def calculate_triage_stats(emails, threads=None, user_identifier="Jim@hfmg.net", demo_mode=False):
+def calculate_triage_stats(emails, threads=None, user_identifier="", demo_mode=False):
     target = user_identifier.strip().lower()
     vol_emails = len(emails)
 
@@ -674,7 +852,7 @@ def calculate_triage_stats(emails, threads=None, user_identifier="Jim@hfmg.net",
         "vol_emails": vol_emails,
         "vol_threads": vol_threads,
         "vol_meetings": vol_meetings,
-        "total_unread": vol_emails,
+        "total_unread": sum(1 for e in emails if not e.get("isRead", False)),
         "att_total": att_total,
         "att_breakdown": att_breakdown,
         "to": to_count,

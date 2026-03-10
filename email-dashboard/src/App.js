@@ -1,29 +1,46 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import Login from './Login';
 import Dashboard from './Dashboard';
+import Calendarview from './Calendarview';
+import BootAnimation from './BootAnimation';
+import './animations.css';
 
-// Helper component to protect routes
 const PrivateRoute = ({ children }) => {
   const isAuthenticated = localStorage.getItem("jimAuthSession") === "true";
   return isAuthenticated ? children : <Navigate to="/login" />;
 };
 
 function App() {
+  const [booting, setBooting] = useState(true);
+
   return (
-    <Router>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route 
-          path="/" 
-          element={
-            <PrivateRoute>
-              <Dashboard />
-            </PrivateRoute>
-          } 
-        />
-      </Routes>
-    </Router>
+    <>
+      {booting && <BootAnimation onDone={() => setBooting(false)} />}
+      {!booting && (
+        <Router>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route
+              path="/"
+              element={
+                <PrivateRoute>
+                  <Dashboard />
+                </PrivateRoute>
+              }
+            />
+            <Route
+              path="/calendar"
+              element={
+                <PrivateRoute>
+                  <Calendarview />
+                </PrivateRoute>
+              }
+            />
+          </Routes>
+        </Router>
+      )}
+    </>
   );
 }
 

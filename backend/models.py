@@ -3,11 +3,13 @@ from typing import List, Optional
 
 class AnalysisRequest(BaseModel):
     emails: List[dict]
+    user_email: str = "default"  # identifies which user's cache to use
 
 class ReplyRequest(BaseModel):
     email_body: str
     sender: str
     subject: str
+    user_name: str = "User"  # logged-in user's display name
 
 class ThreadParseRequest(BaseModel):
     body: str
