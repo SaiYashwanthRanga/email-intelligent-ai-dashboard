@@ -17,13 +17,28 @@ from typing import List
 from urllib.parse import unquote
 
 from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest
+
+import logging
+
+# ── App logger ──
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger("hfmg")
+
+# ── Silence uvicorn access log (kills the per-request flood) ──
+logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
+logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
 from services import (
     group_emails_by_subject,
-    detect_real_threads,
+    split_reply_chain,
     analyze_single_thread,
     analyze_single_email,
     analyze_emails_batch,
     generate_executive_brief,
+    generate_daily_digest,
     generate_sender_report,
     draft_email_reply,
     calculate_triage_stats,
@@ -53,6 +68,10 @@ CACHE_FILE = Path("db_cache.json")
 # TTL: 5 minutes — fresh enough, avoids repeated org server calls
 _meetings_cache: dict = {}
 MEETINGS_CACHE_TTL = 300  # seconds
+
+# ─── BACKGROUND ANALYSIS JOB STORE ───
+# Keyed by user_email → { "status": "running"|"done", "results": [...] }
+_analysis_jobs: dict = {}
 
 # ─── ORG SERVER CONFIG ───
 ORG_BASE = "http://172.22.6.145"
@@ -92,148 +111,56 @@ app.add_middleware(
 # --- HELPER FUNCTIONS ---
 
 def update_cache_mark_read(message_id: str, user_email: str = ""):
-    """Mark a message as read in the per-user cache."""
+    """Mark a message as read in ALL per-user cache layers."""
     if not user_email:
         return
     try:
         from services import load_cache, save_cache, _cache_file_for
         data = load_cache(user_email)
-        updated = False
+        updates = {}
 
+        # ── Layer 1: meta_last_enriched_emails (email list cache) ──
         emails = data.get("meta_last_enriched_emails", [])
+        list_updated = False
         for e in emails:
             if e.get("id") == message_id or e.get("messageId") == message_id:
                 e["isRead"] = True
-                updated = True
+                list_updated = True
                 break
+        if list_updated:
+            updates["meta_last_enriched_emails"] = emails
 
-        if updated:
-            save_cache({"meta_last_enriched_emails": emails}, user_email)
+        # BUG FIX #3: Also update meta_emails_by_id (the ID cache that /api/analyze
+        # reads on every refresh).  Without this fix the ID cache kept returning
+        # isRead=False for a message even after /api/mark-read succeeded, causing
+        # the email to flicker back to "unread" on the next sync.
+        id_cache = data.get("meta_emails_by_id", {})
+        if message_id in id_cache:
+            id_cache[message_id]["isRead"] = True
+            updates["meta_emails_by_id"] = id_cache
+
+        if updates:
+            save_cache(updates, user_email)
 
     except Exception as e:
-        print(f"❌ Failed to update read cache: {e}")
+        log.error(f"Failed to update read cache: {e}")
 
 
-def fetch_attachment_from_api(user_email: str, message_id: str, file_name: str) -> bytes:
-    """
-    🔑 Fetch a specific attachment directly from the org mail API.
-    
-    Strategy:
-      1. Try single-message endpoint first (fast, if your .NET server supports it)
-      2. Fallback: fetch recent inbox and search for the matching messageId
-    
-    The mail API returns attachments with full base64 in the "hash" field.
-    """
-
-    # ── ATTEMPT 1: Try single-message endpoint (FAST PATH) ──
-    # 🔧 If your .NET server supports this, it's the best option.
-    #    If it returns 404, we fall through to the inbox search.
-    single_msg_url = f"{ORG_BASE}/api/Values/inbox/{user_email}/message/{message_id}"
-
-    print(f"📥 Attempting single-message fetch: {single_msg_url}")
-    print(f"   Looking for file: {file_name}")
-
-    try:
-        resp = requests.get(single_msg_url, timeout=30)
-
-        if resp.status_code == 200:
-            mail_data = resp.json()
-            if isinstance(mail_data, list):
-                mail_data = mail_data[0] if mail_data else None
-
-            if mail_data:
-                result = _extract_attachment(mail_data, file_name)
-                if result:
-                    return result
-
-            print("⚠️ Single-message endpoint returned data but attachment not found, trying inbox search...")
-
-        else:
-            print(f"⚠️ Single-message endpoint returned {resp.status_code}, falling back to inbox search...")
-
-    except requests.exceptions.ConnectionError:
-        print("⚠️ Single-message endpoint not available, falling back to inbox search...")
-    except Exception as e:
-        print(f"⚠️ Single-message attempt failed ({e}), falling back to inbox search...")
-
-    # ── ATTEMPT 2: Fetch inbox and search for the messageId (FALLBACK) ──
-    inbox_url = f"{ORG_BASE}/api/Values/inbox/{user_email}/count200"
-    print(f"📥 Fetching inbox to find attachment: {inbox_url}")
-
-    try:
-        resp = requests.get(inbox_url, timeout=60)
-
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Mail server error: {resp.text}"
-            )
-
-        inbox_data = resp.json()
-
-        if not isinstance(inbox_data, list):
-            raise HTTPException(status_code=500, detail="Unexpected inbox format")
-
-        # Search through all emails for matching messageId or id
-        for mail in inbox_data:
-            if mail.get("messageId") == message_id or mail.get("id") == message_id:
-                print(f"✅ Found email with id: {message_id}")
-
-                result = _extract_attachment(mail, file_name)
-                if result:
-                    return result
-
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Email found but attachment '{file_name}' not in it"
-                )
-
-        raise HTTPException(
-            status_code=404,
-            detail=f"Email with messageId '{message_id}' not found in inbox"
-        )
-
-    except HTTPException:
-        raise
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="Mail server timeout")
-    except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=503, detail="Cannot reach mail server")
-    except Exception as e:
-        print(f"❌ fetch_attachment_from_api error: {e}")
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
-
-
-def _extract_attachment(mail_data: dict, file_name: str) -> bytes | None:
-    """
-    Search for a named attachment in an email object and return decoded bytes.
-    Searches both root-level attachments and thread message attachments.
-    Returns None if not found.
-    """
-    all_attachments = []
-
-    # Root-level attachments
-    if isinstance(mail_data.get("attachments"), list):
-        all_attachments.extend(mail_data["attachments"])
-
-    # Thread message attachments
-    if isinstance(mail_data.get("messages"), list):
-        for msg in mail_data["messages"]:
-            if isinstance(msg.get("attachments"), list):
-                all_attachments.extend(msg["attachments"])
-
-    # Find by filename
-    for att in all_attachments:
-        if att.get("name") == file_name:
-            raw_hash = att.get("hash")
-            if not raw_hash or len(raw_hash) < 20:
-                print(f"⚠️ Attachment '{file_name}' found but hash is empty/truncated")
-                return None
-
-            print(f"✅ Extracted attachment: {file_name} ({len(raw_hash)} chars base64)")
-            return base64.b64decode(raw_hash)
-
-    return None
+# ─────────────────────────────────────────────────────────────────────────────
+# EWS ATTACHMENT DOWNLOAD HELPER
+# GET /api/Values/attachments/download
+#   ?messageId=...&attachmentId=...&targetUserEmail=...
+# ─────────────────────────────────────────────────────────────────────────────
+async def fetch_attachment_bytes(message_id: str, attachment_id: str, user_email: str) -> bytes:
+    url    = f"{ORG_BASE}/api/Values/attachments/download"
+    params = {"messageId": message_id, "attachmentId": attachment_id, "targetUserEmail": user_email}
+    log.debug(f"Attachment download: user={user_email} msg={message_id[:20]}...")
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.get(url, params=params)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code,
+                            detail=f"Attachment server error {resp.status_code}: {resp.text[:200]}")
+    return resp.content
 
 
 # --- ENDPOINTS ---
@@ -242,7 +169,7 @@ def _extract_attachment(mail_data: dict, file_name: str) -> bytes | None:
 async def login(credentials: LoginRequest):
     try:
         org_login_url = f"{ORG_BASE}/login"
-        print(f"🔐 Login attempt for: {credentials.email}")
+        log.debug(f"Login attempt: {credentials.email}")
 
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -254,7 +181,7 @@ async def login(credentials: LoginRequest):
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
         user_data = response.json()
-        print(f"✅ Login successful for: {credentials.email}")
+        log.info(f"Login OK: {credentials.email}")
         return user_data
 
     except httpx.TimeoutException:
@@ -264,20 +191,77 @@ async def login(credentials: LoginRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Login error: {e}")
+        log.error(f"Login error: {e}")
         raise HTTPException(status_code=500, detail="Login failed.")
+
+
+@app.get("/api/email-details")
+async def get_email_details(messageId: str, userEmail: str):
+    """
+    Full email details: TO, CC, body, attachments with attachmentId.
+    Called on every email click to populate the detail panel.
+    .NET: GET /api/Values/inbox/onemail?messageId=...&targetUserEmail=...
+
+    NOTE: The .NET DTO returns hasAttachments:false even when files exist.
+    We compute it from attachments.length.
+    """
+    if not messageId or not userEmail:
+        raise HTTPException(status_code=400, detail="Missing messageId or userEmail")
+
+    org_url = f"{ORG_BASE}/api/Values/inbox/onemail"
+    params  = {"messageId": messageId, "targetUserEmail": userEmail}
+    log.debug(f"email-details: {messageId[:20]}... user={userEmail}")
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(org_url, params=params)
+
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code,
+                                detail=f"Mail server error: {resp.text[:300]}")
+
+        data     = resp.json()
+        raw_atts = data.get("attachments") or []
+
+        data["attachments"] = [
+            {
+                "name":         att.get("name", ""),
+                "type":         att.get("type", "application/octet-stream"),
+                "size":         att.get("size", 0),
+                "attachmentId": att.get("attachmentId") or att.get("AttachmentId", ""),
+                "storage":      "api",
+                "messageId":    messageId,
+            }
+            for att in raw_atts if isinstance(att, dict)
+        ]
+        data["hasAttachments"] = len(data["attachments"]) > 0
+
+        log.debug(f"email-details OK: {len(data['attachments'])} attachments")
+        return data
+
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Mail server timeout")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Cannot reach mail server")
+    except Exception as e:
+        log.error(f"get_email_details error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/fetch-inbox")
 def fetch_inbox(email: str):
     try:
-        # Build the org server inbox URL from the email address
+        # Build the org server inbox URL from the email address.
+        # Route template: GET /api/Values/inbox/{mail}/count{num}
+        # "count" and the number share the same path segment — no slash between them.
         clean_email = unquote(email).strip()
-        clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count200"
+        clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count700"
 
-        print(f"📡 Requesting org inbox: {clean_url}")
+        log.debug(f"Fetching org inbox: {clean_url}")
 
-        resp = requests.get(clean_url, timeout=60)
+        resp = requests.get(clean_url, timeout=120)
 
         if resp.status_code != 200:
             raise HTTPException(
@@ -285,7 +269,23 @@ def fetch_inbox(email: str):
                 detail=f"Mail server error: {resp.text}"
             )
 
-        data = resp.json()
+        raw = resp.json()
+
+        # ─── FIX: Unwrap PagedMailResponse if .NET returns the paged shape ───
+        # Old shape: [ {...}, {...} ]          (flat list)
+        # New shape: { "mails": [...], "currentPage": 1, "pageSize": 700, "hasMore": false }
+        # We support both so a .NET rollback never breaks this endpoint.
+        if isinstance(raw, dict):
+            data = raw.get("mails", [])
+            log.debug(
+                f"PagedMailResponse received — page={raw.get('currentPage')} "
+                f"size={raw.get('pageSize')} hasMore={raw.get('hasMore')} "
+                f"count={len(data)}"
+            )
+        else:
+            # Legacy flat-list response — still works as before
+            data = raw if isinstance(raw, list) else []
+            log.debug(f"Flat list response received — count={len(data)}")
 
         # ─── STEP 1: Stamp parent messageId + strip base64 from root attachments ───
         for mail in data:
@@ -299,9 +299,9 @@ def fetch_inbox(email: str):
                     att["hash"] = raw_hash[:16]        # preview only for UI
                     att["full_hash"] = None
                     att["storage"] = "api"
-                    att["messageId"] = parent_id       # ✅ FIX: stamp parent ID so download can find it
+                    att["messageId"] = parent_id       # stamp parent ID so download can find it
 
-                    print(f"📎 Stripped attachment: {att.get('name')} (was {len(raw_hash)} chars)")
+                    log.debug(f"Stripped attachment: {att.get('name')}")
 
         # ─── STEP 2: Merge thread message attachments to root level ───
         for mail in data:
@@ -321,23 +321,29 @@ def fetch_inbox(email: str):
                                 att["hash"] = raw_hash[:16]
                                 att["full_hash"] = None
                                 att["storage"] = "api"
-                                att["messageId"] = parent_id   # ✅ FIX: stamp parent ID
+                                att["messageId"] = parent_id   # stamp parent ID
                             combined.append(att)
 
             mail["attachments"] = combined
 
-        print(f"✅ Processed {len(data)} emails (attachments stripped, will fetch from API on download)")
+        log.debug(f"Processed {len(data)} emails from inbox fetch")
 
-        # Sort by received time
-        data.sort(
-            key=lambda x: datetime.fromisoformat(x.get("received", "1970-01-01T00:00:00")),
-            reverse=True
-        )
+        def _sort_key(x):
+            raw = x.get("received") or x.get("received_at") or ""
+            try:
+                return datetime.fromisoformat(raw).timestamp()
+            except Exception:
+                return 0.0
+
+        data.sort(key=_sort_key, reverse=True)
 
         return data
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        log.error(f"fetch_inbox error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/analyze")
@@ -348,104 +354,80 @@ async def analyze_emails(payload: AnalysisRequest):
     if not emails:
         save_cached_emails([], user_email)
         set_last_email_count(0, user_email)
-        return {"emails": [], "report": None}
+        return {"emails": [], "report": None, "analyzing": False}
 
-    # ─── STEP 1: Split emails into cached vs new ───
+    # ─── STEP 1: Split cached vs new (instant) ───
     cached_by_id = get_cached_emails_by_id(user_email)
-
     cached_results = []
     new_emails = []
+    # Track which primary thread IDs have already been added so secondary
+    # message IDs (which are _threadRef pointers) don't produce duplicate
+    # copies of the same thread in the response.
+    seen_primary_ids = set()
 
     for email in emails:
         eid = email.get("id") or email.get("messageId")
         if eid and eid in cached_by_id:
-            # Use cached analysis but keep fresh isRead status from live inbox
-            cached_email = cached_by_id[eid].copy()
+            cached_entry = cached_by_id[eid]
+
+            # ── Resolve _threadRef pointer ──
+            # Secondary IDs store only {id, messageId, _threadRef: primary_id}.
+            # Resolve to the primary thread result so we return the full object.
+            # If the primary is already in cached_results, skip — don't duplicate.
+            ref_id = cached_entry.get("_threadRef")
+            if ref_id:
+                if ref_id in seen_primary_ids:
+                    # Primary already included — skip this secondary ref entirely
+                    continue
+                primary = cached_by_id.get(ref_id)
+                if primary and not primary.get("_threadRef"):
+                    # Use the primary thread result
+                    cached_email = primary.copy()
+                    cached_email["isRead"] = email.get("isRead", cached_email.get("isRead", False))
+                    cached_results.append(cached_email)
+                    seen_primary_ids.add(ref_id)
+                else:
+                    # Primary not found — treat as new so it gets re-analysed
+                    new_emails.append(email)
+                continue
+
+            # ── Normal cache hit (no pointer) ──
+            primary_id = cached_entry.get("id") or cached_entry.get("messageId") or eid
+            if primary_id in seen_primary_ids:
+                continue
+            cached_email = cached_entry.copy()
             cached_email["isRead"] = email.get("isRead", cached_email.get("isRead", False))
             cached_results.append(cached_email)
+            seen_primary_ids.add(primary_id)
         else:
             new_emails.append(email)
 
-    print(f"⚡ Cache hit: {len(cached_results)} | New to analyze: {len(new_emails)}")
+    log.debug(f"Cache hit: {len(cached_results)} | New: {len(new_emails)}")
 
-    # ─── STEP 2: Only analyze NEW emails ───
-    new_analyzed = []
-    if new_emails:
-        real_threads, single_emails = detect_real_threads(new_emails)
+    # ─── STEP 2: Return cached emails IMMEDIATELY, fire AI in background ───
+    # Mark new emails as "analyzing" with placeholder values so UI renders instantly
+    placeholder_emails = []
+    for e in new_emails:
+        placeholder = e.copy()
+        placeholder["category"] = "NORMAL"
+        placeholder["priority"] = 1
+        placeholder["summary"] = "Analyzing..."
+        placeholder["action"] = "REVIEW"
+        placeholder["analyzing"] = True
+        placeholder_emails.append(placeholder)
 
-        # Threads: one AI call each (they need thread-aware analysis)
-        thread_tasks = [
-            analyze_single_thread(e.get("subject", "No Subject"), [e], user_email)
-            for e in real_threads
-        ]
-
-        # Singles: batch into ONE or a few AI calls instead of N calls
-        batch_task = analyze_emails_batch(single_emails)
-
-        thread_results, batch_results = await asyncio.gather(
-            asyncio.gather(*thread_tasks) if thread_tasks else asyncio.sleep(0),
-            batch_task
-        )
-
-        if thread_tasks:
-            new_analyzed.extend(thread_results)
-        new_analyzed.extend(batch_results)
-
-        # Sanitize and save new results to per-ID cache
-        for e in new_analyzed:
-            atts = e.get("attachments")
-            if atts:
-                e["attachments"] = [
-                    {
-                        "name": a.get("name"), "type": a.get("type"),
-                        "size": a.get("size"), "hash": a.get("hash"),
-                        "storage": a.get("storage"), "full_hash": None,
-                        "messageId": a.get("messageId")
-                    }
-                    for a in atts if isinstance(a, dict)
-                ]
-            e["cc"] = e.get("cc") if isinstance(e.get("cc"), list) else []
-            e["to"] = e.get("to") if isinstance(e.get("to"), list) else []
-            e["category"] = (e.get("category") or "NORMAL").upper()
-
-        save_emails_to_id_cache(new_analyzed, user_email)
-
-    # ─── STEP 3: Merge cached + new ───
-    all_results = cached_results + new_analyzed
-
-    # Deduplicate by ID
+    # Merge cached + placeholders for instant response
+    all_immediate = cached_results + placeholder_emails
     seen = {}
-    for e in all_results:
+    no_id_emails = []
+    for e in all_immediate:
         eid = e.get("id") or e.get("messageId")
         if eid:
             seen[eid] = e
-    all_results = list(seen.values())
+        else:
+            no_id_emails.append(e)   # keep no-ID emails — never deduplicate them
+    all_immediate = list(seen.values()) + no_id_emails
 
-    # ─── STEP 4: Regenerate report only when there are new emails ───
-    cached_report = get_cached_report(user_email)
-    if new_emails or not cached_report:
-        threads_only = [t for t in all_results if t.get("thread_count", 1) > 1]
-        brief_task = generate_executive_brief(threads_only)
-        sender_task = generate_sender_report(emails)
-        brief, sender_summaries = await asyncio.gather(brief_task, sender_task)
-
-        triage_data = calculate_triage_stats(emails, all_results, user_identifier=user_email, demo_mode=False)
-        brief["thread_email_count"] = len(emails)
-        brief["thread_attachment_count"] = triage_data["att_total"]
-        brief["sender_summaries"] = sender_summaries
-        brief["triage_stats"] = triage_data
-
-        save_cached_report(brief, user_email)
-    else:
-        print("⚡ No new emails — reusing cached report")
-        brief = cached_report
-
-    set_last_email_count(len(emails), user_email)
-
-    # Save legacy cache for backward compat
-    save_cached_emails(all_results, user_email)
-
-    # ─── STEP 5: Sort and return ───
     def safe_datetime(val):
         try:
             dt = datetime.fromisoformat(val)
@@ -455,12 +437,208 @@ async def analyze_emails(payload: AnalysisRequest):
         except:
             return datetime(1970, 1, 1)
 
-    all_results.sort(
+    all_immediate.sort(
         key=lambda x: safe_datetime(x.get("received_at", "1970-01-01T00:00:00")),
         reverse=True
     )
 
-    return {"emails": all_results, "report": brief}
+    cached_report = get_cached_report(user_email)
+    set_last_email_count(len(emails), user_email)
+
+    # If no new emails, return instantly — no background job needed
+    if not new_emails:
+        log.debug("All cached — instant return")
+        return {"emails": all_immediate, "report": cached_report, "analyzing": False}
+
+    # ─── STEP 3: Fire background AI analysis ───
+    _analysis_jobs[user_email] = {"status": "running", "results": [], "report": None}
+
+    async def run_background_analysis():
+        def sanitize_batch(email_list):
+            for e in email_list:
+                atts = e.get("attachments")
+                if atts:
+                    e["attachments"] = [
+                        {
+                            "name":         a.get("name"),
+                            "type":         a.get("type"),
+                            "size":         a.get("size"),
+                            "storage":      a.get("storage"),
+                            "messageId":    a.get("messageId"),
+                            "attachmentId": a.get("attachmentId"),  # required for download
+                            "full_hash":    None,
+                        }
+                        for a in atts if isinstance(a, dict) and a.get("name") and a.get("attachmentId")
+                    ]
+                e["cc"] = e.get("cc") if isinstance(e.get("cc"), list) else []
+                e["to"] = e.get("to") if isinstance(e.get("to"), list) else []
+                e["category"] = (e.get("category") or "NORMAL").upper()
+                e["analyzing"] = False
+            return email_list
+
+        def push_results(batch):
+            """Sanitize, cache under all message IDs, and expose to poll endpoint."""
+            sanitize_batch(batch)
+            # For thread results, index the full result under the PRIMARY id,
+            # and store a lightweight pointer under every secondary message ID.
+            # This prevents the next sync from returning N identical copies of
+            # the same thread (one per constituent message ID) which caused the
+            # Insights page to show the same briefing card N times.
+            to_cache = []
+            for e in batch:
+                to_cache.append(e)
+                parent_id = e.get("id") or e.get("messageId")
+                for mid in (e.get("allMessageIds") or []):
+                    if mid and mid != parent_id:
+                        # Store only a pointer — resolved to the primary on load
+                        to_cache.append({
+                            "id": mid,
+                            "messageId": mid,
+                            "_threadRef": parent_id   # ← marks this as a secondary ref
+                        })
+            save_emails_to_id_cache(to_cache, user_email)
+            _analysis_jobs[user_email]["results"].extend(batch)
+            log.debug(f"Pushed {len(batch)} emails to job store")
+
+        try:
+            # ── Sort new emails newest-first so top-of-inbox gets analyzed first ──
+            def safe_dt(e):
+                for key in ("received_at", "received", "date"):
+                    val = e.get(key)
+                    if val:
+                        try:
+                            from datetime import datetime as _dt
+                            dt = _dt.fromisoformat(str(val))
+                            if dt.tzinfo:
+                                dt = dt.astimezone(tz=None).replace(tzinfo=None)
+                            return dt
+                        except:
+                            pass
+                return datetime(1970, 1, 1)
+
+            new_emails_sorted = sorted(new_emails, key=safe_dt, reverse=True)
+
+            # ── Group by conversationId — Exchange's authoritative thread key ──
+            # All emails sharing a conversationId are analysed together in one
+            # analyze_single_thread call so the AI sees the full conversation
+            # and produces one coherent summary.
+            from collections import defaultdict as _dd
+            conv_groups = _dd(list)
+            for e in new_emails_sorted:
+                key = e.get("conversationId") or e.get("id") or e.get("messageId")
+                conv_groups[key].append(e)
+
+            thread_groups = []   # (conv_id, [emails]) — true multi-email threads
+            #                       OR single emails with an embedded reply chain
+            single_emails = []   # true single-message emails
+
+            for conv_id, group in conv_groups.items():
+                if len(group) > 1:
+                    # Multiple emails share this conversationId → definite thread
+                    group.sort(key=safe_dt, reverse=True)   # newest first
+                    thread_groups.append((conv_id, group))
+                else:
+                    e = group[0]
+                    # Single email — check if its body contains an embedded
+                    # reply chain (e.g. a forwarded thread in one message)
+                    raw_body  = str(e.get("body") or "")
+                    sender    = e.get("from") or "Unknown"
+                    date      = e.get("received_at") or e.get("date") or "Unknown"
+                    split_msgs = split_reply_chain(raw_body, sender, date, e.get("attachments", []))
+                    if len(split_msgs) > 1:
+                        thread_groups.append((conv_id, group))
+                    else:
+                        single_emails.append(e)
+
+            # ── 1. Threads: fire all concurrently, push EACH as it finishes ──
+            if thread_groups:
+                thread_coros = [
+                    analyze_single_thread(
+                        group[0].get("subject", "No Subject"),
+                        group,          # ALL emails in the conversation
+                        user_email,
+                        conv_id
+                    )
+                    for conv_id, group in thread_groups
+                ]
+                for coro in asyncio.as_completed(thread_coros):
+                    result = await coro
+                    push_results([result])
+
+            # ── 2. Singles: process one chunk at a time, push per chunk ──
+            CHUNK_SIZE = 20
+            for chunk_start in range(0, len(single_emails), CHUNK_SIZE):
+                chunk = single_emails[chunk_start:chunk_start + CHUNK_SIZE]
+                chunk_results = await analyze_emails_batch(chunk)
+                push_results(chunk_results)
+
+            # ── 3. Generate report from all completed results ──
+            all_done = _analysis_jobs[user_email]["results"]
+            all_results = cached_results + all_done
+            deduped = {}
+            no_id_list = []
+            for e in all_results:
+                eid = e.get("id") or e.get("messageId")
+                if eid:
+                    deduped[eid] = e
+                else:
+                    no_id_list.append(e)
+            all_results = list(deduped.values()) + no_id_list
+
+            threads_only = [t for t in all_results if t.get("thread_count", 1) > 1]
+            brief_task   = generate_executive_brief(threads_only)
+            sender_task  = generate_sender_report(emails)
+            digest_task  = generate_daily_digest(all_results)
+            brief, sender_summaries, daily_digest = await asyncio.gather(
+                brief_task, sender_task, digest_task
+            )
+
+            triage_data = calculate_triage_stats(emails, all_results, user_identifier=user_email, demo_mode=False)
+            brief["thread_email_count"]   = len(emails)
+            brief["thread_attachment_count"] = triage_data["att_total"]
+            brief["sender_summaries"]     = sender_summaries
+            brief["triage_stats"]         = triage_data
+            brief["daily_digest"]         = daily_digest
+            save_cached_report(brief, user_email)
+            save_cached_emails(all_results, user_email)
+
+            _analysis_jobs[user_email]["status"] = "done"
+            _analysis_jobs[user_email]["report"] = brief
+            log.info(f"Analysis done for {user_email}: {len(all_done)} emails")
+
+        except Exception as ex:
+            log.error(f"Background analysis failed: {ex}")
+            _analysis_jobs[user_email]["status"] = "error"
+
+    asyncio.create_task(run_background_analysis())
+
+    return {
+        "emails": all_immediate,
+        "report": cached_report,
+        "analyzing": True
+    }
+
+
+@app.get("/api/analysis-updates")
+async def get_analysis_updates(user_email: str = "default", since: int = 0):
+    """
+    Poll this endpoint after /api/analyze returns analyzing:true.
+    Pass `since` = number of results already received to get only NEW ones.
+    Returns incrementally as each email/chunk finishes.
+    """
+    job = _analysis_jobs.get(user_email)
+    if not job:
+        return {"status": "none", "new_results": [], "total": 0, "report": None}
+
+    all_results = job["results"]
+    new_results = all_results[since:]   # only send what frontend hasn't seen yet
+
+    return {
+        "status": job["status"],
+        "new_results": new_results,
+        "total": len(all_results),
+        "report": job["report"] if job["status"] == "done" else None
+    }
 
 
 @app.post("/api/reply")
@@ -526,7 +704,8 @@ async def reply_email(
     to: List[str] = Form(...),
     cc: List[str] = Form([]),
     attachments: List[UploadFile] = File([]),
-    targetUserEmail: str = Form(None)
+    targetUserEmail: str = Form(None),
+    isReplyAll: str = Form("false")
 ):
     try:
         org_api_url = f"{ORG_BASE}/api/Values/mail/reply"
@@ -535,6 +714,7 @@ async def reply_email(
         parts = []
         parts.append(("MessageItemId", (None, messageItemId, "text/plain")))
         parts.append(("ReplyBodyHtml", (None, replyBodyHtml, "text/plain")))
+        parts.append(("IsReplyAll", (None, isReplyAll, "text/plain")))
         for t in to:
             parts.append(("To", (None, t, "text/plain")))
         for c in cc:
@@ -564,47 +744,118 @@ async def reply_email(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────
-# 🆕 UPDATED: Download attachment via org mail API
-# No more disk storage — fetches directly from source
-# ─────────────────────────────────────────────────────
-@app.post("/api/download-attachment")
-def download_attachment(data: dict):
-    name = data.get("name")
-    message_id = data.get("messageId")
-    user_email = data.get("userEmail", "")
+@app.post("/api/forward-email")
+async def forward_email(request: Request):
+    try:
+        form = await request.form()
 
-    if not name or not message_id:
-        raise HTTPException(status_code=400, detail="Missing 'name' or 'messageId'")
+        # ── Pull fields manually so we can log exactly what arrived ──
+        messageItemId   = form.get("messageItemId") or form.get("MessageItemId")
+        forwardBodyHtml = form.get("forwardBodyHtml") or form.get("body") or ""
+        targetUserEmail = form.get("targetUserEmail") or ""
+
+        to_list = form.getlist("to") or form.getlist("To")
+        cc_list = form.getlist("cc") or form.getlist("Cc")
+
+        log.warning(f"[forward] messageItemId={messageItemId!r} to={to_list} cc={cc_list} targetUser={targetUserEmail!r}")
+
+        if not messageItemId:
+            raise HTTPException(status_code=400, detail="Missing messageItemId")
+        if not to_list:
+            raise HTTPException(status_code=400, detail="Missing 'to' recipients")
+
+        org_api_url = f"{ORG_BASE}/api/Values/forwardmail"
+        # targetUserEmail is now [FromForm] — must go in parts, not query param
+
+        parts = []
+        parts.append(("MessageItemId", (None, messageItemId, "text/plain")))
+        parts.append(("Body",          (None, forwardBodyHtml, "text/plain")))
+        parts.append(("Subject",       (None, "", "text/plain")))  # DTO has Subject field, send empty
+        parts.append(("targetUserEmail", (None, targetUserEmail, "text/plain")))
+        for t in to_list:
+            if t.strip():
+                parts.append(("ToList", (None, t.strip(), "text/plain")))
+        for c in cc_list:
+            if c.strip():
+                parts.append(("CcList", (None, c.strip(), "text/plain")))
+
+        # Handle file attachments from the form
+        attachments = form.getlist("attachments")
+        has_file = False
+        for file in attachments:
+            if hasattr(file, "read"):
+                file_bytes = await file.read()
+                if file_bytes:
+                    parts.append(("Attachments", (file.filename, file_bytes, file.content_type)))
+                    has_file = True
+
+        if not has_file:
+            parts.append(("Attachments", ("", b"", "application/octet-stream")))
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(org_api_url, files=parts)
+
+        log.warning(f"[forward] .NET response: {response.status_code} — {response.text[:200]}")
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        return {"success": True, "message": "Email forwarded"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"[forward] exception: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/download-attachment")
+async def download_attachment(data: dict):
+    """
+    Download via EWS.
+    Body: { messageId, attachmentId, name, type, userEmail }
+    Proxies to: GET /api/Values/attachments/download
+                  ?messageId=...&attachmentId=...&targetUserEmail=...
+    """
+    message_id    = data.get("messageId")
+    attachment_id = data.get("attachmentId")
+    name          = data.get("name")
+    user_email    = data.get("userEmail", "")
+    content_type  = data.get("type") or "application/octet-stream"
+
+    if not message_id:
+        raise HTTPException(status_code=400, detail="Missing 'messageId'")
+    if not attachment_id:
+        raise HTTPException(status_code=400, detail="Missing 'attachmentId'")
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing 'name'")
     if not user_email:
         raise HTTPException(status_code=400, detail="Missing 'userEmail'")
 
-    print(f"📥 Download request: '{name}' from message {message_id}")
+    log.debug(f"Download: {name} | msg={message_id[:20]}... | att={attachment_id[:20]}...")
 
-    # Get the attachment content type from cache (for proper Content-Type header)
-    content_type = "application/octet-stream"
-    cached_emails = get_cached_emails(user_email) or []
+    try:
+        file_bytes = await asyncio.wait_for(
+            fetch_attachment_bytes(message_id, attachment_id, user_email),
+            timeout=110
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504,
+            detail=f"Download timed out for '{name}'. Large files may take longer — please retry.")
 
-    for mail in cached_emails:
-        if mail.get("id") == message_id or mail.get("messageId") == message_id:
-            for att in mail.get("attachments", []):
-                if att.get("name") == name:
-                    content_type = att.get("type", "application/octet-stream")
-                    break
-            break
+    log.debug(f"Streaming: {name} ({len(file_bytes):,} bytes)")
 
-    # 🔑 Fetch attachment bytes directly from org mail API
-    file_bytes = fetch_attachment_from_api(user_email, message_id, name)
-
-    print(f"✅ Streaming {name} ({len(file_bytes)} bytes) to client")
+    def iter_file(raw: bytes, chunk_size: int = 256 * 1024):
+        for i in range(0, len(raw), chunk_size):
+            yield raw[i:i + chunk_size]
 
     return StreamingResponse(
-        io.BytesIO(file_bytes),
+        iter_file(file_bytes),
         media_type=content_type,
         headers={
             "Content-Disposition": f'attachment; filename="{name}"',
-            "Content-Length": str(len(file_bytes)),
-            "Cache-Control": "no-store"
+            "Content-Length":      str(len(file_bytes)),
+            "Cache-Control":       "no-store",
         }
     )
 
@@ -637,6 +888,35 @@ def mark_mail_as_read(payload: dict = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/mail-stats")
+async def get_mail_stats(userEmail: str, count: int = 700):
+    """
+    Proxy: GET /api/Values/mail/unread/count?targetUserEmail=...&count=...
+    Returns exact triage stats from EWS:
+      unreadCount, totalAttachments, totalToRecipients,
+      totalCcRecipients, fileTypeCounts
+    """
+    org_url = f"{ORG_BASE}/api/Values/mail/unread/count"
+    params  = {"targetUserEmail": userEmail, "count": count}
+    log.debug(f"mail-stats: user={userEmail} count={count}")
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(org_url, params=params)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code,
+                                detail=f"Mail stats error: {resp.text[:200]}")
+        return resp.json()
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Mail stats timeout")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Cannot reach mail server")
+    except Exception as e:
+        log.error(f"get_mail_stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/search-contacts")
 async def search_contacts(q: str = ""):
     """
@@ -649,8 +929,8 @@ async def search_contacts(q: str = ""):
 
         # Fetch all contacts from the org server
         contacts_url = f"{ORG_BASE}/get"
-        print(f"🔍 Searching contacts: {contacts_url}")
-        
+        log.debug(f"Searching contacts: {contacts_url}")
+
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(contacts_url)
 
@@ -661,45 +941,44 @@ async def search_contacts(q: str = ""):
             )
 
         all_contacts = response.json()
-        
+
         if not isinstance(all_contacts, list):
             return []
-        
+
         # Filter contacts based on search query (case-insensitive)
         query_lower = q.lower()
         filtered = []
-        
+
         for contact in all_contacts:
             mail_id = contact.get("mailId", "")
-            
+
             # Skip system mailboxes
             if "SystemMailbox" in mail_id:
                 continue
-            
+
             # Check if query matches the email
             if query_lower in mail_id.lower():
                 # Extract name from email (part before @)
                 name_part = mail_id.split("@")[0] if "@" in mail_id else mail_id
                 # Convert "First.Last" to "First Last"
                 display_name = name_part.replace(".", " ").title()
-                
+
                 filtered.append({
                     "email": mail_id,
                     "name": display_name,
                     "group": contact.get("groupName", "user")
                 })
-        
+
         # Limit results to 10 for performance
         return filtered[:10]
-    
+
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Contact server timeout")
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Cannot reach contact server")
     except Exception as e:
-        print(f"❌ search_contacts error: {e}")
+        log.error(f"search_contacts error: {e}")
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-
 
 
 @app.get("/api/meetings")
@@ -725,23 +1004,23 @@ async def get_meetings(email: str, startDate: str = None, endDate: str = None):
     cache_key = f"{email}|{startDate}|{endDate}"
     cached = _meetings_cache.get(cache_key)
     if cached and (time.time() - cached["fetched_at"]) < MEETINGS_CACHE_TTL:
-        print(f"📅 Meetings cache HIT for {cache_key} ({len(cached['data'])} meetings)")
+        log.debug(f"Meetings cache HIT: {cache_key}")
         return cached["data"]
 
     org_url = f"{ORG_BASE}/api/Values/meetings"
     params  = {"email": email, "startDate": startDate, "endDate": endDate}
 
-    print(f"📅 Fetching meetings (cache MISS): {org_url} | params={params}")
+    log.debug(f"Meetings cache MISS: {org_url}")
 
     try:
         # Use async httpx so we don't block the FastAPI event loop
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(org_url, params=params)
 
-        print(f"   → Status: {resp.status_code}")
+        log.debug(f"Response status: {resp.status_code}")
 
         if resp.status_code != 200:
-            print(f"   ❌ Error body: {resp.text[:300]}")
+            log.error(f"Error body: {resp.text[:300]}")
             raise HTTPException(
                 status_code=resp.status_code,
                 detail=f"Calendar server error: {resp.text}"
@@ -755,7 +1034,7 @@ async def get_meetings(email: str, startDate: str = None, endDate: str = None):
 
         # ── Store in cache ──
         _meetings_cache[cache_key] = {"data": meetings, "fetched_at": time.time()}
-        print(f"   ✅ Returning {len(meetings)} meetings (cached)")
+        log.debug(f"Returning {len(meetings)} meetings")
         return meetings
 
     except HTTPException:
@@ -765,7 +1044,7 @@ async def get_meetings(email: str, startDate: str = None, endDate: str = None):
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Cannot reach calendar server")
     except Exception as e:
-        print(f"❌ get_meetings error: {e}")
+        log.error(f"get_meetings error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -784,25 +1063,38 @@ async def respond_to_meeting(meetingId: str, action: str, targetUserEmail: str =
             detail=f"Invalid action '{action}'. Must be one of: {', '.join(valid_actions)}"
         )
 
+    # Warn early if the ID looks like an email message ID rather than a calendar item ID
+    if "@" in meetingId or meetingId.count(":") >= 2:
+        log.warning(f"[rsvp] meetingId looks like an email message ID, not a calendar item ID: {meetingId!r}")
+
     org_url = f"{ORG_BASE}/api/Values/meetings/Action"
     rsvp_params = {"meetingId": meetingId, "action": action}
     if targetUserEmail:
         rsvp_params["targetUserEmail"] = targetUserEmail
 
-    icon = {"Accept": "✅", "Tentative": "🔔", "Decline": "❌"}.get(action, "📅")
-    print(f"{icon} Meeting RSVP: meetingId={meetingId} action={action} targetUserEmail={targetUserEmail}")
+    log.info(f"Meeting RSVP: {meetingId} action={action}")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(org_url, params=rsvp_params)
 
-        print(f"   → Status: {resp.status_code}")
+        log.debug(f"Response status: {resp.status_code}")
 
         if resp.status_code not in (200, 201, 204):
-            print(f"   ❌ Error body: {resp.text[:300]}")
+            error_body = resp.text[:500]
+            log.error(f"[rsvp] Org server error {resp.status_code}: {error_body}")
+
+            # Exchange returns this when we pass a MeetingRequest ID to an Appointment endpoint
+            if "MeetingRequest" in error_body and "Appointment" in error_body:
+                raise HTTPException(
+                    status_code=409,
+                    detail="MEETING_REQUEST_TYPE_MISMATCH"
+                )
+
             raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Calendar server error: {resp.text}"
+                status_code=422,
+                detail=f"Calendar server rejected the request (HTTP {resp.status_code}). "
+                       f"Org server said: {error_body}"
             )
 
         # Bust the meetings cache so next load reflects the updated RSVP status
@@ -817,7 +1109,7 @@ async def respond_to_meeting(meetingId: str, action: str, targetUserEmail: str =
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Cannot reach calendar server")
     except Exception as e:
-        print(f"❌ respond_to_meeting error: {e}")
+        log.error(f"respond_to_meeting error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -829,4 +1121,10 @@ def clear_meetings_cache():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        access_log=False,          # silence per-request noise
+        log_level="warning"        # uvicorn internal logs: warnings+ only
+    )

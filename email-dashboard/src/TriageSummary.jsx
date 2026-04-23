@@ -54,23 +54,30 @@ const FILE_ICONS = {
 const emojiStyleMain = { fontSize: "1.4rem", marginRight: "6px", verticalAlign: "middle" };
 const emojiStyleSub = { fontSize: "1.2rem", marginRight: "5px", verticalAlign: "middle" };
 
-const TriageSummary = ({ stats, realThreads, emails, onAttachmentClick }) => {
+const TriageSummary = ({ stats, realThreads, emails, report, onAttachmentClick }) => {
   if (!stats) return null;
 
   const { 
     vol_emails, 
     vol_meetings, 
-    total_unread, 
     att_total, 
     att_breakdown,
     to = 0,
     cc = 0 
   } = stats;
 
+  // THREADS = number of cards currently shown in the Executive Summary.
+  const trueThreadCount = (report?.briefing_cards || []).length;
+
+  // INVITES = emails that contain an actual zoom.us link in the body.
+  const zoomInviteCount = (emails || []).filter(e =>
+    (e.body || '').toLowerCase().includes('zoom.us')
+  ).length;
+
   return (
     <div className="triage-glass-panel triage-premium">
       
-      {/* TOP ROW: Now Perfectly Symmetrical */}
+      {/* TOP ROW */}
       <div className="triage-main-row">
         
         {/* BLOCK 1: EMAILS */}
@@ -91,31 +98,19 @@ const TriageSummary = ({ stats, realThreads, emails, onAttachmentClick }) => {
             <span style={emojiStyleMain}>🧵</span> THREADS
           </span>
           <span className="triage-number">
-            <CountUp end={realThreads?.length || 0} />
+            <CountUp end={trueThreadCount} />
           </span>
         </div>
 
         <div className="triage-divider-vertical" />
 
-        {/* BLOCK 3: MEETINGS */}
+        {/* BLOCK 3: INVITES */}
         <div className="triage-metric-block">
           <span className="triage-label">
-            <span style={emojiStyleMain}>📅</span> MEETINGS
+            <span style={emojiStyleMain}>📅</span> INVITES
           </span>
           <span className="triage-number">
-            <CountUp end={vol_meetings} />
-          </span>
-        </div>
-
-        <div className="triage-divider-vertical" />
-
-        {/* BLOCK 4: UNREAD (Now matches others perfectly) */}
-        <div className="triage-metric-block">
-          <span className="triage-label">
-            <span style={emojiStyleMain}>🔔</span> UNREAD
-          </span>
-          <span className="triage-number">
-            <CountUp end={total_unread} />
+            <CountUp end={zoomInviteCount} />
           </span>
         </div>
 
@@ -128,12 +123,7 @@ const TriageSummary = ({ stats, realThreads, emails, onAttachmentClick }) => {
             <span style={emojiStyleSub}>📎</span> ATTACHMENTS
           </span>
           
-          <span 
-            className="triage-sub-value clickable-stat" 
-            onClick={onAttachmentClick}
-            style={{ cursor: 'pointer' }}
-            title="Click to view all attachments"
-          >
+          <span className="triage-sub-value">
             <CountUp end={att_total} />
           </span>
 

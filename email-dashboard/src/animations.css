@@ -26,8 +26,18 @@
 }
 
 @keyframes shimmerSweep {
-  0%   { background-position: -600px 0; }
-  100% { background-position: 600px 0; }
+  0%   { transform: translateX(0%); }
+  100% { transform: translateX(280%); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.45; transform: scale(0.82); }
+}
+
+@keyframes analyzingShimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
 }
 
 @keyframes borderGlow {
@@ -49,6 +59,11 @@
   0%   { transform: scale(0.5); opacity: 0; }
   70%  { transform: scale(1.15); }
   100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0); }
 }
 
 @keyframes spinSlow {
@@ -128,6 +143,8 @@
               border-color 0.2s ease,
               background 0.2s ease !important;
   animation: fadeSlideUp 0.35s cubic-bezier(0.2, 0, 0, 1) both;
+  will-change: transform;
+  contain: layout style;
 }
 
 /* Stagger cards on load */
@@ -147,7 +164,7 @@
   border-color: rgba(0, 217, 255, 0.3) !important;
 }
 
-/* Shimmer effect on unread cards */
+/* Shimmer effect on unread cards — transform-based (GPU composited, zero repaint) */
 .unread-mail {
   position: relative;
   overflow: hidden;
@@ -156,16 +173,17 @@
 .unread-mail::after {
   content: '';
   position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
+  top: 0; left: -60%; bottom: 0;
+  width: 60%;
   background: linear-gradient(
     105deg,
-    transparent 40%,
+    transparent 0%,
     rgba(0, 217, 255, 0.04) 50%,
-    transparent 60%
+    transparent 100%
   );
-  background-size: 600px 100%;
-  animation: shimmerSweep 4s ease infinite;
+  animation: shimmerSweep 5s ease infinite;
   pointer-events: none;
+  will-change: transform;
 }
 
 /* Unread indicator dot pulse */

@@ -11,38 +11,129 @@ from datetime import datetime
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+
+def clean_for_ai(text: str, max_chars: int = 800) -> str:
+    """Strip HTML, collapse whitespace, truncate — reduces tokens by 60-70%."""
+    if not text:
+        return ""
+    # Remove HTML tags
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Decode HTML entities
+    text = html.unescape(text)
+    # Collapse whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Remove quoted reply junk (From: ... On ... wrote:)
+    text = re.sub(r"(From:.*?\n.*?Sent:.*?\n.*?To:.*?\n.*?Subject:.*?\n)", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"On .{10,80} wrote:", "", text, flags=re.IGNORECASE)
+    # Strip control characters that survive HTML cleaning and break JSON serialization.
+    # Outlook/Exchange bodies often contain VML, Office XML and binary-ish fragments
+    # with chars in the \x00-\x1f range. JSON only allows \t \n \r in that range —
+    # everything else causes OpenAI to reject the request with a 400 invalid JSON error.
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return text.strip()[:max_chars]
+
+import logging
+log = logging.getLogger("hfmg")
+
+
+def clean_subject(subject: str) -> str:
+    """Strip spam/junk tags from subject before sending to AI."""
+    if not subject:
+        return ""
+    cleaned = re.sub(r'\[\s*(spam|junk|bulk|virus|caution)\s*\]', '', subject, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\*+\s*(spam|junk)\s*\*+', '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def is_newsletter_body(body: str, sender: str = "") -> bool:
+    """Detect newsletter/marketing emails by body signals.
+    Requires 2+ signals for internal senders, 1+ for external.
+    This prevents productivity/ops emails with a single footer
+    signal from being wrongly classified as NEWSLETTER.
+    """
+    if not body:
+        return False
+    body_lower = body.lower()
+    signals = [
+        "unsubscribe",
+        "view online",
+        "view in browser",
+        "view this email",
+        "you are receiving this",
+        "you're receiving this",
+        "copyright ©",
+        "copyright &copy",
+        "our address is",
+        "opt out",
+        "opt-out",
+        "email preferences",
+        "manage preferences",
+        "forward for signup",
+        "sign up for our",
+        "mailchimp",
+        "hubspot",
+        "sendgrid",
+        "constantcontact",
+    ]
+    matched = sum(1 for s in signals if s in body_lower)
+    is_internal = sender and "hfmg.net" in sender.lower()
+    # Internal senders need 2+ signals (real internal newsletters have multiple)
+    # External senders need only 1 signal
+    return matched >= 2 if is_internal else matched >= 1
+
+
 # --- STEP 1: Create a strict classification prompt ---
 CLASSIFICATION_PROMPT = """
-You are an enterprise email triage assistant.
+You are an enterprise email triage assistant for a medical group (HFMG).
 
 Your job is to strictly classify an email into ONE of the following categories:
 
-1. PRIORITY  
-   - Emails from executives, leadership, or VIP senders  
-   - Financial, legal, compliance, production-impacting topics  
+1. VIP
+   - Emails from the highest-tier executive senders (pre-identified VIP list)
+   - Always surfaces at the very top regardless of content
 
-2. URGENT  
-   - Time-sensitive  
-   - Deadlines today or tomorrow  
-   - Outages, incidents, escalations  
+2. PRIORITY
+   - Emails from senior staff / priority senders (second-tier list)
+   - Financial, legal, compliance, production-impacting topics
 
-3. CONFIDENTIAL  
-   - Sensitive, legal, HR, patient, or contract information  
-   - Financial approvals, payment authorizations, invoices, budget approvals, purchase approvals  
-   - Any email that contains financial decision making or approval requests 
+3. URGENT
+   - Has a concrete deadline of TODAY or TOMORROW
+   - Outages, system-down incidents, patient safety issues, escalations requiring same-day action
+   - URGENT RULE: A deadline alone makes something URGENT. "Internal review only" or "confidential" language does NOT override a hard deadline.
+   - NOT URGENT: routine operational counts or reports (e.g. inactive insurance counts, weekly denial reports) even if numbers are high
 
-4. MEETING  
-   - Meeting invites, schedules, minutes, follow-ups  
+4. CONFIDENTIAL
+   - ONLY: emails requiring a DECISION or APPROVAL — financial approvals, payment authorizations, budget approvals, signed contracts awaiting countersignature, HR disciplinary or termination actions involving suspicious activity or misconduct
+   - NOT CONFIDENTIAL: routine employment contracts, offer letters, standard onboarding paperwork, contract status updates, weekly analytics reports, denial reports, vendor analytics, inactive patient/insurance counts
+   - NOT CONFIDENTIAL: termination forms unless the sender explicitly states suspicious activity, concerns, or misconduct
+   - NOT CONFIDENTIAL: emails that merely mention a contract by name without requesting a decision or approval
 
-5. ZOOM CALLS
-    -  Any email that contains a Zoom meeting link
-    -  URLs like https://zoom.us or https://*.zoom.us
+5. MEETING
+   - Meeting invites, schedules, minutes, follow-ups
 
-5. NEWSLETTER  
-   - Marketing, announcements, automated updates  
+6. ZOOM CALLS
+   - Any email that contains a Zoom meeting link (zoom.us URL)
 
-6. NORMAL  
-   - Everything else  
+7. NEWSLETTER
+   - Marketing, announcements, automated updates, weekly/daily digests
+   - Any email containing: unsubscribe, view online, view in browser, copyright notice, 'our address is', 'you are receiving this', opt-out, email preferences, manage preferences
+   - These signals ALWAYS mean NEWSLETTER regardless of content topic
+   - A newsletter mentioning Zoom or any company as a news item is still NEWSLETTER
+   - [SPAM] or [JUNK] in subject does NOT change category — classify based on body content only
+
+8. NORMAL
+   - Everything else including: routine contract updates, employment paperwork status, weekly reports, operational counts, vendor analytics
+
+CONFIDENTIAL vs URGENT — if an email has a hard deadline AND contains sensitive content, choose URGENT. Deadline beats confidentiality.
+
+GOLDEN RULE — READ FIRST:
+Any email that is ONLY sharing information, counts, or reports (e.g. inactive insurance counts,
+denial reports, productivity summaries, patient lists, weekly stats) must be classified as NORMAL.
+These are NEVER URGENT and NEVER CONFIDENTIAL, no matter how large the numbers are.
+URGENT and CONFIDENTIAL require an explicit action, decision, or same-day deadline.
 
 Rules:
 - Always choose exactly ONE category.
@@ -50,14 +141,20 @@ Rules:
 - Do NOT explain.
 - Output ONLY valid JSON.
 - Give a priority score (1 to 5).
-- Give a one-sentence professional summary.
+- Write a summary of 2-4 sentences that is so complete the reader never needs to open the email:
+  Sentence 1: Core topic and context.
+  Sentence 2: Specific details — names, numbers, dates, deadlines, locations, systems mentioned.
+  Sentence 3: What the recipient needs to do or decide.
+  Sentence 4 (if applicable): Attachments, links, or follow-up items.
+  Never be vague. Include every concrete detail present in the body.
+- NEWSLETTER RULE — exactly 2 sentences: Sentence 1: name the publication/source and its specific headline or subject. Sentence 2: list the 2-3 most concrete highlights or facts so the reader can decide if it's worth opening. NEVER say "this email", "a range of topics", "important topics", or anything vague. Name the specific tools, people, numbers, or policies in the body.
 
 JSON format:
 
 {
-  "category": "PRIORITY | URGENT | CONFIDENTIAL | MEETING | ZOOM | NEWSLETTER | NORMAL"
+  "category": "VIP | PRIORITY | URGENT | CONFIDENTIAL | MEETING | ZOOM | NEWSLETTER | NORMAL",
   "priority": 1,
-  "summary": "short professional summary"
+  "summary": "Detailed 2-4 sentence summary with all key facts."
 }
 """
 
@@ -67,24 +164,68 @@ api_key = os.getenv("OPENAI_API_KEY")
 ACTIVE_MODEL = "gpt-4o-mini"
 
 if not api_key:
-    print("❌ CRITICAL ERROR: OPENAI_API_KEY is missing from .env file!")
+    log.critical("OPENAI_API_KEY is missing from .env file!")
 
 client = AsyncOpenAI(api_key=api_key)
-VIP_FILE = "vip_list.json"
 
-# --- CONFIGURATION: PRIORITY SENDERS ---
-def load_vip_list():
-    if os.path.exists(VIP_FILE):
+# --- CONFIGURATION: VIP + PRIORITY SENDERS ---
+VIP_FILE      = "vip_list.json"
+PRIORITY_FILE = "priority_list.json"
+
+def load_sender_list(filepath: str) -> list:
+    """Load a flat JSON list of email addresses from a file."""
+    if os.path.exists(filepath):
         try:
-            with open(VIP_FILE, "r") as f:
-                return json.load(f)
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+            log.warning(f"{filepath} is not a flat list — expected format: [\"email@domain.com\", ...]")
         except Exception as e:
-            print(f"⚠️ Error loading VIP list: {e}")
-            return []
+            log.error(f"Error loading {filepath}: {e}")
     return []
 
-VIP_SENDERS = [v.lower() for v in load_vip_list()]
-print(f"✅ Loaded {len(VIP_SENDERS)} VIP senders: {VIP_SENDERS}")
+VIP_SENDERS       = [v.lower() for v in load_sender_list(VIP_FILE)]
+PRIORITY_SENDERS  = [v.lower() for v in load_sender_list(PRIORITY_FILE)]
+LEGAL_SENDERS     = [v.lower() for v in load_sender_list("legal_list.json")]
+PROVIDERS_SENDERS = [v.lower() for v in load_sender_list("providers_om_list.json")]
+# Domain-based matching for legal firms (catches any address at these firms)
+LEGAL_DOMAINS     = ["ropesgray.com", "garfunkelwild.com", "jclancylaw.com", "ambpclaw.com"]
+
+# ── DEDUPLICATION: VIP > LEGAL > PRIORITY > PROVIDERS ──────────────────────
+# If the same email appears in multiple lists, the highest-priority list wins.
+# We strip duplicates from lower lists at startup so each email has exactly
+# one category — no ambiguity at classification time.
+_vip_set      = set(VIP_SENDERS)
+_legal_set    = set(LEGAL_SENDERS)
+_priority_set = set(PRIORITY_SENDERS)
+
+def _log_overlaps(removed: list, from_list: str, kept_in: str):
+    for e in removed:
+        log.warning(f"[dedup] {e!r} removed from {from_list} — already in {kept_in}")
+
+# LEGAL: remove anything already in VIP
+_legal_overlap_vip = [e for e in LEGAL_SENDERS if e in _vip_set]
+LEGAL_SENDERS = [e for e in LEGAL_SENDERS if e not in _vip_set]
+_legal_set    = set(LEGAL_SENDERS)
+_log_overlaps(_legal_overlap_vip, "legal_list", "vip_list")
+
+# PRIORITY: remove anything already in VIP or LEGAL
+_priority_overlap = [e for e in PRIORITY_SENDERS if e in _vip_set or e in _legal_set]
+PRIORITY_SENDERS  = [e for e in PRIORITY_SENDERS if e not in _vip_set and e not in _legal_set]
+_priority_set     = set(PRIORITY_SENDERS)
+_log_overlaps(_priority_overlap, "priority_list", "vip_list or legal_list")
+
+# PROVIDERS: remove anything already in VIP, LEGAL, or PRIORITY
+_providers_overlap = [e for e in PROVIDERS_SENDERS if e in _vip_set or e in _legal_set or e in _priority_set]
+PROVIDERS_SENDERS  = [e for e in PROVIDERS_SENDERS if e not in _vip_set and e not in _legal_set and e not in _priority_set]
+_log_overlaps(_providers_overlap, "providers_om_list", "vip_list, legal_list, or priority_list")
+# ───────────────────────────────────────────────────────────────────────────
+
+log.debug(f"Loaded {len(VIP_SENDERS)} VIP senders from {VIP_FILE}")
+log.debug(f"Loaded {len(PRIORITY_SENDERS)} PRIORITY senders from {PRIORITY_FILE}")
+log.debug(f"Loaded {len(LEGAL_SENDERS)} LEGAL senders + {len(LEGAL_DOMAINS)} LEGAL domains")
+log.debug(f"Loaded {len(PROVIDERS_SENDERS)} PROVIDERS/OM senders")
 
 
 # --- DATA NORMALIZATION ---
@@ -100,37 +241,78 @@ def normalize_list(val):
 
 def normalize_email(e: dict):
     """
-    Normalize raw email dict into a consistent structure.
-    🆕 UPDATED: No more file_path — attachments use storage='api'
+    Normalize raw email dict from EWS into a consistent structure.
+    New EWS fields handled:
+      - body         → HTML content (field name confirmed)
+      - received     → ISO-8601 with timezone offset
+      - from         → plain email address
+      - hasAttachments → boolean (NOTE: EWS onemail DTO bug returns false even
+                         when attachments exist — always recompute from array)
+      - attachmentId  → EWS file attachment identifier for download
+      - sent          → sent timestamp
     """
     email_id = e.get("id") or e.get("_id") or e.get("messageId")
 
     clean_attachments = []
     for att in e.get("attachments", []):
         clean_attachments.append({
-            "name": att.get("name"),
-            "type": att.get("type", "application/octet-stream"),
-            "size": att.get("size", 0),
-            "hash": att.get("hash"),             # 16-char preview only
-            "storage": att.get("storage", "api"),  # 🆕 always 'api' now
-            "messageId": email_id                  # links attachment to its email
+            "name":         att.get("name"),
+            "type":         att.get("type", "application/octet-stream"),
+            "size":         att.get("size", 0),
+            "attachmentId": att.get("attachmentId") or att.get("AttachmentId"),
+            "hash":         att.get("hash"),
+            "storage":      "api",
+            "messageId":    email_id
         })
 
     return {
         "id": email_id or "mail",
         "subject": e.get("subject", "No Subject"),
         "from": e.get("from") or e.get("sender") or e.get("email") or "Unknown",
-        "to": normalize_list(e.get("to")),
-        "cc": normalize_list(e.get("cc")),
-        "body": str(e.get("body") or e.get("content") or e.get("text") or ""),
+        "to":  normalize_list(e.get("to")),
+        "cc":  normalize_list(e.get("cc")),
+
+        # Body resolution — "body" is the confirmed EWS HTML field name.
+        # Guard with HTML tag check so plain-text bodies fall through to fallback.
+        "body": (lambda _e: (
+            (lambda v: v if v and "<" in v else None)(_e.get("body")) or
+            _e.get("bodyHtml") or _e.get("htmlBody") or
+            _e.get("body_html") or _e.get("htmlContent") or
+            _e.get("bodyContent") or _e.get("mailBody") or
+            next(
+                (str(v) for k, v in _e.items()
+                 if isinstance(v, str)
+                 and k not in ("id", "messageId", "subject", "from", "sender",
+                               "to", "cc", "bcc", "received", "receivedDateTime",
+                               "received_at", "date", "isRead", "storage", "hash",
+                               "sent", "body")
+                 and "<" in v and ">" in v and len(v) > 50),
+                None
+            ) or
+            str(_e.get("body") or _e.get("content") or _e.get("text") or "")
+        ))(e),
+
+        # Timestamps — "received" is the primary EWS field (with tz offset)
         "received_at": (
+            e.get("received") or
             e.get("receivedDateTime") or
             e.get("received_at") or
-            e.get("received") or
             e.get("date") or
             "1970-01-01T00:00:00"
         ),
-        "attachments": clean_attachments
+        "sent_at": e.get("sent") or "",
+
+        "isRead": bool(e.get("isRead", False)),
+
+        # hasAttachments: use array length as ground truth.
+        # EWS onemail DTO has a bug where it returns false even when files exist.
+        "hasAttachments": len(clean_attachments) > 0 or bool(e.get("hasAttachments", False)),
+
+        "attachments": clean_attachments,
+
+        # Exchange-authoritative thread identifier — groups all replies/forwards
+        # in the same conversation regardless of subject line changes.
+        "conversationId": e.get("conversationId") or e.get("ConversationId") or "",
     }
 
 
@@ -145,12 +327,27 @@ def _cache_file_for(user_email: str) -> str:
     safe = _re.sub(r"[^\w@.-]", "_", user_email.lower().strip())
     return f"cache_{safe}.json"
 
+# Bump this string any time the cache schema or AI logic changes.
+# Any cache file written with a different version will be discarded
+# automatically on next load, forcing a clean re-analysis.
+CACHE_VERSION = "v6"   # bumped: newsletter detection + priority sender AI categorization
+CACHE_VERSION_KEY = "meta_cache_version"
+
 def load_cache(user_email: str = "default"):
     path = _cache_file_for(user_email)
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            # If the version doesn't match, discard the entire cache.
+            if data.get(CACHE_VERSION_KEY) != CACHE_VERSION:
+                log.warning(f"Cache version mismatch for {user_email} — discarding stale cache")
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                return {}
+            return data
         except:
             return {}
     return {}
@@ -172,6 +369,8 @@ def save_cache(new_data: dict, user_email: str = "default"):
     with _get_lock(user_email):           # ← serialises writes per user
         current = load_cache(user_email)
         current.update(new_data)
+        # Always stamp the current version so stale caches are detected on next load
+        current[CACHE_VERSION_KEY] = CACHE_VERSION
         with open(path, "w") as f:
             json.dump(current, f, indent=2)
 
@@ -255,59 +454,109 @@ def body_hash(text):
 
 def group_emails_by_subject(emails):
     groups = defaultdict(list)
-    GENERIC_SUBJECTS = ["no subject", "hi", "hello", "update", "meeting", "question", "info", "query", "status"]
 
     for e in emails:
         if 'thread_count' in e:
             continue
-        subject = e.get('subject', 'No Subject').strip()
-        body = e.get("body", "")
-        clean_subj = re.sub(r'^(re|fwd|fw|aw):\s*', '', subject, flags=re.IGNORECASE).strip()
-        key = f"{clean_subj}::{body_hash(body)}"
+        # Use Exchange's conversationId as the authoritative thread key.
+        # Every reply/forward in the same thread shares the same conversationId.
+        # Fall back to messageId so emails with no conversationId stay as singletons.
+        key = e.get("conversationId") or e.get("id") or e.get("messageId") or str(id(e))
         groups[key].append(e)
 
     return groups
+
+
+def _strip_html_for_split(text: str) -> str:
+    """
+    Convert HTML email body to plain text for reply-chain detection.
+    Block-level tags become newlines so From:/Sent:/To:/Subject: headers
+    end up on separate lines where the regex can match them.
+    EWS returns full HTML — the old plain-text regex never matched.
+    """
+    text = html.unescape(text)
+    text = re.sub(r"\s*&nbsp;\s*", " ", text)
+    text = re.sub(r"<(?:br|BR)\s*/?>", "\n", text)
+    text = re.sub(r"<(?:div|DIV|p|P|tr|TR|hr|HR)[^>]*>", "\n", text)
+    text = re.sub(r"</(?:div|DIV|p|P|td|TD|th|TH|tr|TR)>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _extract_latest_html(html_body: str) -> str:
+    """
+    Extract only the new reply text from a full Outlook HTML body.
+    Outlook consistently separates the new reply from the quoted chain using
+    one of these markers — we cut the HTML at the first one we find:
+      1. <hr>          — most common in desktop Outlook replies
+      2. divRplyFwdMsg — Outlook Web App / OWA
+      3. <b>From:</b>  — quoted header block in inline HTML
+    Falls back to the full body if none are found (single message, no chain).
+    """
+    if not html_body:
+        return html_body
+
+    # 1. <hr> separator
+    hr_match = re.search(r'<hr\b[^>]*>', html_body, re.IGNORECASE)
+    if hr_match:
+        return html_body[:hr_match.start()].strip() or html_body
+
+    # 2. divRplyFwdMsg div (OWA)
+    div_match = re.search(r'<div[^>]+id=["\']?divRplyFwdMsg["\']?', html_body, re.IGNORECASE)
+    if div_match:
+        return html_body[:div_match.start()].strip() or html_body
+
+    # 3. Bolded From: header inside quoted block
+    from_match = re.search(r'<(?:b|strong)[^>]*>\s*From:\s*</(?:b|strong)>', html_body, re.IGNORECASE)
+    if from_match:
+        return html_body[:from_match.start()].strip() or html_body
+
+    return html_body
 
 
 def split_reply_chain(body, main_sender, main_date, attachments=None):
     if not body:
         return []
 
-    body = html.unescape(body)
-    body = re.sub(r"\s*&nbsp;\s*", "\n", body)
-    body = re.sub(r"\n{2,}", "\n\n", body).strip()
+    original_body = body  # keep HTML for the latest message rendering
+
+    # Strip HTML before pattern matching — EWS bodies are HTML,
+    # reply headers are wrapped in <div>/<b> tags the old regex couldn't see
+    text_body = _strip_html_for_split(body)
 
     pattern = re.compile(
-        r"(From:\s.*?\nSent:\s.*?\nTo:\s.*?\n(?:Cc:\s.*?\n)?Subject:\s.*?\n)",
-        re.IGNORECASE | re.DOTALL
+        r"(From:\s[^\n]*\nSent:\s[^\n]*\nTo:\s[^\n]*\n(?:Cc:\s[^\n]*\n)?Subject:\s[^\n]*\n)",
+        re.IGNORECASE
     )
 
-    parts = pattern.split(body)
+    parts = pattern.split(text_body)
     messages = []
 
-    latest_body = parts[0].strip()
-    if latest_body:
+    latest_text = parts[0].strip()
+    if latest_text:
+        # When a reply chain is detected, extract only the new reply HTML
+        # (everything above Outlook's <hr> / divRplyFwdMsg separator).
+        # Without this, parsedThread[0] contained the full quoted chain
+        # causing the previous messages to show inside the latest message card.
+        latest_html = _extract_latest_html(original_body) if len(parts) > 1 else original_body
         messages.append({
-            "from": main_sender,
-            "date": main_date,
-            "body": latest_body,
+            "from":        main_sender,
+            "date":        main_date,
+            "body":        latest_html,
             "attachments": attachments or []
         })
 
     for i in range(1, len(parts), 2):
-        header = parts[i]
-        content = parts[i + 1] if i + 1 < len(parts) else ""
-
+        header  = parts[i]
+        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
         from_match = re.search(r"From:\s*(.*)", header, re.IGNORECASE)
         sent_match = re.search(r"Sent:\s*(.*)", header, re.IGNORECASE)
-
-        sender = from_match.group(1).strip() if from_match else "Unknown"
-        date = sent_match.group(1).strip() if sent_match else "Unknown"
-
         messages.append({
-            "from": sender,
-            "date": date,
-            "body": content.strip(),
+            "from":        from_match.group(1).strip() if from_match else "Unknown",
+            "date":        sent_match.group(1).strip() if sent_match else "Unknown",
+            "body":        content,
             "attachments": []
         })
 
@@ -319,12 +568,12 @@ def detect_real_threads(emails):
     singles = []
 
     for e in emails:
-        body = str(e.get("body") or "")
-        sender = e.get("from") or "Unknown"
-        date = e.get("received_at") or e.get("date") or "Unknown"
+        raw_body    = str(e.get("body") or "")
+        sender      = e.get("from") or "Unknown"
+        date        = e.get("received_at") or e.get("date") or "Unknown"
         attachments = e.get("attachments", [])
 
-        split_messages = split_reply_chain(body, sender, date, attachments)
+        split_messages = split_reply_chain(raw_body, sender, date, attachments)
 
         if len(split_messages) > 1:
             e["__is_thread__"] = True
@@ -343,12 +592,14 @@ async def analyze_single_email(email):
         return email
 
     body = email.get("body", "")
-    subject = email.get("subject", "No Subject")
+    subject = clean_subject(email.get("subject", "No Subject"))
+
+    newsletter_hint = "\nNOTE: This email contains newsletter/marketing signals. Classify as NEWSLETTER.\n" if is_newsletter_body(body, email.get("from", "")) else ""
 
     prompt = f"""
 Subject: {subject}
 From: {email.get('from')}
-Body:{body}{CLASSIFICATION_PROMPT}
+Body:{body}{newsletter_hint}{CLASSIFICATION_PROMPT}
 """
 
     try:
@@ -369,13 +620,23 @@ Body:{body}{CLASSIFICATION_PROMPT}
         subject_text = (email.get("subject") or "").lower()
         has_zoom = "zoom.us" in body_text or "zoom.us" in subject_text
 
+        is_legal = sender in LEGAL_SENDERS or any(sender.endswith("@" + d) for d in LEGAL_DOMAINS)
         if has_zoom:
             email["category"] = "ZOOM"
             email["priority"] = 4
         elif sender in VIP_SENDERS:
-            email["category"] = "PRIORITY"
+            email["category"] = "VIP"
             email["priority"] = 5
+        elif is_legal:
+            email["category"] = "LEGAL"
+            email["priority"] = 4
+        elif sender in PRIORITY_SENDERS:
+            # Priority senders: AI categorizes freely, fallback to PRIORITY if NORMAL
+            ai_category = result.get("category", "NORMAL")
+            email["category"] = ai_category if ai_category != "NORMAL" else "PRIORITY"
+            email["priority"] = result.get("priority", 4)
         else:
+            # All others including folder members: pure AI categorization
             email["category"] = result.get("category", "NORMAL")
             email["priority"] = result.get("priority", 1)
 
@@ -384,7 +645,7 @@ Body:{body}{CLASSIFICATION_PROMPT}
         return email
 
     except Exception as e:
-        print("Single mail analysis failed:", e)
+        log.error(f"Single mail analysis failed: {e}")
         email["category"] = "NORMAL"
         email["summary"] = "Pending analysis"
         return email
@@ -409,6 +670,7 @@ async def analyze_emails_batch(emails: list) -> list:
         subject_text = (email.get("subject") or "").lower()
         has_zoom = "zoom.us" in body_text or "zoom.us" in subject_text
 
+        is_legal = sender in LEGAL_SENDERS or any(sender.endswith("@" + d) for d in LEGAL_DOMAINS)
         if has_zoom:
             email["category"] = "ZOOM"
             email["priority"] = 4
@@ -416,11 +678,24 @@ async def analyze_emails_batch(emails: list) -> list:
             email["action"] = "REVIEW"
             pre_classified.append(email)
         elif sender in VIP_SENDERS:
-            email["category"] = "PRIORITY"
+            email["category"] = "VIP"
             email["priority"] = 5
-            email["summary"] = email.get("summary") or "Message from a VIP sender."
             email["action"] = "REVIEW"
-            pre_classified.append(email)
+            needs_ai.append(email)
+        elif is_legal:
+            # Pre-set category/priority but still send to AI for a real summary
+            email["category"] = "LEGAL"
+            email["priority"] = 4
+            email["action"] = "REVIEW"
+            needs_ai.append(email)
+        elif sender in PRIORITY_SENDERS:
+            # Do NOT pre-lock category — AI will decide, fallback applied after
+            email["action"] = "REVIEW"
+            needs_ai.append(email)
+        elif sender in PROVIDERS_SENDERS:
+            # Pure AI categorization — no sender lock
+            email["action"] = "REVIEW"
+            needs_ai.append(email)
         elif email.get("category") and email.get("summary"):
             # Already analyzed — skip
             pre_classified.append(email)
@@ -437,24 +712,32 @@ async def analyze_emails_batch(emails: list) -> list:
             "index": i,
             "subject": e.get("subject", "No Subject"),
             "from": e.get("from", "Unknown"),
-            "body_preview": (e.get("body") or "")[:400]
+            "body_preview": clean_for_ai(e.get("body") or "", 800)
         })
 
     batch_prompt = f"""
 You are an enterprise email triage assistant. Classify each email below.
 
-Categories: PRIORITY | URGENT | CONFIDENTIAL | MEETING | ZOOM | NEWSLETTER | NORMAL
+Categories: VIP | PRIORITY | URGENT | CONFIDENTIAL | MEETING | NEWSLETTER | NORMAL
 
 Rules:
-- ZOOM: contains zoom.us link
-- PRIORITY: from executives/leadership/VIP, financial/legal topics
-- URGENT: time-sensitive, deadlines today/tomorrow, outages
-- CONFIDENTIAL: sensitive HR/legal/financial approvals
+- ZOOM links are detected automatically before AI runs — never return ZOOM as a category
+- VIP: sender is a top-tier executive (detected automatically — AI should not set this)
+- PRIORITY: from senior staff/leadership, financial/legal topics
+- URGENT: hard deadline today/tomorrow, outage, patient safety. Routine counts/reports are NEVER urgent.
+- CONFIDENTIAL: ONLY emails requiring a DECISION or APPROVAL. NOT: routine contracts, offer letters, denial reports, analytics, inactive counts, or termination forms without explicit misconduct.
+- URGENT beats CONFIDENTIAL when a hard deadline is present.
 - MEETING: meeting invites, schedules, minutes
-- NEWSLETTER: marketing, automated updates
-- NORMAL: everything else
+- NEWSLETTER: marketing, automated updates, weekly/daily reports
+- NORMAL: routine contracts, employment paperwork, operational counts, vendor analytics, FYIs
 
-For each email return one object with: index, category, priority (1-5), summary (one professional sentence).
+For each email return one object with: index, category, priority (1-5), and a summary of 2-4 sentences.
+Summary must be thorough enough that the reader never needs to open the email:
+- Sentence 1: Core topic and context
+- Sentence 2: Specific details (names, numbers, dates, deadlines, locations, systems)
+- Sentence 3: What action or decision is needed
+- Sentence 4 (if applicable): Attachments or follow-up items
+Never be vague. Include every concrete detail from the body.
 
 INPUT:
 {json.dumps(emails_input)}
@@ -472,28 +755,43 @@ OUTPUT JSON FORMAT:
         chunk_input = [
             {
                 "index": i,
-                "subject": e.get("subject", "No Subject"),
+                "subject": clean_subject(e.get("subject", "No Subject")),
                 "from": e.get("from", "Unknown"),
-                "body_preview": (e.get("body") or "")[:400]
+                "body_preview": clean_for_ai(e.get("body") or "", 800),
+                "newsletter_hint": is_newsletter_body(e.get("body") or "", e.get("from", ""))
             }
             for i, e in enumerate(chunk_emails)
         ]
 
         chunk_prompt = f"""
-You are an enterprise email triage assistant. Classify each email below.
+You are an executive email intelligence assistant for a medical group portal. 
+Your job is to produce summaries so thorough that the reader NEVER needs to open the email itself.
 
-Categories: PRIORITY | URGENT | CONFIDENTIAL | MEETING | ZOOM | NEWSLETTER | NORMAL
+Categories: VIP | PRIORITY | URGENT | CONFIDENTIAL | MEETING | NEWSLETTER | NORMAL
 
-Rules:
-- ZOOM: contains zoom.us link
-- PRIORITY: from executives/leadership/VIP, financial/legal topics  
-- URGENT: time-sensitive, deadlines today/tomorrow, outages
-- CONFIDENTIAL: sensitive HR/legal/financial approvals
-- MEETING: meeting invites, schedules, minutes
-- NEWSLETTER: marketing, automated updates
-- NORMAL: everything else
+Classification Rules:
+- ZOOM links are detected automatically before AI runs — never return ZOOM as a category
+- VIP: top-tier executive sender (detected automatically — AI should not set this)
+- PRIORITY: from senior staff/leadership, financial or legal topics
+- GOLDEN RULE: Emails that only share information, counts, or reports (inactive insurance counts, denial reports, productivity summaries, patient lists, weekly stats) are ALWAYS NORMAL — never URGENT or CONFIDENTIAL regardless of the numbers involved.
+- URGENT: has a hard deadline of TODAY or TOMORROW, or is an outage/patient safety/escalation. "Internal review only" language does NOT make something urgent — only a concrete deadline does. Routine operational counts and weekly reports are NEVER urgent.
+- CONFIDENTIAL: ONLY emails requiring an actual DECISION or APPROVAL — financial approvals, payment authorizations, budget approvals, HR disciplinary/termination actions involving suspicious activity or misconduct. NOT confidential: routine employment contracts, offer letters, onboarding paperwork, contract status updates, weekly denial reports, vendor analytics reports, inactive insurance/patient counts, or termination forms unless suspicious activity is explicitly stated.
+- URGENT beats CONFIDENTIAL: if an email has a hard deadline AND sensitive content, always choose URGENT.
+- MEETING: meeting invites, agendas, minutes, scheduling requests
+- NEWSLETTER: marketing, automated digests, bulk updates, weekly/daily operational reports
+- NORMAL: routine contract updates, employment paperwork, operational counts, vendor analytics, FYIs
 
-For each email return one object with: index, category, priority (1-5), summary (one professional sentence).
+Summary Rules — this is the most important part:
+- Write 2-4 sentences minimum. Never one sentence.
+- Sentence 1: What is this email about? (core topic, context)
+- Sentence 2: What specific action, request, or information does it contain? (names, numbers, dates, deadlines if present)
+- Sentence 3: What does the recipient need to do, decide, or know? (next step or key takeaway)
+- Sentence 4 (if relevant): Any attachments, links, or follow-up items mentioned?
+- Include specific details: patient names/counts, dollar amounts, dates, locations, system names — whatever is in the body
+- Write in third person, professional tone
+- Never say "this email" — just state the facts directly
+- Never be vague. "Patients due for AWV tomorrow" is bad. "14 patients are due for Annual Wellness Visits on March 14; the attached CSV lists names, DOBs, and assigned providers for scheduling follow-up." is good.
+- NEWSLETTER RULE — exactly 2 sentences: Sentence 1: name the publication/source and its specific headline or subject. Sentence 2: list the 2-3 most concrete highlights or facts from the content so the reader can decide if it's worth opening. NEVER say "this email", "a range of topics", "important topics", "various topics", or anything vague. Name specific tools, companies, people, numbers, policies, or data points actually in the body.
 
 INPUT:
 {json.dumps(chunk_input)}
@@ -516,14 +814,30 @@ OUTPUT JSON:
 
             for i, email in enumerate(chunk_emails):
                 ai = results_map.get(i, {})
-                email["category"] = ai.get("category", "NORMAL")
-                email["priority"] = ai.get("priority", 1)
-                email["summary"] = ai.get("summary", "No summary")
+                sender = (email.get("from") or "").lower()
+                is_legal = sender in LEGAL_SENDERS or any(sender.endswith("@" + d) for d in LEGAL_DOMAINS)
+                # VIP/LEGAL/PRIORITY/PROVIDERS: keep pre-set category/priority, only take AI summary
+                body_lower = (email.get("body") or "").lower()
+                subject_lower = (email.get("subject") or "").lower()
+                if sender in VIP_SENDERS or is_legal:
+                    # VIP/LEGAL: keep pre-set category, only take AI summary
+                    email["summary"] = ai.get("summary", "No summary")
+                else:
+                    ai_category = ai.get("category", "NORMAL")
+                    # Hard guard: AI must never set ZOOM via content alone
+                    if ai_category == "ZOOM" and "zoom.us" not in body_lower and "zoom.us" not in subject_lower:
+                        ai_category = "MEETING"
+                    # PRIORITY senders: fallback to PRIORITY if AI returns NORMAL
+                    if sender in PRIORITY_SENDERS and ai_category == "NORMAL":
+                        ai_category = "PRIORITY"
+                    email["category"] = ai_category
+                    email["priority"] = ai.get("priority", 1)
+                    email["summary"] = ai.get("summary", "No summary")
                 email["action"] = "REVIEW"
                 all_ai_results.append(email)
 
         except Exception as ex:
-            print(f"⚠️ Batch chunk failed: {ex}")
+            log.warning(f"Batch chunk failed: {ex}")
             for email in chunk_emails:
                 email["category"] = "NORMAL"
                 email["summary"] = "Pending analysis"
@@ -533,7 +847,7 @@ OUTPUT JSON:
 
 
 async def generate_sender_report(emails):
-    print("🔹 Generating Sender Summaries...")
+    log.debug("Generating sender summaries")
     sender_groups = defaultdict(list)
     for e in emails:
         if 'thread_count' in e:
@@ -551,7 +865,7 @@ async def generate_sender_report(emails):
 
     senders_input = []
     for name, msgs in top_senders:
-        details = " | ".join([f"Subject: {m.get('subject')} (Body: {str(m.get('body'))[:100]}...)" for m in msgs[:3]])
+        details = " | ".join([f"Subject: {m.get('subject')} (Body: {clean_for_ai(str(m.get('body') or ''), 120)})" for m in msgs[:3]])
         senders_input.append({"id": name, "content": details})
 
     prompt = f"""
@@ -581,11 +895,11 @@ async def generate_sender_report(emails):
             final_list.append({"name": display_name, "count": len(msgs), "attachments": att_count, "summary": summary_text})
         return final_list
     except Exception as e:
-        print(f"Error in sender report: {e}")
+        log.error(f"Sender report error: {e}")
         return []
 
 
-async def analyze_single_thread(subject, messages, user_email: str = "default"):
+async def analyze_single_thread(subject, messages, user_email: str = "default", conversation_id: str = ""):
     final_messages = []
 
     if len(messages) == 1:
@@ -606,38 +920,43 @@ async def analyze_single_thread(subject, messages, user_email: str = "default"):
             }]
     else:
         for m in messages:
+            raw_body = m.get('body') or ""
+            # Strip the Outlook quoted chain from each individual reply so each
+            # message card shows only its new content — not the full quoted chain.
+            # Without this, every reply card contained all previous messages,
+            # making the thread look broken/duplicated.
+            # Also fixes: str(m.get('body')) was producing literal "None" strings.
+            visible_body = _extract_latest_html(raw_body) if raw_body else ""
             final_messages.append({
-                "from": m.get('from') or "Unknown",
-                "date": m.get('received_at') or m.get('date') or "Unknown",
-                "body": str(m.get('body')),
-                "attachments": m.get('attachments', [])
+                "from":        m.get('from') or "Unknown",
+                "date":        m.get('received_at') or m.get('received') or m.get('date') or "Unknown",
+                "body":        visible_body,
+                "attachments": m.get('attachments', []),
+                "messageId":   m.get('messageId') or m.get('id') or "",
             })
 
-    thread_id = f"thread__{subject}_{len(final_messages)}"
+    # Use conversationId as the cache key — it's stable across all replies in a thread.
+    # Fall back to subject+count for safety (should not be needed after cache clear).
+    thread_id = f"thread__{conversation_id}" if conversation_id else f"thread__{subject}_{len(final_messages)}"
     cache = load_cache(user_email)
     if thread_id in cache:
         return cache[thread_id]
 
-    display_subject = subject.split("::")[0] if "::" in subject else subject
+    display_subject = clean_subject(subject.split("::")[0] if "::" in subject else subject)
     participants = set()
     latest_date = None
     clean_messages = []
     history_text = ""
-    is_priority_sender = False
 
     for i, msg in enumerate(final_messages):
         sender = msg['from']
         participants.add(sender)
 
-        sender_lower = sender.lower()
-        if sender_lower in VIP_SENDERS:
-            is_priority_sender = True
-
         date = msg['date']
         if latest_date is None or date != "Unknown":
             latest_date = date
 
-        history_text += f"[{i+1}] FROM: {sender}\nDATE: {date}\nCONTENT: {msg['body'][:300]}\n----------------\n"
+        history_text += f"[{i+1}] FROM: {sender}\nDATE: {date}\nCONTENT: {clean_for_ai(msg['body'], 600)}\n----------------\n"
         clean_messages.append(msg)
 
     thread_attachments = []
@@ -655,13 +974,36 @@ async def analyze_single_thread(subject, messages, user_email: str = "default"):
 
     clean_messages.sort(key=lambda m: safe_dt(m.get("date")), reverse=True)
 
+    # ── Option D: only the NEWEST email's sender drives the category ──
+    # We check only the most recent message so that a VIP/PRIORITY participant
+    # in an older reply cannot elevate a thread started or last touched by
+    # a non-listed sender (e.g. Amreesh replying to a VIP thread).
+    newest_sender = clean_messages[0].get("from", "").lower() if clean_messages else ""
+    is_vip_sender       = newest_sender in VIP_SENDERS
+    is_legal_sender     = newest_sender in LEGAL_SENDERS or any(newest_sender.endswith("@" + d) for d in LEGAL_DOMAINS)
+    is_priority_sender  = newest_sender in PRIORITY_SENDERS
+    is_providers_sender = newest_sender in PROVIDERS_SENDERS
+
     prompt = f"""
-    Analyze this thread.
-    THREAD: {display_subject}
+    Analyze this email thread and produce a thorough summary.
+    THREAD SUBJECT: {display_subject}
     RAW_DATE: {latest_date}
-    LOG: {history_text}
-    TASK: Categorize (URGENT/MEETING/NEWSLETTER/NORMAL), Summarize status, Normalize date to ISO 8601.
-    OUTPUT JSON: {{ "category": "...", "priority": 1-5, "summary": "...", "action": "...", "normalized_date": "ISO_DATE" }}
+    MESSAGES: {history_text}
+
+    TASK:
+    1. Categorize: URGENT | MEETING | CONFIDENTIAL | NEWSLETTER | NORMAL
+       (ZOOM is detected automatically — never return ZOOM as a category)
+    2. Priority: 1-5
+    3. Summary: Write 2-4 sentences thorough enough that the reader never needs to open the thread.
+       - Sentence 1: What is this thread about? (topic, context, who is involved)
+       - Sentence 2: What specific details, numbers, dates, names, or decisions are discussed?
+       - Sentence 3: What action or response is needed from the recipient?
+       - Sentence 4 (if applicable): Any attachments, links, or outstanding follow-ups?
+       Never be vague. Include every concrete fact from the messages.
+       - NEWSLETTER RULE — exactly 2 sentences: Sentence 1: name the publication/source and its specific headline or subject. Sentence 2: list the 2-3 most concrete highlights or facts so the reader can decide if it's worth opening. NEVER say "this email", "a range of topics", "important topics", or anything vague.
+    4. Action: what the recipient should do (REPLY/REVIEW/SCHEDULE/APPROVE/FYI)
+
+    OUTPUT JSON: {{ "category": "...", "priority": 1-5, "summary": "...", "action": "..." }}
     """
     try:
         response = await client.chat.completions.create(
@@ -680,15 +1022,42 @@ async def analyze_single_thread(subject, messages, user_email: str = "default"):
         if has_zoom:
             final_category = "ZOOM"
             final_priority = 4
-        elif is_priority_sender:
-            final_category = "PRIORITY"
+        elif is_vip_sender:
+            final_category = "VIP"
             final_priority = 5
+        elif is_legal_sender:
+            final_category = "LEGAL"
+            final_priority = 4
+        elif is_priority_sender:
+            # Priority senders: AI categorizes freely, fallback to PRIORITY if NORMAL
+            ai_category = result.get("category", "NORMAL")
+            final_category = ai_category if ai_category != "NORMAL" else "PRIORITY"
+            final_priority = result.get("priority", 4)
         else:
+            # All others including folder members: pure AI categorization
             final_category = result.get("category", "NORMAL")
             final_priority = result.get("priority", 1)
 
-        final_date = result.get("normalized_date") or latest_date
+        # Use the real Exchange received timestamp from the source email.
+        # messages[0].received_at is set by normalize_email from the API's "received" field
+        # (e.g. "2026-03-31T02:09:39-04:00") and is always the most recent delivery time.
+        # We avoid latest_date because the loop overwrites it with each parsed message,
+        # ending up with the OLDEST reply's date instead of the newest.
+        final_date = (
+            messages[0].get('received_at') or
+            messages[0].get('received') or
+            latest_date or
+            "1970-01-01T00:00:00"
+        )
         latest_message = clean_messages[0]
+
+        # Collect all constituent message IDs so the cache can be indexed
+        # under every reply's ID — not just the thread parent's ID.
+        all_message_ids = [
+            m.get("messageId") or m.get("id")
+            for m in messages
+            if m.get("messageId") or m.get("id")
+        ]
 
         final_result = {
             "id": messages[0].get("messageId") or messages[0].get("id"),
@@ -704,7 +1073,9 @@ async def analyze_single_thread(subject, messages, user_email: str = "default"):
             "category": final_category,
             "priority": final_priority,
             "summary": result.get("summary", "Analysis failed."),
-            "action": result.get("action", "REVIEW")
+            "action": result.get("action", "REVIEW"),
+            "conversationId": conversation_id or "",
+            "allMessageIds": all_message_ids,
         }
         save_cache({thread_id: final_result}, user_email)
         return final_result
@@ -717,34 +1088,48 @@ async def generate_executive_brief(threads):
     if not active_threads:
         return {"briefing_cards": []}
 
-    thread_data = [
-        {
-            "id": t.get("id"),
-            "subject": t.get("subject"),
-            "summary": t.get("summary"),
-            "category": t.get("category")
-        }
-        for t in active_threads[:10]
+    # ── Deduplicate by subject (normalised) then by conversationId ──
+    # Without this, a thread with N messages produces N identical entries
+    # (one per cached message ID) causing N duplicate briefing cards.
+    seen_subjects = set()
+    seen_conv_ids = set()
+    deduped_threads = []
+    for t in active_threads:
+        conv_id = t.get("conversationId", "")
+        subj = (t.get("subject") or "").strip().lower()
+        # Skip if we've already seen this conversationId or subject
+        if conv_id and conv_id in seen_conv_ids:
+            continue
+        if subj and subj in seen_subjects:
+            continue
+        if conv_id:
+            seen_conv_ids.add(conv_id)
+        if subj:
+            seen_subjects.add(subj)
+        deduped_threads.append(t)
+
+    capped = deduped_threads[:10]
+
+    # Ask GPT only for a one-line status per thread.
+    # We never ask GPT for id, subject, topic, or category — we own those
+    # fields and inject them ourselves so they always match the real email.
+    # Using array index as the key avoids all ID truncation/rewrite issues.
+    status_input = [
+        {"index": i, "summary": t.get("summary", "")}
+        for i, t in enumerate(capped)
     ]
 
     prompt = f"""
-Create Executive Briefing Cards.
+For each email thread below write ONE short sentence (max 8 words) describing
+the current status or next action needed.
 
 INPUT JSON:
-{json.dumps(thread_data)}
+{json.dumps(status_input)}
 
-For every input item, create one briefing card.
-You MUST copy the same "id" field into the output.
-
-OUTPUT JSON FORMAT:
+OUTPUT JSON FORMAT — one object per input, same order, index preserved:
 {{
-  "briefing_cards": [
-    {{
-      "id": "original id",
-      "topic": "Short title",
-      "status": "Current status",
-      "category": "URGENT | PRIORITY | MEETING | NORMAL"
-    }}
+  "statuses": [
+    {{"index": 0, "status": "One-line current status here."}}
   ]
 }}
 """
@@ -755,9 +1140,163 @@ OUTPUT JSON FORMAT:
             messages=[{"role": "system", "content": "Output JSON only."}, {"role": "user", "content": prompt}],
             response_format={"type": "json_object"}, temperature=0.0
         )
-        return json.loads(response.choices[0].message.content)
-    except:
-        return {"briefing_cards": []}
+        gpt_result = json.loads(response.choices[0].message.content)
+        status_map = {item["index"]: item["status"] for item in gpt_result.get("statuses", [])}
+    except Exception as ex:
+        log.warning(f"generate_executive_brief GPT call failed: {ex}")
+        status_map = {}
+
+    # Build briefing cards entirely from our own data — no GPT fields for id/subject/category
+    briefing_cards = []
+    for i, t in enumerate(capped):
+        briefing_cards.append({
+            "id":       t.get("id"),
+            "subject":  t.get("subject", "No Subject"),
+            "topic":    t.get("subject", "No Subject"),
+            "status":   status_map.get(i, t.get("summary", "")[:80]),
+            "category": t.get("category", "NORMAL"),
+            "thread_count": t.get("thread_count", 1),
+        })
+
+    return {"briefing_cards": briefing_cards}
+
+
+async def generate_daily_digest(emails: list) -> list:
+    """
+    Groups emails by received date and generates one natural-language paragraph
+    per day. Pre-aggregates before sending to GPT so quality is consistent
+    whether there are 5 emails or 500 — no token limits, no vague summaries.
+    Returns a list of { date, email_count, paragraph } dicts, newest day first.
+    """
+    if not emails:
+        return []
+
+    from collections import defaultdict as _dd, Counter
+
+    # ── Group by date ──
+    day_groups = _dd(list)
+    for e in emails:
+        raw = e.get("received_at") or e.get("received") or ""
+        try:
+            dt = datetime.fromisoformat(raw)
+            day_key = dt.strftime("%Y-%m-%d")
+        except Exception:
+            day_key = "Unknown"
+        if day_key != "Unknown":
+            day_groups[day_key].append(e)
+
+    if not day_groups:
+        return []
+
+    sorted_days = sorted(day_groups.keys(), reverse=True)[:7]
+
+    # ── Pre-aggregate each day into a compact structure ──
+    # GPT receives this instead of raw email objects — works for any volume
+    days_input = []
+    for day in sorted_days:
+        group = day_groups[day]
+
+        # Count by category
+        category_counts = Counter(
+            (e.get("category") or "NORMAL").upper()
+            for e in group
+        )
+
+        # Top senders by volume (max 5) with their dominant topic
+        sender_map = _dd(list)
+        for e in group:
+            sender = (e.get("from") or "Unknown").strip()
+            sender_map[sender].append(e)
+
+        top_senders = []
+        for sender, s_emails in sorted(sender_map.items(), key=lambda x: -len(x[1]))[:5]:
+            # Pick the most representative summary from this sender
+            best = next((e.get("summary") for e in s_emails if e.get("summary")), "")
+            top_senders.append({
+                "from":  sender,
+                "count": len(s_emails),
+                "topic": clean_for_ai(best, 120) if best else s_emails[0].get("subject", "")
+            })
+
+        # Urgent subjects (max 4)
+        urgent_items = [
+            e.get("subject", "")
+            for e in group
+            if (e.get("category") or "").upper() in ("URGENT", "CONFIDENTIAL")
+        ][:4]
+
+        # VIP/PRIORITY subjects (max 4)
+        priority_items = [
+            e.get("subject", "")
+            for e in group
+            if (e.get("category") or "").upper() in ("VIP", "LEGAL", "PRIORITY")
+        ][:4]
+
+        days_input.append({
+            "date":           day,
+            "total":          len(group),
+            "by_category":    dict(category_counts),
+            "top_senders":    top_senders,
+            "urgent_items":   urgent_items,
+            "priority_items": priority_items,
+            "meetings":       sum(1 for e in group if (e.get("category") or "").upper() in ("MEETING", "ZOOM")),
+            "attachments":    sum(len(e.get("attachments") or []) for e in group),
+        })
+
+    prompt = f"""
+You are an executive assistant writing a concise daily email digest for a busy medical group executive.
+
+For each day below write ONE focused paragraph (4-6 sentences) that:
+- Opens with the date and total email count naturally in the flow
+- Calls out the top senders and what they were writing about
+- Highlights urgent or confidential items by name if present
+- Mentions meetings/Zoom calls if any
+- Ends with one clear "action focus" — the single most important thing to act on
+- Never says "this email", "various topics", or anything vague
+- Uses direct, professional language — no filler
+
+INPUT (pre-aggregated, may cover high email volumes):
+{json.dumps(days_input, indent=2)}
+
+OUTPUT JSON:
+{{
+  "digest": [
+    {{
+      "date": "2026-04-16",
+      "email_count": 56,
+      "paragraph": "On Wednesday April 16, 56 emails arrived..."
+    }}
+  ]
+}}
+"""
+
+    try:
+        response = await client.chat.completions.create(
+            model=ACTIVE_MODEL,
+            messages=[
+                {"role": "system", "content": "Output JSON only."},
+                {"role": "user",   "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=1500
+        )
+        result = json.loads(response.choices[0].message.content)
+        digest = result.get("digest", [])
+
+        # Always use our own email_count — never trust GPT's
+        count_map = {d["date"]: d["total"] for d in days_input}
+        for item in digest:
+            item["email_count"] = count_map.get(item["date"], item.get("email_count", 0))
+
+        return digest
+
+    except Exception as ex:
+        log.warning(f"generate_daily_digest failed: {ex}")
+        return [
+            {"date": d, "email_count": len(day_groups[d]), "paragraph": ""}
+            for d in sorted_days
+        ]
 
 
 async def draft_email_reply(sender, context, user_name: str = "User"):
@@ -772,7 +1311,7 @@ async def draft_email_reply(sender, context, user_name: str = "User"):
     YOUR STYLE GUIDE:
     - Tone: {tone_desc}.
     - Be decisive. No fluff.
-    - Sign off: "Thanks, {first_name}" or "Best, {first_name}".
+    - Sign off: "Thanks, {user_name}" or "Best, {user_name}".
     """
     user_prompt = f"CONTEXT: {context}. TASK: Draft reply body only."
 
@@ -789,14 +1328,19 @@ async def draft_email_reply(sender, context, user_name: str = "User"):
 
 def calculate_triage_stats(emails, threads=None, user_identifier="", demo_mode=False):
     target = user_identifier.strip().lower()
-    vol_emails = len(emails)
+    vol_emails = sum(
+        e.get("thread_count") or
+        len(e.get("messages") or []) or
+        1
+        for e in emails
+    )
 
     if threads and isinstance(threads, list):
         meaningful_threads = []
         for t in threads:
             category = (t.get("category") or "").upper()
             thread_count = t.get("thread_count", 1)
-            if category != "NEWSLETTER" or thread_count > 1 or category in ["URGENT", "PRIORITY", "MEETING"]:
+            if category != "NEWSLETTER" or thread_count > 1 or category in ["URGENT", "PRIORITY", "VIP", "MEETING"]:
                 meaningful_threads.append(t)
         vol_threads = len(meaningful_threads)
     else:
@@ -804,7 +1348,7 @@ def calculate_triage_stats(emails, threads=None, user_identifier="", demo_mode=F
 
     vol_meetings = 0
     if threads and isinstance(threads, list):
-        vol_meetings = sum(1 for t in threads if (t.get("category") or "").upper() == "MEETING")
+        vol_meetings = sum(1 for t in threads if (t.get("category") or "").upper() in ("MEETING", "ZOOM"))
 
     att_total = 0
     att_breakdown = {"PDF": 0, "DOC": 0, "XLS": 0, "IMG": 0}

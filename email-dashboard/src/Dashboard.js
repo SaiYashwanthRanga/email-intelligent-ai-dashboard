@@ -4,6 +4,7 @@ import DashboardView from "./DashboardView";
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useMemo, useRef } from "react";
+import InboxView from './InboxView.jsx';
 
 const API_BASE = process.env.REACT_APP_API_URL;
 
@@ -32,21 +33,19 @@ function Dashboard() {
   const [inboxReady, setInboxReady] = useState(false);
   const [isSoftSyncing, setIsSoftSyncing] = useState(false);
 
-  // ✅ NEW: Thread-aware received time (latest of parent + messages)
+  // ✅ FIXED: Only use the real Exchange delivery timestamp for card display.
+  // Previously this included m.date from thread messages, which are parsed from
+  // body text (e.g. "Thursday 4/2 at 10am is available") — causing cards to show
+  // meeting dates mentioned inside emails instead of when the email was received.
+  // The API returns "received" with timezone offset (e.g. "2026-03-31T02:09:39-04:00"),
+  // which normalize_email maps to "received_at". We trust only those two fields.
   const getEffectiveReceivedAt = (email) => {
-    const times = [];
-
-    if (email?.received) times.push(new Date(email.received));
-    if (email?.received_at) times.push(new Date(email.received_at));
-
-    if (Array.isArray(email?.messages)) {
-      email.messages.forEach(m => {
-        if (m?.date) times.push(new Date(m.date));
-        if (m?.received_at) times.push(new Date(m.received_at));
-      });
+    const raw = email?.received_at || email?.received;
+    if (raw && raw !== "Unknown" && raw !== "1970-01-01T00:00:00") {
+      const dt = new Date(raw);
+      if (!isNaN(dt.getTime())) return dt;
     }
-
-    return times.length ? new Date(Math.max(...times)) : new Date(0);
+    return new Date(0);
   };
 
   // --- HELPER: Normalize subject by stripping reply/forward prefixes ---
@@ -62,20 +61,84 @@ function Dashboard() {
   };
 
   // --- GROUP EMAILS BY THREAD: merge Re:/RE: replies under one thread card ---
+  // Outlook rule: ONLY group emails that carry a Re:/Fwd: prefix.
+  // Emails without a reply prefix are always standalone — even if many
+  // arrive with the same subject (e.g. automated notifications like
+  // "Iguana: Lab Results" or "AWV regarding;"). Grouping those would
+  // falsely collapse unrelated automated emails into fake threads.
+  const REPLY_PREFIX = /^(re|fwd|fw|aw|tr)\s*:\s*/i;
+
   const groupedEmails = useMemo(() => {
     if (!emails || emails.length === 0) return [];
 
-    const groups = {};
-
-    emails.forEach(email => {
-      const baseSubject = normalizeSubject(email.subject);
-      if (!groups[baseSubject]) groups[baseSubject] = [];
-      groups[baseSubject].push(email);
-    });
-
+    // ── STEP 1: Separate emails the backend already threaded (have messages array
+    //   with >1 entries, or threadCount>1) from plain single emails.
+    //   Backend threads are grouped by conversationId — trust that completely.
+    const backendThreaded = new Set(); // conversationIds already handled
     const result = [];
 
-    Object.values(groups).forEach(group => {
+    emails.forEach(email => {
+      // Backend already produced a thread card for this email
+      const hasBackendThread = (
+        (Array.isArray(email.messages) && email.messages.length > 1) ||
+        (email.threadCount && email.threadCount > 1)
+      );
+
+      if (hasBackendThread) {
+        const convId = email.conversationId || email.id || email.messageId;
+        if (convId && backendThreaded.has(convId)) return; // skip duplicate
+        if (convId) backendThreaded.add(convId);
+        result.push(email); // use exactly as-is from backend
+      }
+    });
+
+    // ── STEP 2: For remaining single emails, apply subject-based grouping
+    //   ONLY if they share a conversationId that wasn't already handled above.
+    //   This catches cases where the backend returned individual reply emails
+    //   (each with 1 message) that belong to the same conversation.
+    const singles = emails.filter(email => {
+      const hasBackendThread = (
+        (Array.isArray(email.messages) && email.messages.length > 1) ||
+        (email.threadCount && email.threadCount > 1)
+      );
+      if (hasBackendThread) return false;
+      // Also skip if this email's conversationId was already handled by a backend thread
+      const convId = email.conversationId;
+      if (convId && backendThreaded.has(convId)) return false;
+      return true;
+    });
+
+    // Group singles by conversationId first, then fall back to subject prefix
+    const convGroups = {};
+    const subjectGroups = {};
+
+    singles.forEach(email => {
+      const convId = email.conversationId;
+      if (convId) {
+        if (!convGroups[convId]) convGroups[convId] = [];
+        convGroups[convId].push(email);
+        return;
+      }
+
+      // No conversationId — use subject prefix grouping (Re:/Fwd: only)
+      const subject = email.subject || '';
+      if (!REPLY_PREFIX.test(subject.trim())) {
+        const uniqueKey = email.id || email.messageId || subject + '_' + Math.random();
+        subjectGroups[uniqueKey] = [email];
+        return;
+      }
+      const baseSubject = normalizeSubject(subject);
+      if (!subjectGroups[baseSubject]) subjectGroups[baseSubject] = [];
+      subjectGroups[baseSubject].push(email);
+    });
+
+    // Merge all groups
+    const allGroups = [
+      ...Object.values(convGroups),
+      ...Object.values(subjectGroups),
+    ];
+
+    allGroups.forEach(group => {
       if (group.length === 1) {
         result.push(group[0]);
         return;
@@ -96,43 +159,42 @@ function Dashboard() {
           allMessages.push(...email.messages);
         } else {
           allMessages.push({
-            from: email.from || email.sender || "Unknown",
-            date: email.received || email.received_at || email.date,
-            body: email.body || "",
-            attachments: email.attachments || []
+            from:        email.from || email.sender || "Unknown",
+            date:        email.received || email.received_at || email.date,
+            body:        email.body || "",
+            attachments: email.attachments || [],
+            messageId:   email.id || email.messageId || "",
           });
         }
       });
 
-      // Deduplicate messages by from+date key
-      const seen = new Set();
+      // Deduplicate messages by messageId first, then from+date
+      const seenMsgIds = new Set();
+      const seenKeys   = new Set();
       threadParent.messages = allMessages.filter(msg => {
+        const mid = msg.messageId;
+        if (mid) {
+          if (seenMsgIds.has(mid)) return false;
+          seenMsgIds.add(mid);
+          return true;
+        }
         const key = `${msg.from}|${msg.date}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
+        if (seenKeys.has(key)) return false;
+        seenKeys.add(key);
         return true;
       });
 
-      // Merge all attachments from every email in the group
+      // Merge all attachments
       const allAtts = [];
       sorted.forEach(e => {
         if (Array.isArray(e.attachments)) allAtts.push(...e.attachments);
       });
       threadParent.attachments = allAtts;
 
-      // Unread if ANY email in the group is unread
-      threadParent.isRead = sorted.every(e => e.isRead);
-
-      // Store count for the UI thread-count badge
-      threadParent.threadCount = sorted.length;
-
-      // ✅ Store ALL original message IDs so markAsRead can fire for every reply
-      threadParent.allMessageIds = sorted
-        .map(e => e.id || e.messageId)
-        .filter(Boolean);
-
-      // Use the latest summary
-      threadParent.summary = sorted.find(e => e.summary)?.summary || "";
+      threadParent.isRead       = sorted.every(e => e.isRead);
+      threadParent.threadCount  = threadParent.messages.length;
+      threadParent.allMessageIds = sorted.map(e => e.id || e.messageId).filter(Boolean);
+      threadParent.summary      = sorted.find(e => e.summary)?.summary || "";
 
       result.push(threadParent);
     });
@@ -150,9 +212,12 @@ function Dashboard() {
 
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [isAnalyzingBackground, setIsAnalyzingBackground] = useState(false);
+  const pollIntervalRef = useRef(null);
   const [activeTab, setActiveTab] = useState('ALL');
-  const [mainView, setMainView] = useState('INSIGHTS');
-  const [username, setUsername] = useState("User"); 
+  const [mainView, setMainView] = useState('THREADS');
+  const [username, setUsername] = useState("User");
+  const [mailStats, setMailStats] = useState(null);
   
   // Use the logged-in user's email (set during login)
   const userEmail = localStorage.getItem("userEmail") || "";
@@ -170,6 +235,7 @@ function Dashboard() {
   const [copySuccess, setCopySuccess] = useState(false);
   const [fileModalData, setFileModalData] = useState(null);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(true);
+  const [senderFilter, setSenderFilter] = useState(null); // { email, name } | null
 
   // ✅ REMOVED: expandedReplyId and related state
   // DashboardView now manages inline reply state internally per-card
@@ -229,23 +295,98 @@ function Dashboard() {
 
   // --- DERIVED STATE: Filter & Safe Sort ---
 
-  // Separate real threads and single emails (Sorted) — uses grouped data
   const realThreads = (groupedEmails || [])
-    .filter(e => Array.isArray(e.messages) && e.messages.length > 1)
+    .filter(e =>
+      (Array.isArray(e.messages) && e.messages.length > 1) ||
+      (e.threadCount && e.threadCount > 1)
+    )
     .sort((a, b) => getEffectiveReceivedAt(b) - getEffectiveReceivedAt(a));
   
   // --- CHANGED: Replace filteredEmails logic ---
   const filteredAndSortedEmails = useMemo(() => {
     if (!sortedEmails.length) return [];
 
-    if (activeTab === "ALL") {
-      return sortedEmails;
+    let result = sortedEmails;
+
+    // Sender filter (from Insights "View" click)
+    if (senderFilter) {
+      result = result.filter(e => {
+        const from = (e.from || e.sender || "").toLowerCase();
+        return from.includes(senderFilter.email.toLowerCase());
+      });
     }
 
-    return sortedEmails.filter(
-      e => e.category === activeTab
+    if (activeTab === "ALL") return result;
+    return result.filter(e => e.category === activeTab);
+  }, [sortedEmails, activeTab, senderFilter]);
+
+  const augmentedReport = useMemo(() => {
+    if (!report) return null;
+    const existingIds = new Set((report.briefing_cards || []).map(c => c.id).filter(Boolean));
+
+    // Deduplicate sortedEmails by conversationId before scanning for missing threads.
+    // Without this, a thread with N messages produces N entries in sortedEmails
+    // (one per cached message ID), causing N duplicate briefing cards.
+    const seenConvIds = new Set();
+    const dedupedEmails = sortedEmails.filter(e => {
+      const convKey = e.conversationId || e.id || e.messageId;
+      if (seenConvIds.has(convKey)) return false;
+      seenConvIds.add(convKey);
+      return true;
+    });
+
+    const missing = dedupedEmails
+      .filter(e => {
+        const count = e.threadCount || e.thread_count || 0;
+        const id    = e.id || e.messageId;
+        return count > 1 && id && !existingIds.has(id);
+      })
+      .map(e => ({
+        id:           e.id || e.messageId,
+        subject:      e.subject || "No Subject",
+        topic:        e.subject || "No Subject",
+        status:       e.summary || `${e.threadCount || e.thread_count} message thread`,
+        summary:      e.summary || "",
+        category:     e.category || "NORMAL",
+        thread_count: e.threadCount || e.thread_count || 2,
+      }));
+    if (missing.length === 0) return report;
+    return { ...report, briefing_cards: [...(report.briefing_cards || []), ...missing] };
+  }, [report, sortedEmails]);
+
+  const triageStats = useMemo(() => {
+    const base = report?.triage_stats || null;
+    if (!mailStats) return base;
+
+    const fc = mailStats.fileTypeCounts || {};
+
+    // ── Group raw API file types into display categories ──
+    const att_breakdown = {
+      PDF:   (fc[".pdf"]  || 0),
+      DOC:   (fc[".docx"] || 0) + (fc[".doc"]  || 0),
+      XLS:   (fc[".xlsx"] || 0) + (fc[".xls"]  || 0) + (fc[".xlsb"] || 0) + (fc[".csv"] || 0),
+      PPT:   (fc[".pptx"] || 0) + (fc[".ppt"]  || 0),
+      IMG:   (fc[".png"]  || 0) + (fc[".jpg"]  || 0) + (fc[".jpeg"] || 0) + (fc[".gif"]  || 0) + (fc[".tiff"] || 0),
+      VIDEO: (fc[".mp4"]  || 0) + (fc[".wmv"]  || 0) + (fc[".avi"]  || 0) + (fc[".mov"]  || 0),
+      AUDIO: (fc[".mp3"]  || 0) + (fc[".wav"]  || 0) + (fc[".m4a"]  || 0),
+      TXT:   (fc[".txt"]  || 0) + (fc[".vtt"]  || 0),
+    };
+
+    // Strip categories with 0 count so the UI doesn't show empty entries
+    const filteredBreakdown = Object.fromEntries(
+      Object.entries(att_breakdown).filter(([, v]) => v > 0)
     );
-  }, [sortedEmails, activeTab]);
+
+    return {
+      ...(base || {}),
+      vol_emails: mailStats?.unreadCount ?? emails.length,
+      total_unread:  mailStats.unreadCount      ?? base?.total_unread  ?? 0,
+      att_total:     mailStats.totalAttachments ?? base?.att_total     ?? 0,
+      att_breakdown: filteredBreakdown,
+      to:            mailStats.totalToRecipients  ?? base?.to          ?? 0,
+      cc:            mailStats.totalCcRecipients  ?? base?.cc          ?? 0,
+    };
+  }, [report, mailStats, emails]);
 
   // --- GREETING & DATE ---
   const [greetingInfo, setGreetingInfo] = useState({ greeting: 'Hello', date: '' });
@@ -273,9 +414,27 @@ function Dashboard() {
   }, []);
 
   // --- HELPERS ---
+  // Smart toast: deduplicates identical messages, aggregates counts,
+  // and caps the visible stack at 3 so notifications never block the UI.
   const addToast = (message, type = 'info') => {
-    const id = Date.now();
-    setToasts(prev => [...prev, { id, message, type }]);
+    setToasts(prev => {
+      // 1. If an identical message+type is already visible, just bump its
+      //    count and refresh its ID (resets the auto-dismiss timer).
+      const existing = prev.find(t => t.message === message && t.type === type);
+      if (existing) {
+        return prev.map(t =>
+          t.id === existing.id
+            ? { ...t, id: Date.now(), count: (t.count || 1) + 1 }
+            : t
+        );
+      }
+
+      const newToast = { id: Date.now(), message, type, count: 1 };
+
+      // 2. Hard cap: keep only the 2 most recent + the new one (max 3 visible).
+      const trimmed = prev.length >= 3 ? prev.slice(-2) : prev;
+      return [...trimmed, newToast];
+    });
   };
 
   const removeToast = (id) => {
@@ -486,13 +645,32 @@ function Dashboard() {
           await runAnalysis(res.data, false);
         }
 
-        // Restore selected email after refresh
+        // Fetch exact triage stats from EWS — non-blocking background call
+        axios.get(`${API_BASE}/mail-stats`, {
+          params: { userEmail, count: 700 }
+        }).then(statsRes => setMailStats(statsRes.data))
+          .catch(err => console.warn("mail-stats fetch failed:", err.message));
+
+        // Restore selected email after refresh — but only update AI fields
+        // (category, summary, priority) so the user's reply draft and parsed
+        // thread state are preserved. Replacing the entire object would trigger
+        // useEffect([selectedEmail]) which resets parsedThread and clears replyDraft.
         if (currentSelectedId) {
           const updatedEmail = res.data.find(
             e => (e.id || e.messageId) === currentSelectedId
           );
           if (updatedEmail) {
-            setSelectedEmail(updatedEmail);
+            setSelectedEmail(prev => {
+              if (!prev) return prev;
+              // Merge only non-destructive fields — leave body, messages, etc. intact
+              return {
+                ...prev,
+                category:  updatedEmail.category  || prev.category,
+                summary:   updatedEmail.summary   || prev.summary,
+                priority:  updatedEmail.priority  || prev.priority,
+                isRead:    updatedEmail.isRead     ?? prev.isRead,
+              };
+            });
           }
         }
 
@@ -513,87 +691,194 @@ function Dashboard() {
     }
   };
 
-  // ⬇️ MODIFIED: Accept silent param and check before UI switch
+  // ── Sanitize helper ──
+  const sanitizeEmails = (emailList) =>
+    emailList.map(e => {
+      if (Array.isArray(e.attachments)) {
+        e.attachments = e.attachments.map(a => ({
+          name: a.name, type: a.type, size: a.size,
+          hash: a.hash, storage: a.storage,
+          full_hash: a.full_hash || null, messageId: a.messageId,
+          attachmentId: a.attachmentId || null
+        }));
+      }
+      e.cc = Array.isArray(e.cc) ? e.cc : [];
+      e.to = Array.isArray(e.to) ? e.to : [];
+      e.category = (e.category || "NORMAL").toUpperCase();
+      if (e.hasAttachments === undefined || e.hasAttachments === null) {
+        e.hasAttachments = (e.attachments || []).length > 0;
+      }
+      return e;
+    });
+
+  const dedupeById = (list) =>
+    Object.values(list.reduce((acc, e) => {
+      const id = e.id || e.messageId;
+      if (id) acc[id] = e;
+      return acc;
+    }, {}));
+
+  // ── Stop any running poll ──
+  const stopPolling = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  };
+
+  // ── Poll /api/analysis-updates until done ──
+  const startPolling = (userEmail) => {
+    stopPolling();
+    setIsAnalyzingBackground(true);
+
+    let seenCount = 0;  // tracks how many results we've already merged
+
+    pollIntervalRef.current = setInterval(async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/analysis-updates`, {
+          params: { user_email: userEmail, since: seenCount }
+        });
+        const { status, new_results, total, report: updatedReport } = res.data;
+
+        // ── Merge whatever arrived since last tick (even if still running) ──
+        if (new_results && new_results.length > 0) {
+          seenCount += new_results.length;
+
+          setEmails(prev => {
+            const merged = [...prev];
+            new_results.forEach(newEmail => {
+              const id = newEmail.id || newEmail.messageId;
+              const idx = merged.findIndex(e => (e.id || e.messageId) === id);
+              const sanitized = sanitizeEmails([newEmail])[0];
+              if ((sanitized.hasAttachments === undefined || sanitized.hasAttachments === null)
+                  && idx !== -1 && merged[idx].hasAttachments !== undefined) {
+                sanitized.hasAttachments = merged[idx].hasAttachments;
+              }
+              if (idx !== -1) merged[idx] = sanitized;
+              else merged.push(sanitized);
+            });
+            return dedupeById(merged);
+          });
+
+          // Silently update selectedEmail AI fields if it's among the new results.
+          // Use functional update so we never replace the object — only patch fields —
+          // which avoids triggering useEffect([selectedEmail]) and clearing the draft.
+          setSelectedEmail(prev => {
+            if (!prev) return prev;
+            const prevId = prev.id || prev.messageId;
+            const match = new_results.find(e => (e.id || e.messageId) === prevId);
+            if (!match) return prev;
+            return {
+              ...prev,
+              category: match.category || prev.category,
+              summary:  match.summary  || prev.summary,
+              priority: match.priority || prev.priority,
+              isRead:   match.isRead   ?? prev.isRead,
+            };
+          });
+        }
+
+        // ── Stop polling only when fully done ──
+        if (status === "done") {
+          stopPolling();
+          setIsAnalyzingBackground(false);
+          if (updatedReport) {
+            setReport(updatedReport);
+            const metaCache = {
+              lastSync: new Date().toISOString(),
+              emailCount: total,
+              briefingCount: updatedReport?.briefing_cards?.length || 0
+            };
+            localStorage.setItem("emailDashboardMeta", JSON.stringify(metaCache));
+          }
+        } else if (status === "error" || status === "none") {
+          stopPolling();
+          setIsAnalyzingBackground(false);
+        }
+      } catch (err) {
+        console.error("Poll error:", err);
+        stopPolling();
+        setIsAnalyzingBackground(false);
+      }
+    }, 2000);  // poll every 2s for snappier updates
+  };
+
   const runAnalysis = async (emailsToAnalyze, silent = false) => {
     const payload = emailsToAnalyze || emails;
-    
-    // Even if payload is empty, we must ensure loading is turned off
-    if (!payload || payload.length === 0) {
-        setLoading(false);
-        return;
-    }
+    if (!payload || payload.length === 0) { setLoading(false); return; }
+
+    const rawHasAttachments = {};
+    (payload || []).forEach(e => {
+      const id = e.id || e.messageId;
+      if (id && e.hasAttachments !== undefined) rawHasAttachments[id] = e.hasAttachments;
+    });
 
     try {
       const userEmail = localStorage.getItem("userEmail") || "default";
       const res = await axios.post(`${API_BASE}/analyze`, { emails: payload, user_email: userEmail });
-      
+
       if (res.data.emails && Array.isArray(res.data.emails)) {
-        // Sanitize attachments structure for UI
-        const sanitized = res.data.emails.map(e => {
-          if (Array.isArray(e.attachments)) {
-            e.attachments = e.attachments.map(a => ({
-              name: a.name,
-              type: a.type,
-              size: a.size,
-              hash: a.hash,
-              storage: a.storage,
-              full_hash: a.full_hash || null,
-              messageId: a.messageId
-            }));
+        const sanitized = sanitizeEmails(res.data.emails).map(e => {
+          const id = e.id || e.messageId;
+          if (id && (e.hasAttachments === undefined || e.hasAttachments === null)
+              && rawHasAttachments[id] !== undefined) {
+            e.hasAttachments = rawHasAttachments[id];
           }
-
-          // ✅ ENSURE CC AND TO ARE ALWAYS ARRAYS
-          e.cc = Array.isArray(e.cc) ? e.cc : [];
-          e.to = Array.isArray(e.to) ? e.to : [];
-
-          // 🔥 NORMALIZE CATEGORY: No undefined, always uppercase
-          e.category = (e.category || "NORMAL").toUpperCase();
-
-          // No need to process e.messages attachments separately
-          // Backend should have merged them into e.attachments
           return e;
         });
-
-        // 🔥 THIS updates UI ONLY after AI completes
-        // Deduplicate by ID to ensure clean state
-        const unique = Object.values(
-          sanitized.reduce((acc, e) => {
-            const id = e.id || e.messageId;
-            acc[id] = e;
-            return acc;
-          }, {})
-        );
-
-        setEmails(unique);
-        
-        // Update report
-        setReport(res.data.report);
-      
-        // ✅ FIXED: Save only metadata to LocalStorage (not full data)
-        const metaCache = {
-          lastSync: new Date().toISOString(),
-          emailCount: res.data.emails?.length || 0,
-          briefingCount: res.data.report?.briefing_cards?.length || 0
-        };
-        localStorage.setItem("emailDashboardMeta", JSON.stringify(metaCache));
-      }
-      
-      // ⬇️ MODIFIED: Only switch view & toast if NOT silent
-      if (!silent) {
-        addToast("Insights Updated!", "success");
-        setMainView('INSIGHTS'); 
+        setEmails(dedupeById(sanitized));
+        if (res.data.report) setReport(res.data.report);
       }
 
-    } catch (err) { 
-      console.error(err); 
-      addToast("Analysis Failed. Check console.", "error"); 
+      if (res.data.analyzing) {
+        const userEmail = localStorage.getItem("userEmail") || "default";
+        startPolling(userEmail);
+      }
+      if (!silent) addToast("Inbox loaded!", "success");
+
+    } catch (err) {
+      console.error(err);
+      addToast("Analysis Failed. Check console.", "error");
     } finally {
-        // 🔴 FIX: Always turn off loading, even if error or 0 zoom mails
-        setLoading(false);
+      setLoading(false);
     }
   };
 
   // --- THREAD PARSING (SIMPLIFIED) ---
+
+  // Strip the Outlook quoted-reply chain from an HTML email body so only
+  // the new reply text is shown. Mirrors the Python _extract_latest_html logic.
+  // Split an Outlook HTML body into { visible, quoted }.
+  // "visible" = the new reply content (above the separator).
+  // "quoted"  = the <hr> + everything below it (the inline quoted chain).
+  // If no separator is found the whole body is visible and quoted is "".
+  const splitAtQuote = (html) => {
+    if (!html) return { visible: html, quoted: '' };
+
+    // 1. <hr> separator — desktop Outlook
+    const hrMatch = html.search(/<hr\b[^>]*>/i);
+    if (hrMatch > 0) return {
+      visible: html.slice(0, hrMatch).trim(),
+      quoted:  html.slice(hrMatch).trim()
+    };
+
+    // 2. divRplyFwdMsg — OWA
+    const divMatch = html.search(/<div[^>]+id=["']?divRplyFwdMsg["']?/i);
+    if (divMatch > 0) return {
+      visible: html.slice(0, divMatch).trim(),
+      quoted:  html.slice(divMatch).trim()
+    };
+
+    // 3. Bolded From: header
+    const fromMatch = html.search(/<(?:b|strong)[^>]*>\s*From:\s*<\/(?:b|strong)>/i);
+    if (fromMatch > 0) return {
+      visible: html.slice(0, fromMatch).trim(),
+      quoted:  html.slice(fromMatch).trim()
+    };
+
+    return { visible: html, quoted: '' };
+  };
+
   useEffect(() => {
     const fetchParsedThread = async () => {
       if (!selectedEmail) return;
@@ -602,12 +887,16 @@ function Dashboard() {
       
       // If email has messages array, use it; otherwise treat as single message
       if (selectedEmail.messages && Array.isArray(selectedEmail.messages)) {
-        const segments = selectedEmail.messages.map((msg, idx) => ({
-          type: idx === 0 ? 'latest' : 'history',
-          header: `From: ${msg.from} | ${formatDate(msg.date || msg.received_at)}`,
-          content: msg.body || "",
-          attachments: msg.attachments || []
-        }));
+        const segments = selectedEmail.messages.map((msg, idx) => {
+          const { visible, quoted } = splitAtQuote(msg.body || "");
+          return {
+            type: idx === 0 ? 'latest' : 'history',
+            header: `From: ${msg.from} | ${formatDate(msg.date || msg.received_at)}`,
+            content: visible,        // new reply text only
+            quotedContent: quoted,   // <hr> + quoted chain, shown via ··· button
+            attachments: msg.attachments || []
+          };
+        });
         setParsedThread(segments);
         setThreadLoading(false);
         return; 
@@ -621,7 +910,9 @@ function Dashboard() {
       setThreadLoading(false);
     };
     fetchParsedThread();
-  }, [selectedEmail]);
+  }, [selectedEmailId]);  // ← depend on ID only, not the whole object
+                           //   so AI field patches (category/summary) don't
+                           //   re-trigger this and wipe the user's draft
 
   const generateAiReply = async () => {
     if (!selectedEmail) return;
@@ -767,35 +1058,55 @@ function Dashboard() {
     setFileModalData({ title, files: safeList });
   };
 
-  // --- SAFE DOWNLOAD HANDLER ---
-  const handleFileDownload = async (file) => {
+  // ── fetchEmailDetails ─────────────────────────────────────────────────────
+  // Fetches full email on click: populates TO, CC, FROM and attachments
+  // with attachmentId from /api/email-details → .NET onemail.
+  // The inbox fetch omits TO/CC for speed — this restores them.
+  const fetchEmailDetails = async (email) => {
+    const messageId = email?.id || email?.messageId;
+    const userEmail = localStorage.getItem("userEmail") || "";
+    if (!messageId || !userEmail) return email;
     try {
-      if (file.storage === "remote") {
-        addToast("Video files must be downloaded from the original email.", "error");
-        return;
-      }
+      const res = await axios.get(`${API_BASE}/email-details`, {
+        params: { messageId, userEmail }
+      });
+      const d    = res.data;
+      const atts = Array.isArray(d.attachments) ? d.attachments : [];
+      return {
+        ...email,
+        from:           d.from  || email.from,
+        to:             Array.isArray(d.to)  ? d.to  : (email.to  || []),
+        cc:             Array.isArray(d.cc)  ? d.cc  : (email.cc  || []),
+        body:           d.body  || email.body,
+        attachments:    atts,
+        hasAttachments: atts.length > 0,
+      };
+    } catch (err) {
+      console.error("fetchEmailDetails failed:", err);
+      return email;
+    }
+  };
 
-      addToast(`Downloading ${file.name}...`, "loading");
-
+  const handleFileDownload = async (file) => {
+    const userEmail = localStorage.getItem("userEmail") || "";
+    if (!file.attachmentId) {
+      addToast("Attachment not ready — reopen the email and try again.", "error");
+      return;
+    }
+    addToast(`Downloading ${file.name}...`, "loading");
+    try {
       const res = await axios.post(
-        `${API_BASE}/download`,
-        {
-          name: file.name,
-          type: file.type,
-          storage: file.storage,
-          full_hash: file.full_hash
-        },
+        `${API_BASE}/download-attachment`,
+        { messageId: file.messageId, attachmentId: file.attachmentId, name: file.name, type: file.type, userEmail },
         { responseType: "blob" }
       );
-
-      const blob = new Blob([res.data], { type: file.type });
+      const blob = new Blob([res.data], { type: file.type || "application/octet-stream" });
       const link = document.createElement("a");
       link.href = window.URL.createObjectURL(blob);
       link.download = file.name;
       link.click();
-
+      window.URL.revokeObjectURL(link.href);
       addToast(`Downloaded: ${file.name}`, "success");
-
     } catch (err) {
       console.error(err);
       addToast(`Download failed for ${file.name}`, "error");
@@ -806,7 +1117,7 @@ function Dashboard() {
     <DashboardView
       // State
       emails={emails}
-      report={report}
+      report={augmentedReport}
       loading={loading}
       mainView={mainView}
       setMainView={setMainView}
@@ -827,15 +1138,27 @@ function Dashboard() {
       isSoftSyncing={isSoftSyncing}
       autoSyncEnabled={autoSyncEnabled}
       setAutoSyncEnabled={setAutoSyncEnabled}
+      isAnalyzingBackground={isAnalyzingBackground}
+
+      // Sender filter (Insights → Inbox navigation)
+      senderFilter={senderFilter}
+      setSenderFilter={setSenderFilter}
 
       // Selection & Modals
       selectedEmail={selectedEmail}
       
-      // --- STEP 3: WRAPPED SETTER TO STORE ID ---
-      setSelectedEmail={(email) => {
+      // On every click: show email immediately then enrich with full TO/CC/attachments
+      setSelectedEmail={async (email) => {
         setSelectedEmail(email);
         setSelectedEmailId(email ? (email.id || email.messageId) : null);
+        if (email) {
+          const enriched = await fetchEmailDetails(email);
+          setSelectedEmail(enriched);
+          setSelectedEmailId(enriched ? (enriched.id || enriched.messageId) : null);
+        }
       }}
+      
+      triageStats={triageStats}
       
       fileModalData={fileModalData}
       setFileModalData={setFileModalData}
