@@ -1,0 +1,16 @@
+# Python backend
+backend/venv/
+backend/__pycache__/
+backend/.env
+backend/cache_*.json
+
+# Node frontend
+frontend-new/node_modules/
+frontend-new/dist/
+
+# Old, incomplete frontend (not part of this push)
+frontend/
+
+# Editor/OS
+.vscode/
+Thumbs.db

@@ -1,0 +1,355 @@
+/* ============================================================
+   HFMG PORTAL — PREMIUM ANIMATIONS
+   Import this in index.js: import './animations.css';
+   ============================================================ */
+
+/* ── KEYFRAMES ── */
+
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateX(-10px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes modalEntrance {
+  from { opacity: 0; transform: scale(0.96) translateY(12px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 217, 255, 0); }
+  50%       { box-shadow: 0 0 18px 4px rgba(0, 217, 255, 0.12); }
+}
+
+@keyframes shimmerSweep {
+  0%   { transform: translateX(0%); }
+  100% { transform: translateX(280%); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.45; transform: scale(0.82); }
+}
+
+@keyframes analyzingShimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+
+@keyframes borderGlow {
+  0%, 100% { border-color: rgba(0, 217, 255, 0.15); }
+  50%       { border-color: rgba(0, 217, 255, 0.4); }
+}
+
+@keyframes countUp {
+  from { opacity: 0; transform: translateY(8px) scale(0.9); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes tabSlide {
+  from { opacity: 0; transform: translateX(6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes badgePop {
+  0%   { transform: scale(0.5); opacity: 0; }
+  70%  { transform: scale(1.15); }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes spinSlow {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes unreadDot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.6; transform: scale(0.85); }
+}
+
+@keyframes auroraDrift {
+  0%   { transform: translate3d(0%, 0%, 0) rotate(0deg) scale(1); }
+  33%  { transform: translate3d(-4%, 3%, 0) rotate(8deg) scale(1.08); }
+  66%  { transform: translate3d(3%, -3%, 0) rotate(-6deg) scale(1.04); }
+  100% { transform: translate3d(0%, 0%, 0) rotate(0deg) scale(1); }
+}
+
+@keyframes auroraDriftReverse {
+  0%   { transform: translate3d(0%, 0%, 0) rotate(0deg) scale(1.05); }
+  50%  { transform: translate3d(4%, -4%, 0) rotate(-10deg) scale(0.96); }
+  100% { transform: translate3d(0%, 0%, 0) rotate(0deg) scale(1.05); }
+}
+
+@keyframes glassSheen {
+  0%   { transform: translateX(-120%) skewX(-12deg); }
+  100% { transform: translateX(220%) skewX(-12deg); }
+}
+
+/* ── PAGE / APP ENTRANCE ── */
+
+.main-content {
+  animation: fadeSlideUp 0.5s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.top-bar {
+  animation: fadeSlideUp 0.45s cubic-bezier(0.2, 0, 0, 1) 0.05s both;
+}
+
+/* ── SIDEBAR ── */
+
+.sidebar {
+  transition: left 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.35s ease !important;
+}
+
+.sidebar.open {
+  box-shadow: 4px 0 40px rgba(0, 217, 255, 0.08), 20px 0 60px rgba(0,0,0,0.5);
+}
+
+/* ── TRIAGE / STATS PANEL ── */
+
+.triage-premium {
+  animation: fadeSlideUp 0.5s cubic-bezier(0.2, 0, 0, 1) 0.1s both;
+}
+
+.triage-metric-block {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.triage-metric-block:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 217, 255, 0.1);
+}
+
+/* ── TAB BUTTONS ── */
+
+.tab-btn {
+  transition: background 0.2s ease, color 0.2s ease,
+              border-color 0.2s ease, box-shadow 0.2s ease,
+              transform 0.15s ease !important;
+}
+
+.tab-btn:hover {
+  transform: translateY(-1px);
+}
+
+.tab-btn:active {
+  transform: translateY(0px) scale(0.97);
+}
+
+.tab-btn.active {
+  animation: glowPulse 3s ease infinite;
+}
+
+.count-badge {
+  animation: badgePop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* ── EMAIL CARDS ── */
+
+.email-card {
+  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1),
+              box-shadow 0.2s ease,
+              border-color 0.2s ease,
+              background 0.2s ease !important;
+  animation: fadeSlideUp 0.35s cubic-bezier(0.2, 0, 0, 1) both;
+  will-change: transform;
+  contain: layout style;
+}
+
+/* Stagger cards on load */
+.email-card:nth-child(1)  { animation-delay: 0.04s; }
+.email-card:nth-child(2)  { animation-delay: 0.08s; }
+.email-card:nth-child(3)  { animation-delay: 0.12s; }
+.email-card:nth-child(4)  { animation-delay: 0.16s; }
+.email-card:nth-child(5)  { animation-delay: 0.20s; }
+.email-card:nth-child(6)  { animation-delay: 0.24s; }
+.email-card:nth-child(7)  { animation-delay: 0.27s; }
+.email-card:nth-child(8)  { animation-delay: 0.30s; }
+.email-card:nth-child(9)  { animation-delay: 0.33s; }
+.email-card:nth-child(10) { animation-delay: 0.35s; }
+
+.email-card:hover {
+  transform: translateY(-2px) !important;
+  border-color: rgba(0, 217, 255, 0.3) !important;
+}
+
+/* Shimmer effect on unread cards — transform-based (GPU composited, zero repaint) */
+.unread-mail {
+  position: relative;
+  overflow: hidden;
+}
+
+.unread-mail::after {
+  content: '';
+  position: absolute;
+  top: 0; left: -60%; bottom: 0;
+  width: 60%;
+  background: linear-gradient(
+    105deg,
+    transparent 0%,
+    rgba(0, 217, 255, 0.04) 50%,
+    transparent 100%
+  );
+  animation: shimmerSweep 5s ease infinite;
+  pointer-events: none;
+  will-change: transform;
+}
+
+/* Unread indicator dot pulse */
+.unread-dot {
+  animation: unreadDot 2s ease infinite;
+}
+
+/* ── CATEGORY TAGS ── */
+
+.cat-tag {
+  transition: transform 0.15s ease, box-shadow 0.15s ease !important;
+}
+
+.cat-tag:hover {
+  transform: scale(1.05);
+}
+
+/* ── MODAL ── */
+
+.modal-overlay {
+  animation: none;
+  backdrop-filter: blur(6px);
+  transition: backdrop-filter 0.3s ease;
+}
+
+.modal-content {
+  animation: modalEntrance 0.35s cubic-bezier(0.2, 0, 0, 1) both !important;
+}
+
+/* ── BRIEFING CARDS ── */
+
+.briefing-card-row {
+  transition: background 0.2s ease, transform 0.2s ease,
+              box-shadow 0.2s ease, border-color 0.2s ease !important;
+  animation: fadeSlideIn 0.3s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.briefing-card-row:nth-child(1) { animation-delay: 0.03s; }
+.briefing-card-row:nth-child(2) { animation-delay: 0.07s; }
+.briefing-card-row:nth-child(3) { animation-delay: 0.11s; }
+.briefing-card-row:nth-child(4) { animation-delay: 0.15s; }
+.briefing-card-row:nth-child(5) { animation-delay: 0.19s; }
+.briefing-card-row:nth-child(6) { animation-delay: 0.22s; }
+
+.briefing-card-row:hover {
+  transform: translateX(4px);
+}
+
+/* ── BUTTONS ── */
+
+.btn-gradient {
+  transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease !important;
+}
+
+.btn-gradient:hover:not(:disabled) {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.4) !important;
+}
+
+.btn-gradient:active:not(:disabled) {
+  transform: translateY(0) scale(0.97) !important;
+}
+
+.menu-btn {
+  transition: border-color 0.2s ease, color 0.2s ease,
+              box-shadow 0.2s ease, transform 0.15s ease !important;
+}
+
+.menu-btn:hover {
+  transform: translateY(-1px);
+}
+
+.menu-btn:active {
+  transform: scale(0.95);
+}
+
+/* ── VIEW SWITCHER ── */
+
+.view-btn {
+  transition: background 0.2s ease, color 0.2s ease,
+              box-shadow 0.2s ease, transform 0.15s ease !important;
+}
+
+.view-btn:hover {
+  transform: translateY(-1px);
+}
+
+.view-btn.active {
+  animation: borderGlow 3s ease infinite;
+}
+
+/* ── FILE / ATTACHMENT ROWS ── */
+
+.file-row {
+  transition: background 0.18s ease, transform 0.18s ease !important;
+  animation: fadeSlideIn 0.28s ease both;
+}
+
+.file-row:nth-child(1) { animation-delay: 0.02s; }
+.file-row:nth-child(2) { animation-delay: 0.05s; }
+.file-row:nth-child(3) { animation-delay: 0.08s; }
+.file-row:nth-child(4) { animation-delay: 0.11s; }
+.file-row:nth-child(5) { animation-delay: 0.14s; }
+
+.file-row:hover {
+  transform: translateX(3px);
+}
+
+/* ── LOGO BOX ── */
+
+.logo-box {
+  transition: box-shadow 0.3s ease, transform 0.3s ease !important;
+}
+
+.logo-box:hover {
+  transform: rotate(5deg) scale(1.05);
+  box-shadow: 0 0 24px rgba(0, 217, 255, 0.3) !important;
+}
+
+/* ── SPINNER ── */
+
+.animate-spin {
+  animation: spinSlow 0.75s linear infinite !important;
+}
+
+/* ── VISIONOS AURORA — EMAIL DETAIL ── */
+
+.visionos-meta-card {
+  animation: fadeSlideUp 0.35s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.visionos-meta-card:nth-child(1) { animation-delay: 0.02s; }
+.visionos-meta-card:nth-child(2) { animation-delay: 0.06s; }
+.visionos-meta-card:nth-child(3) { animation-delay: 0.10s; }
+.visionos-meta-card:nth-child(4) { animation-delay: 0.14s; }
+
+.visionos-aurora-panel .modal-header,
+.visionos-aurora-panel .modal-summary-box,
+.visionos-aurora-panel .reply-section {
+  animation: fadeSlideUp 0.4s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* ── REDUCE MOTION (accessibility) ── */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
