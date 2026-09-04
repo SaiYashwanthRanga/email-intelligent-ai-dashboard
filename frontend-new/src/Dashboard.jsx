@@ -5,8 +5,15 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useMemo, useRef } from "react";
 import InboxView from './InboxView.jsx';
+import { getDeviceId, getDeviceLabel } from './deviceIdentity';
 
 const API_BASE = import.meta.env.VITE_API_URL;
+
+// Progressive inbox fetch: grab a small, fast batch first so the user sees
+// mail almost immediately, then fill in the rest in the background instead
+// of blocking the whole UI until all emails arrive.
+const FAST_FETCH_COUNT = 40;
+const FULL_FETCH_COUNT = 500;
 
 // --- ✅ HELPER: Extract email from "Name <email@domain.com>" format ---
 const extractEmail = (value) => {
@@ -31,7 +38,12 @@ function Dashboard() {
   const [lastSyncTime, setLastSyncTime] = useState(null);
   const [isIdle, setIsIdle] = useState(false);
   const [inboxReady, setInboxReady] = useState(false);
+  const [inboxError, setInboxError] = useState(false);
   const [isSoftSyncing, setIsSoftSyncing] = useState(false);
+  // True while phase 2 (the full-inbox background fetch) is still running,
+  // so the inbox list can show a "still fetching" indicator once the user
+  // scrolls past the fast first batch instead of the list just ending.
+  const [isFetchingFullInbox, setIsFetchingFullInbox] = useState(false);
 
   // ✅ FIXED: Only use the real Exchange delivery timestamp for card display.
   // Previously this included m.date from thread messages, which are parsed from
@@ -243,6 +255,7 @@ function Dashboard() {
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(true);
   const [senderFilter, setSenderFilter] = useState(null); // { email, name } | null
   const [canUseTracking, setCanUseTracking] = useState(false);
+  const [canUseActivity, setCanUseActivity] = useState(false); // gates the Activity tab — see activity_access.json
   const [autoDigest, setAutoDigest] = useState(null);       // complete 7-day digest from EWS
   const [digestLoading, setDigestLoading] = useState(true); // shows skeleton until first load
 
@@ -526,6 +539,12 @@ function Dashboard() {
         .then(r => r.json())
         .then(data => setCanUseTracking(!!data.allowed))
         .catch(() => setCanUseTracking(false));
+
+      // ── Check activity-view access for this user (see activity_access.json) ──
+      fetch(`${API_BASE}/activity/access?user_email=${encodeURIComponent(email)}`)
+        .then(r => r.json())
+        .then(data => setCanUseActivity(!!data.allowed))
+        .catch(() => setCanUseActivity(false));
     }
   }, [navigate]);
 
@@ -613,6 +632,32 @@ function Dashboard() {
     markUserActive();
   }, []);
 
+  // ── ACTIVITY HEARTBEAT — reuses the idle-detection state above so "active
+  // hours" means exactly what it says: only pings while the user is actually
+  // interacting, not just sitting logged in overnight. Every logged-in user
+  // reports their own activity (no access check on the ping itself — that
+  // matches them already being able to see their own inbox); who can VIEW
+  // everyone's summary is gated separately, server-side, via
+  // activity_access.json.
+  useEffect(() => {
+    const userEmail = localStorage.getItem("userEmail") || "";
+    if (!userEmail) return;
+
+    const sendPing = () => {
+      axios.post(`${API_BASE}/activity/ping`, {
+        user_email: userEmail,
+        device_id: getDeviceId(),
+        device_label: getDeviceLabel(),
+      }).catch(() => {}); // best-effort — a missed heartbeat just means one fewer sample
+    };
+
+    if (isIdle) return; // paused while idle — no interval, no immediate ping
+
+    sendPing(); // one right away so "active now" doesn't wait a full interval
+    const interval = setInterval(sendPing, 60 * 1000);
+    return () => clearInterval(interval);
+  }, [isIdle]);
+
   // ✅ VERIFIED: Auto-refresh effect with logging
   useEffect(() => {
     console.log("🔥 isIdle:", isIdle, "AutoSync:", autoSyncEnabled);
@@ -646,6 +691,26 @@ function Dashboard() {
   // DashboardView manages this internally now
 
   // --- STEP 4: UPDATED FETCH FUNCTION TO RESTORE SELECTION ---
+  // Restore selected email after a refresh — but only update AI fields
+  // (category, summary, priority) so the user's reply draft and parsed
+  // thread state are preserved. Replacing the entire object would trigger
+  // useEffect([selectedEmail]) which resets parsedThread and clears replyDraft.
+  const restoreSelectionFields = (data, currentSelectedId) => {
+    if (!currentSelectedId) return;
+    const updatedEmail = data.find(e => (e.id || e.messageId) === currentSelectedId);
+    if (!updatedEmail) return;
+    setSelectedEmail(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        category:  updatedEmail.category  || prev.category,
+        summary:   updatedEmail.summary   || prev.summary,
+        priority:  updatedEmail.priority  || prev.priority,
+        isRead:    updatedEmail.isRead     ?? prev.isRead,
+      };
+    });
+  };
+
   const fetchAndAnalyze = async (arg) => {
     const silent = arg === true;
     const currentSelectedId = selectedEmailId; // Capture current ID
@@ -658,80 +723,104 @@ function Dashboard() {
       setIsSoftSyncing(true);
     }
 
-    if (!silent) setInboxReady(false);   // only block UI on manual refresh
-
     if (!silent) {
+      setInboxReady(false);   // only block UI on manual refresh
+      setInboxError(false);
       addToast("Syncing Inbox...", "loading");
       setLoading(true);
     }
-    
+
+    const userEmail = localStorage.getItem("userEmail");
+
+    const fetchStats = () => {
+      // Fetch exact triage stats from EWS — non-blocking background call
+      axios.get(`${API_BASE}/mail-stats`, {
+        params: { userEmail, count: 700 }
+      }).then(statsRes => setMailStats(statsRes.data))
+        .catch(err => console.warn("mail-stats fetch failed:", err.message));
+    };
+
+    const markSynced = () => {
+      const now = new Date().toISOString();
+      localStorage.setItem("lastSyncTime", now);
+      setLastSyncTime(now);
+    };
+
     try {
-      // ✅ FIXED: Send email as param; backend builds the full API URL
-      const userEmail = localStorage.getItem("userEmail");
+      if (silent) {
+        // 🟢 SILENT AUTO-SYNC — the user is idle and not watching, so there's
+        // no perceived wait to shave off. Fetch the full inbox in one shot
+        // (as before) rather than risking a visible list-size flicker from
+        // a two-phase merge while nobody asked for a faster paint.
+        const res = await axios.get(`${API_BASE}/fetch-inbox`, {
+          params: { email: userEmail, count: FULL_FETCH_COUNT },
+          timeout: 130000
+        });
 
-      const res = await axios.get(`${API_BASE}/fetch-inbox`, {
-        params: { email: userEmail }
-      });
-      
-      if (Array.isArray(res.data)) {
-        if (!silent) {
-          addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
-        }
-
-        // 🟢 SILENT AUTO-SYNC → DO NOT overwrite UI yet
-        if (silent) {
+        if (Array.isArray(res.data)) {
           await runAnalysis(res.data, true);
-        } 
-        // 🔵 MANUAL REFRESH → normal behavior
-        else {
-          setEmails(res.data);
-          setInboxReady(true);
-          await runAnalysis(res.data, false);
+          fetchStats();
+          restoreSelectionFields(res.data, currentSelectedId);
+          markSynced();
         }
-
-        // Fetch exact triage stats from EWS — non-blocking background call
-        axios.get(`${API_BASE}/mail-stats`, {
-          params: { userEmail, count: 700 }
-        }).then(statsRes => setMailStats(statsRes.data))
-          .catch(err => console.warn("mail-stats fetch failed:", err.message));
-
-        // Restore selected email after refresh — but only update AI fields
-        // (category, summary, priority) so the user's reply draft and parsed
-        // thread state are preserved. Replacing the entire object would trigger
-        // useEffect([selectedEmail]) which resets parsedThread and clears replyDraft.
-        if (currentSelectedId) {
-          const updatedEmail = res.data.find(
-            e => (e.id || e.messageId) === currentSelectedId
-          );
-          if (updatedEmail) {
-            setSelectedEmail(prev => {
-              if (!prev) return prev;
-              // Merge only non-destructive fields — leave body, messages, etc. intact
-              return {
-                ...prev,
-                category:  updatedEmail.category  || prev.category,
-                summary:   updatedEmail.summary   || prev.summary,
-                priority:  updatedEmail.priority  || prev.priority,
-                isRead:    updatedEmail.isRead     ?? prev.isRead,
-              };
-            });
-          }
-        }
-
-        const now = new Date().toISOString();
-        localStorage.setItem("lastSyncTime", now);
-        setLastSyncTime(now);
-      } else { 
-        if (!silent) addToast("Error: API returned unexpected format.", "error"); 
+        return;
       }
-    } catch (err) { 
-      if (!silent) addToast(`Sync Error: ${err.message}`, "error"); 
-    } finally {
-        if (silent) {
-          setIsSoftSyncing(false);
-        } else {
-          setLoading(false);
+
+      // 🔵 MANUAL / INITIAL REFRESH — the user is watching this one.
+      // PHASE 1: small fast batch first, so the inbox paints almost instantly
+      // instead of waiting on all 500 emails from the org server.
+      const fastRes = await axios.get(`${API_BASE}/fetch-inbox`, {
+        params: { email: userEmail, count: FAST_FETCH_COUNT },
+        timeout: 30000
+      });
+
+      if (!Array.isArray(fastRes.data)) {
+        addToast("Error: API returned unexpected format.", "error");
+        setInboxError(true);
+        setInboxReady(true);
+        return;
+      }
+
+      addToast(`Loaded your latest ${fastRes.data.length} emails — analyzing…`, "success");
+      setEmails(fastRes.data);
+      setInboxReady(true);
+      await runAnalysis(fastRes.data, false);
+      restoreSelectionFields(fastRes.data, currentSelectedId);
+      fetchStats();
+      markSynced();
+      setLoading(false);   // unblock the UI now — phase 2 continues quietly below
+
+      // PHASE 2: fetch the full inbox in the background and merge it in.
+      // Emails already shown (and already analyzed) win over the raw
+      // re-fetched copy for the same id — dedupeById keeps the *last*
+      // entry per id, and `prev` (already-analyzed) is placed last below.
+      setIsFetchingFullInbox(true);
+      try {
+        const fullRes = await axios.get(`${API_BASE}/fetch-inbox`, {
+          params: { email: userEmail, count: FULL_FETCH_COUNT },
+          timeout: 130000
+        });
+
+        if (Array.isArray(fullRes.data)) {
+          setEmails(prev => dedupeById([...fullRes.data, ...prev]));
+          await runAnalysis(fullRes.data, true);   // silent=true → no second "Inbox loaded!" toast
+          restoreSelectionFields(fullRes.data, currentSelectedId);
+          markSynced();
         }
+      } catch (err) {
+        console.warn("Background full-inbox sync failed; fast batch remains shown:", err.message);
+      } finally {
+        setIsFetchingFullInbox(false);
+      }
+    } catch (err) {
+      if (!silent) {
+        addToast(`Sync Error: ${err.message}`, "error");
+        setInboxError(true);
+        setInboxReady(true);   // stop the infinite "Syncing inbox..." spinner
+      }
+    } finally {
+      if (silent) setIsSoftSyncing(false);
+      setLoading(false);
     }
   };
 
@@ -878,7 +967,7 @@ function Dashboard() {
         const userEmail = localStorage.getItem("userEmail") || "default";
         startPolling(userEmail);
       }
-      if (!silent) addToast("Inbox loaded!", "success");
+      if (!silent) addToast("Recent emails ready — syncing the rest of your inbox…", "success");
 
     } catch (err) {
       console.error(err);
@@ -1256,10 +1345,12 @@ function Dashboard() {
       // --- NEW PROPS PASSED DOWN ---
       lastSyncTime={lastSyncTime}
       inboxReady={inboxReady}
+      inboxError={inboxError}
       isSoftSyncing={isSoftSyncing}
       autoSyncEnabled={autoSyncEnabled}
       setAutoSyncEnabled={setAutoSyncEnabled}
       isAnalyzingBackground={isAnalyzingBackground}
+      isFetchingFullInbox={isFetchingFullInbox}
 
       // Digest — complete 7-day EWS-sourced digest (no email gaps)
       autoDigest={autoDigest}
@@ -1269,6 +1360,7 @@ function Dashboard() {
       senderFilter={senderFilter}
       setSenderFilter={setSenderFilter}
       canUseTracking={canUseTracking}
+      canUseActivity={canUseActivity}
 
       // Flag / AI correction
       flagOpen={flagOpen}

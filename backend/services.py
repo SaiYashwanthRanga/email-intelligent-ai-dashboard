@@ -258,7 +258,7 @@ JSON format:
 # 1. SETUP AI CLIENT
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
-ACTIVE_MODEL = "gpt-5.4-mini"
+ACTIVE_MODEL = "gpt-4o-mini"
 
 if not api_key:
     log.critical("OPENAI_API_KEY is missing from .env file!")
@@ -325,6 +325,132 @@ def is_tracking_allowed(user_email: str) -> bool:
     """
     _load_tracking_allowed()   # reload from disk each time — file is tiny
     return user_email.lower().strip() in _TRACKING_ALLOWED_USERS
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── ACTIVITY ACCESS CONTROL ──────────────────────────────────────────────────
+# The activity view shows every user's active hours and devices — that's
+# other people's data, not just the viewer's own, so it's gated the same way
+# tracking access is: only emails listed in activity_access.json can see it.
+# Edit that file to add/remove viewers — no code change or restart required.
+ACTIVITY_ACCESS_FILE = "activity_access.json"
+_ACTIVITY_ALLOWED_USERS: set = set()
+
+def _load_activity_allowed():
+    global _ACTIVITY_ALLOWED_USERS
+    users = load_sender_list(ACTIVITY_ACCESS_FILE)
+    _ACTIVITY_ALLOWED_USERS = {u.lower().strip() for u in users}
+
+_load_activity_allowed()   # run once at startup
+
+def is_activity_allowed(user_email: str) -> bool:
+    """Return True if user_email may view the (everyone's) activity summary."""
+    _load_activity_allowed()
+    return (user_email or "").lower().strip() in _ACTIVITY_ALLOWED_USERS
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── ACTIVITY TRACKING — active hours + device, per user ─────────────────────
+# Storage is bucketed by hour rather than one row per heartbeat, so a user
+# active every day for a year stays at ~24 counters/day instead of one row
+# every ~60s forever. "Device" is best-effort: browsers don't expose a real
+# OS-level device/computer name to a web page, so this is a persistent
+# per-browser id (generated client-side, see deviceIdentity.js) paired with
+# an OS+browser label sniffed from the user agent — the same physical laptop
+# shows up as a "different device" if the person switches browsers or clears
+# site data.
+ACTIVITY_LOG_FILE = "activity_log.json"
+_activity_lock = threading.Lock()
+ACTIVITY_RETENTION_DAYS = 60   # drop hour-buckets older than this on write
+
+def _load_activity_log() -> dict:
+    if os.path.exists(ACTIVITY_LOG_FILE):
+        try:
+            with open(ACTIVITY_LOG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_activity_log(data: dict):
+    with open(ACTIVITY_LOG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _parse_hour_key(key: str):
+    try:
+        return datetime.strptime(key, "%Y-%m-%dT%H")
+    except Exception:
+        return datetime.min
+
+def record_activity_ping(user_email: str, device_id: str, device_label: str = "") -> None:
+    """Record one heartbeat from an active (non-idle) browser tab."""
+    user_email = (user_email or "").lower().strip()
+    device_id  = (device_id or "").strip()
+    if not user_email or not device_id:
+        return
+
+    now      = datetime.now()
+    hour_key = now.strftime("%Y-%m-%dT%H")
+    now_iso  = now.isoformat()
+
+    with _activity_lock:
+        data = _load_activity_log()
+        user_entry = data.setdefault(user_email, {"devices": {}, "hourBuckets": {}, "lastSeen": now_iso})
+        user_entry["lastSeen"] = now_iso
+
+        device_entry = user_entry["devices"].setdefault(device_id, {"firstSeen": now_iso})
+        device_entry["label"]    = device_label or device_entry.get("label", "Unknown device")
+        device_entry["lastSeen"] = now_iso
+
+        buckets = user_entry.setdefault("hourBuckets", {})
+        buckets[hour_key] = buckets.get(hour_key, 0) + 1
+
+        cutoff = now - timedelta(days=ACTIVITY_RETENTION_DAYS)
+        user_entry["hourBuckets"] = {k: v for k, v in buckets.items() if _parse_hour_key(k) >= cutoff}
+
+        _save_activity_log(data)
+
+def get_activity_summary(days: int = 14) -> list:
+    """
+    Per-user summary for the activity dashboard: last-seen time, whether
+    they're active right now (pinged in the last 3 minutes — 3x the
+    frontend's 60s heartbeat interval, to absorb one missed beat), the
+    devices seen, and hour-bucketed activity counts for the requested window.
+    """
+    with _activity_lock:
+        data = _load_activity_log()
+
+    now    = datetime.now()
+    cutoff = now - timedelta(days=days)
+    result = []
+
+    for user_email, entry in data.items():
+        buckets = {
+            k: v for k, v in entry.get("hourBuckets", {}).items()
+            if _parse_hour_key(k) >= cutoff
+        }
+
+        last_seen_raw = entry.get("lastSeen")
+        try:
+            last_seen_dt = datetime.fromisoformat(last_seen_raw) if last_seen_raw else None
+        except Exception:
+            last_seen_dt = None
+        is_active_now = bool(last_seen_dt and (now - last_seen_dt) <= timedelta(minutes=3))
+
+        devices = [
+            {"deviceId": did, "label": d.get("label", "Unknown device"), "lastSeen": d.get("lastSeen")}
+            for did, d in entry.get("devices", {}).items()
+        ]
+        devices.sort(key=lambda d: d.get("lastSeen") or "", reverse=True)
+
+        result.append({
+            "userEmail":    user_email,
+            "lastSeen":     last_seen_raw,
+            "isActiveNow":  is_active_now,
+            "devices":      devices,
+            "hourBuckets":  buckets,   # { "2026-09-02T14": <ping count>, ... }
+        })
+
+    result.sort(key=lambda u: u.get("lastSeen") or "", reverse=True)
+    return result
 # ────────────────────────────────────────────────────────────────────────────
 # Domain-based matching for legal firms (catches any address at these firms)
 LEGAL_DOMAINS     = ["ropesgray.com", "garfunkelwild.com", "jclancylaw.com", "ambpclaw.com"]
@@ -616,7 +742,7 @@ def _cache_file_for(user_email: str) -> str:
 # Bump this string any time the cache schema or AI logic changes.
 # Any cache file written with a different version will be discarded
 # automatically on next load, forcing a clean re-analysis.
-CACHE_VERSION = "v10"  # bumped: newsletter fast-path — skip AI for detected newsletters, fixes healthcare publication misclassification
+CACHE_VERSION = "v11"  # bumped: id-cache entries drop the full body (see save_emails_to_id_cache) and gain isMeetingInvite
 CACHE_VERSION_KEY = "meta_cache_version"
 
 def load_cache(user_email: str = "default"):
@@ -690,6 +816,29 @@ def set_last_email_count(count, user_email: str):
 def get_cached_emails_by_id(user_email: str) -> dict:
     return load_cache(user_email).get(EMAIL_ID_CACHE_KEY, {})
 
+# Phrases/domains that mean "this is a meeting/call invite" — mirrors the
+# sniff InboxView.jsx runs over email.body to decide whether to show the
+# RSVP bar on a card. Kept in sync deliberately: we compute this once here,
+# while the body is still around, then drop the body from what gets cached
+# (see save_emails_to_id_cache) so the flag substitutes for the body on
+# every future cache hit instead of re-shipping the full HTML forever.
+_MEETING_INVITE_SIGNALS = (
+    "you're invited", "you are invited", "meeting request", "has invited you",
+    "join the meeting", "join meeting", "zoom.us", "teams.microsoft.com",
+    "meet.google.com", "webex.com",
+)
+
+def _detect_meeting_invite(entry: dict) -> bool:
+    bodies = [entry.get("body") or ""]
+    bodies += [m.get("body") or "" for m in (entry.get("messages") or [])]
+    combined = " ".join(bodies).lower()
+    if any(sig in combined for sig in _MEETING_INVITE_SIGNALS):
+        return True
+    return any(
+        (a.get("name") or "").lower().endswith(".ics")
+        for a in (entry.get("attachments") or [])
+    )
+
 def save_emails_to_id_cache(emails: list, user_email: str):
     existing = get_cached_emails_by_id(user_email)
     for e in emails:
@@ -697,6 +846,22 @@ def save_emails_to_id_cache(emails: list, user_email: str):
         if eid:
             entry = e.copy()
             entry.pop("full_hash", None)
+
+            # The full HTML body is only needed once: to feed the AI during
+            # analysis and to detect a meeting-invite signal. Every sync
+            # after that (this session's Phase 2, and every future session)
+            # was re-shipping it for emails whose analysis never changes.
+            # Capture the one signal derived from it, then drop it — the
+            # detail view (fetchEmailDetails) re-fetches the real body on
+            # open, so nothing else reads it from the cached copy.
+            entry["isMeetingInvite"] = _detect_meeting_invite(entry)
+            entry.pop("body", None)
+            if entry.get("messages"):
+                entry["messages"] = [
+                    {k: v for k, v in m.items() if k != "body"}
+                    for m in entry["messages"]
+                ]
+
             existing[eid] = entry
     save_cache({EMAIL_ID_CACHE_KEY: existing}, user_email)
 
@@ -2035,7 +2200,7 @@ def get_business_days_since(sent_at_str: str) -> int:
 async def fetch_sent_items_for_tracking(user_email: str, count: int = 100) -> list:
     """Call GET /api/Values/sentitems/{email}/count{n} on the .NET server."""
     import httpx as _httpx
-    url = f"http://172.22.6.145/api/Values/sentitems/{user_email}/count{count}"
+    url = f"http://172.22.6.188:177/api/Values/sentitems/{user_email}/count{count}"
     try:
         async with _httpx.AsyncClient(timeout=60) as hc:
             resp = await hc.get(url)
@@ -2147,7 +2312,7 @@ async def _send_reminder(
     sent_at: str,
     orig_body: str,
     sender_first: str,
-    org: str = "http://172.22.6.98",
+    org: str = "http://172.22.6.188:177",
 ) -> bool:
     """
     Generate AI body and send one reminder immediately.
@@ -2370,7 +2535,7 @@ async def run_tracking_scheduler(user_email: str):
               on the same run that Day-1 fires when already >= 3 bdays.
     """
     import httpx as _httpx
-    ORG = "http://172.22.6.145"
+    ORG = "http://172.22.6.188:177"
     log.info(f"[tracking] Scheduler start — user={user_email}")
 
     try:
@@ -2536,6 +2701,15 @@ async def run_tracking_scheduler(user_email: str):
             for item in reply_items:
                 recipients = _build_recipients(item)
                 if not recipients:
+                    append_not_tracked(user_email, {
+                        "messageId": item.get("messageId", ""),
+                        "subject":   item.get("subject", "(no subject)"),
+                        "sentAt":    item.get("sentAt", ""),
+                        "to":        item.get("to", []), "cc": item.get("cc", []),
+                        "reason":    "No trackable recipients (all excluded from tracking)",
+                        "skippedAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+                        "body":      (item.get("body") or "")[:5000],
+                    })
                     continue
                 _queue_approval(item, recipients, "thread reply — bypass AI")
 
@@ -2590,6 +2764,13 @@ async def run_tracking_scheduler(user_email: str):
                         }
 
                     if not recipients:
+                        append_not_tracked(user_email, {
+                            "messageId": msg_id, "subject": subject, "sentAt": sent_at,
+                            "to":        item.get("to", []), "cc": item.get("cc", []),
+                            "reason":    "AI chose to track, but no trackable recipients remained after exclusions",
+                            "skippedAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+                            "body":      (item.get("body") or "")[:5000],
+                        })
                         continue
 
                     _queue_approval(item, recipients, decision.get("reason", ""))
@@ -2707,7 +2888,7 @@ async def approve_tracking_decision(user_email: str, approval_id: str) -> dict:
     for the next scheduler cycle.
     """
     import httpx as _httpx
-    ORG = "http://172.22.6.145"
+    ORG = "http://172.22.6.188:177"
 
     tracking  = load_tracking(user_email)
     approvals = tracking.get("pending_tracking_approvals", [])

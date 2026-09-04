@@ -26,6 +26,14 @@ class SendEmailRequest(BaseModel):
     subject: str
     bodyHtml: str
 
+# Activity tracking — heartbeat from an active browser tab (see services.py
+# record_activity_ping for the storage shape and retention policy).
+class ActivityPingRequest(BaseModel):
+    user_email: str
+    device_id: str      # persistent per-browser id, generated client-side
+    device_label: str = ""  # best-effort "OS • Browser" — see deviceIdentity.js;
+                             # browsers don't expose a real device/computer name
+
 # Iris — Inbox Assistant (Phase 3: grounded snapshot + tool-calling)
 class IrisChatRequest(BaseModel):
     message: str

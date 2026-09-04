@@ -277,12 +277,20 @@ body {
   -webkit-backdrop-filter: blur(16px) saturate(180%);
   box-shadow: 0 6px 18px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.10);
 }
-.view-btn { 
+.view-btn {
   position: relative;
   overflow: hidden;
-  border: none; background: none; padding: 9px 20px; border-radius: 999px; cursor: pointer; 
+  border: none; background: none; padding: 9px 20px; border-radius: 999px; cursor: pointer;
   font-weight: 700; color: var(--text-secondary); display: flex; align-items: center; gap: 8px; font-size: 0.9rem;
   transition: transform 0.16s cubic-bezier(0.2,0,0,1), color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+/* Uniform icon rendering across the whole top bar — every icon here is an
+   inline SVG (not emoji, which renders at a platform/font-dependent size and
+   weight and drifts out of alignment with its neighbors), each pinned with
+   flex-shrink: 0 so it can never get squashed when its pill runs out of
+   room at a narrow window width or aspect ratio. */
+.view-btn svg, .menu-btn svg, .bubble-btn svg {
+  flex-shrink: 0;
 }
 .view-btn:hover { color: var(--text-primary); transform: translateY(-1px); }
 .view-btn:active { transform: translateY(0) scale(0.97); }
@@ -333,6 +341,18 @@ body {
 .bubble-sync {
   padding: 7px 16px;
   font-size: 0.78rem;
+}
+/* Status dot replacing the old 🟢/⛔ emoji — a CSS-drawn circle instead of a
+   font glyph renders at the exact same size and position on every platform,
+   and its glow works in both themes without a separate light-mode override. */
+.sync-dot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 6px rgba(255,255,255,0.85);
 }
 .bubble-sync-on {
   background: linear-gradient(160deg, rgba(74,222,128,0.6) 0%, rgba(22,163,74,0.6) 100%);
@@ -666,11 +686,11 @@ body.light-mode .sticky-folders-header {
 .active .count-badge { background: #00d9ff; color: #0a0e27; border: none; font-weight: 800; }
 
 .email-feed { display: grid; gap: 12px; }
-.email-card { 
-  background: linear-gradient(135deg, rgba(15, 23, 41, 0.8) 0%, rgba(26, 35, 66, 0.5) 100%);
-  border-radius: 12px; overflow: hidden; display: flex; 
+.email-card {
+  background: linear-gradient(135deg, rgba(15, 23, 41, 0.92) 0%, rgba(26, 35, 66, 0.85) 100%);
+  border-radius: 12px; overflow: hidden; display: flex;
   border: var(--glass-border); box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-  cursor: pointer; backdrop-filter: blur(10px);
+  cursor: pointer;
 }
 .email-card:hover { 
   transform: translateY(-4px); 

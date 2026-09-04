@@ -3,6 +3,10 @@ backend/venv/
 backend/__pycache__/
 backend/.env
 backend/cache_*.json
+# Per-user runtime data (mirrors cache_*.json — not source, regenerated per user/server)
+backend/tracking_*@*.json
+backend/not_tracked_*@*.json
+backend/activity_log.json
 
 # Node frontend
 frontend-new/node_modules/
@@ -13,4 +17,6 @@ frontend/
 
 # Editor/OS
 .vscode/
+backend/.claude/
+backend/*.code-workspace
 Thumbs.db

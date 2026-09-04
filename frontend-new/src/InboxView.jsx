@@ -195,7 +195,10 @@ export function FolderPickerDropdown({ senderEmail, onPick, onClose }) {
 
 export function HtmlEmailRenderer({ body, darkMode = false }) {
   const iframeRef = React.useRef(null);
+  const resizeObserverRef = React.useRef(null);
   const [iframeHeight, setIframeHeight] = useState(200);
+
+  useEffect(() => () => resizeObserverRef.current?.disconnect(), []);
 
   const srcDoc = React.useMemo(() => {
     if (!body) return "";
@@ -253,7 +256,18 @@ export function HtmlEmailRenderer({ body, darkMode = false }) {
         if (h > 0) setIframeHeight(h + 20);
       };
       resize();
-      setTimeout(resize, 600);
+
+      // Newsletter-style emails keep growing after load as images/fonts finish —
+      // a one-shot timeout can lock the height in too short and clip content.
+      // Keep watching for as long as this document is displayed.
+      resizeObserverRef.current?.disconnect();
+      const RO = iframeRef.current?.contentWindow?.ResizeObserver;
+      if (RO) {
+        resizeObserverRef.current = new RO(resize);
+        resizeObserverRef.current.observe(doc.documentElement);
+      } else {
+        setTimeout(resize, 600); // fallback if ResizeObserver is ever unavailable
+      }
     } catch (_) {}
   }, []);
 
@@ -286,6 +300,10 @@ const DEFAULT_FORWARD_STATE = {
   showForward: false, forwardBody: "", forwardTo: "", forwardCc: "",
   sending: false, attachments: []
 };
+// A stable reference (not a fresh {} literal per call) so EmailCard's
+// React.memo comparison doesn't see a "changed" prop for every row that
+// hasn't touched RSVP yet — see getRsvpState below.
+const DEFAULT_RSVP_STATE = { status: null, loading: false };
 
 const formatFileSize = (bytes) => {
   if (!bytes) return "";
@@ -552,6 +570,310 @@ function TrackingCard({ item, onDismiss, onFollowUp, readOnly }) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── EmailCard ────────────────────────────────────────────────────────────────
+// Split out from InboxView's list .map() and wrapped in React.memo so that
+// editing a reply/forward box, checking a box, or opening a dropdown on ONE
+// card no longer re-renders every other mounted card. For that memoization to
+// actually take effect, every prop below must either be a plain value that's
+// only different when the row's own state is (isChecked, isActive, replyState,
+// etc. — computed fresh each InboxView render, but referentially stable for
+// untouched rows) or a function whose identity doesn't change on every
+// keystroke (see the useCallback/getter fixes next to their definitions in
+// InboxView). This component MUST stay defined at module scope — defining it
+// inside InboxView would make React treat every card as a brand-new component
+// type on every render, which defeats memoization entirely (worse than before).
+const EmailCard = React.memo(function EmailCard({
+  email, isChecked, isActive, replyState, forwardState,
+  isFlagOpen, isFolderPickerOpen, rsvpState, isReplyAllLoading,
+  isFlagSubmitting, isFlagSuccess,
+  onOpen, onToggleCheck, onMarkRead, onFlagToggle, onFolderPickerToggle,
+  onSubmitCorrection, onRequestAddMembers, onDownloadFile,
+  isFileDownloading, getFileProgress, onRsvp, setInlineRsvpState,
+  onReplyChange, onForwardChange, onReplyAttach, onRemoveReplyAttachment,
+  onGenerateAiReply, onSendReply, onReplyAll, onSendForward,
+  getEmailBody, formatDate, getEffectiveReceivedAt,
+}) {
+  const navigate = useNavigate();
+  const atts    = email.attachments || [];
+  const emailId = email.id || email.messageId;
+
+  return (
+    <div key={emailId}
+      className={`email-card ${!email.isRead ? "unread-mail" : ""} ${isActive ? "active" : ""} border-${(email.category || 'normal').toLowerCase()}`}
+      // content-visibility:auto is the actual scroll fix: the list keeps growing
+      // (visibleCount only ever goes up as you scroll — see loadMoreSentinelCallback
+      // in InboxView) and every card carries its own box-shadow plus a
+      // backdrop-filter-blurred category badge, so once a few hundred cards have
+      // mounted the browser is doing full layout+paint on all of them on every
+      // scroll frame, even the ones nowhere near the viewport. This tells the
+      // browser to skip layout/paint entirely for off-screen cards without
+      // unmounting them — no scroll-position math, no risk to click handlers or
+      // open dropdowns. contain-intrinsic-size gives it a rough placeholder
+      // height to reserve for cards it hasn't measured yet (below the fold on
+      // first load); "auto" means it remembers the real height once a card has
+      // actually been shown once, so the estimate only matters before that.
+      style={{ display: 'flex', alignItems: 'stretch', padding: 0, overflow: 'hidden', contain: 'content', contentVisibility: 'auto', containIntrinsicSize: 'auto 200px' }}
+      onClick={() => onOpen(email)}>
+
+      <div className="ec-left-border" style={{ flexShrink: 0 }}></div>
+
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 10px', flexShrink: 0, alignSelf: 'center' }}
+        onClick={e => { e.stopPropagation(); onToggleCheck(emailId); }}>
+        <RoundCheckbox checked={isChecked} onClick={e => { e.stopPropagation(); onToggleCheck(emailId); }} />
+      </div>
+
+      <div className="ec-content" style={{ flex: 1, minWidth: 0, padding: '14px 16px 14px 0' }}>
+
+        {/* TOP ROW */}
+        <div className="ec-top" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "8px" }}>
+          <h4 style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", flex: 1, minWidth: 0, margin: 0 }}>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{email.subject || "No Subject"}</span>
+            {(() => { const tc = email.threadCount || email.thread_count || email.messages?.length || 0; return tc > 1 ? (<span style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", fontSize: "0.65rem", fontWeight: "700", padding: "2px 8px", borderRadius: "999px", whiteSpace: "nowrap", flexShrink: 0, letterSpacing: "0.3px" }}>🧵 {tc} messages</span>) : null; })()}
+          </h4>
+          <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
+            <button onClick={(e) => { e.stopPropagation(); onMarkRead(email); }} disabled={email.isRead}
+              style={{ background: email.isRead ? "#22c55e" : "#0ea5e9", color: "white", border: "none", borderRadius: "5px", padding: "3px 8px", fontSize: "0.7rem", cursor: email.isRead ? "not-allowed" : "pointer", fontWeight: "600", whiteSpace: "nowrap", opacity: email.isRead ? 0.6 : 1, flexShrink: 0 }}>
+              {email.isRead ? "✓ Read" : "Mark Read"}
+            </button>
+            <div className="ec-badges" style={{ flexShrink: 0 }}>
+              {email.hasReplied && (<span style={{ background: "#16a34a", color: "white", padding: "2px 8px", borderRadius: "999px", fontSize: "0.65rem", fontWeight: "700", marginLeft: "6px", whiteSpace: "nowrap" }}>↩️ Replied</span>)}
+              {(() => { const cat = (email.category || "PENDING").toUpperCase(); const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL; return <span className={`cat-tag ${cat.toLowerCase()}`} style={{ whiteSpace: "nowrap" }}>{meta.emoji} {meta.label}</span>; })()}
+            </div>
+            {/* Flag button */}
+            <button
+              onClick={e => { e.stopPropagation(); onFlagToggle(isFlagOpen ? null : emailId); }}
+              title="Wrong classification? Flag it"
+              style={{ background: isFlagOpen ? 'rgba(239,68,68,0.12)' : 'transparent', border: `1px solid ${isFlagOpen ? 'rgba(239,68,68,0.3)' : 'transparent'}`, color: isFlagOpen ? '#f87171' : 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
+              onMouseEnter={e => { if (!isFlagOpen) { e.currentTarget.style.background = 'rgba(239,68,68,0.08)'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.2)'; e.currentTarget.style.color = '#f87171'; }}}
+              onMouseLeave={e => { if (!isFlagOpen) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}}
+            >
+              <Flag size={12} /> Flag
+            </button>
+            {/* Add-to-folder button */}
+            <button
+              onClick={e => { e.stopPropagation(); onFolderPickerToggle(isFolderPickerOpen ? null : emailId); }}
+              title="Add sender to a folder"
+              style={{ background: isFolderPickerOpen ? 'rgba(59,130,246,0.12)' : 'transparent', border: `1px solid ${isFolderPickerOpen ? 'rgba(59,130,246,0.3)' : 'transparent'}`, color: isFolderPickerOpen ? '#60a5fa' : 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
+              onMouseEnter={e => { if (!isFolderPickerOpen) { e.currentTarget.style.background = 'rgba(59,130,246,0.08)'; e.currentTarget.style.borderColor = 'rgba(59,130,246,0.2)'; e.currentTarget.style.color = '#60a5fa'; }}}
+              onMouseLeave={e => { if (!isFolderPickerOpen) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}}
+            >
+              <FolderPlus size={12} /> Add to Folder
+            </button>
+          </div>
+        </div>
+
+        {/* META */}
+        <div className="ec-meta">
+          <span title={getEmailSender(email)} style={{ maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><User size={14} /> {getEmailSender(email)}</span>
+          <span><Clock size={14} /> {formatDate(getEffectiveReceivedAt(email))}</span>
+          {Array.isArray(email.cc) && email.cc.length > 0 && (<span className="cc-badge" title={email.cc.join(", ")}><Users size={12} /> CC</span>)}
+        </div>
+
+        {/* SUMMARY */}
+        {email.analyzing
+          ? <div className="ec-body ec-analyzing-text"><span className="analyzing-dot" />AI is writing the summary, please wait...</div>
+          : <div className="ec-body">{email.summary || ""}</div>}
+
+        {/* FLAG DROPDOWN */}
+        {isFlagOpen && (
+          <FlagDropdown
+            email={email}
+            onSubmit={onSubmitCorrection}
+            onClose={() => onFlagToggle(null)}
+            submitting={isFlagSubmitting}
+            success={isFlagSuccess}
+          />
+        )}
+
+        {/* ADD-TO-FOLDER DROPDOWN */}
+        {isFolderPickerOpen && (() => {
+          const senderEmail = extractEmail(getEmailSender(email));
+          return (
+            <FolderPickerDropdown
+              senderEmail={senderEmail}
+              onClose={() => onFolderPickerToggle(null)}
+              onPick={(folderName) => {
+                onFolderPickerToggle(null);
+                onRequestAddMembers(folderName, MANAGEABLE_META[folderName]?.label || folderName, [senderEmail]);
+              }}
+            />
+          );
+        })()}
+
+
+        {/* ATTACHMENTS */}
+        {atts.length > 0 && (
+          <div className="ec-atts">
+            <Paperclip size={14} />
+            {atts.map((a, k) => (
+              <div key={k} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
+                <span style={{ flex: 1 }}>{a.name || a.file_name || "File"}<span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>{formatFileSize(a.size)}</span></span>
+                <button onClick={(e) => { e.stopPropagation(); onDownloadFile({ ...a, attachmentId: a.attachmentId }, email.messageId || email.id); }}
+                  disabled={isFileDownloading(a, email.messageId || email.id)}
+                  style={{ backgroundColor: isFileDownloading(a, email.messageId || email.id) ? "#9ca3af" : "#0ea5e9", cursor: isFileDownloading(a, email.messageId || email.id) ? "not-allowed" : "pointer", color: "white", padding: "6px 12px", borderRadius: "6px", border: "none", display: "flex", alignItems: "center", gap: "6px" }}>
+                  {isFileDownloading(a, email.messageId || email.id) ? <><Loader size={14} className="animate-spin" /> {getFileProgress(a, email.messageId || email.id)}%</> : <><Download size={16} /> Download</>}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* RSVP — MEETING & ZOOM INVITES */}
+        {(email.category === "MEETING" || email.category === "ZOOM") && (() => {
+          const _subj = (email.subject || "").trim();
+          if (/^(accepted|declined|tentative|re|fw|fwd|aw|tr)\s*:/i.test(_subj)) return null;
+          // email.body is only present for emails fetched fresh this session
+          // (new mail, or ones already opened). Cache-hit rows from a prior
+          // sync carry isMeetingInvite instead — computed server-side from the
+          // body once, then the body itself is dropped to keep syncs light
+          // (see save_emails_to_id_cache in services.py). Fall back to the
+          // live body scan whenever it's actually available.
+          const _body = (email.body || "").toLowerCase();
+          const _hasSignal = email.body
+            ? (_body.includes("you're invited") || _body.includes("you are invited") || _body.includes("meeting request") || _body.includes("has invited you") || _body.includes("join the meeting") || _body.includes("join meeting") || _body.includes("zoom.us") || _body.includes("teams.microsoft.com") || _body.includes("meet.google.com") || _body.includes("webex.com") || (email.attachments || []).some(a => (a.name || "").toLowerCase().endsWith(".ics")))
+            : (email.isMeetingInvite === true);
+          if (!_hasSignal) return null;
+          const rsvp = rsvpState;
+          const statusColors = {
+            accepted:  { bg: "rgba(22,163,74,0.12)",  border: "rgba(22,163,74,0.35)",  color: "#4ade80", label: "✓ Accepted" },
+            declined:  { bg: "rgba(239,68,68,0.12)",  border: "rgba(239,68,68,0.35)",  color: "#f87171", label: "✗ Declined" },
+            tentative: { bg: "rgba(245,158,11,0.12)", border: "rgba(245,158,11,0.35)", color: "#fbbf24", label: "? Maybe"    },
+          };
+          const done = statusColors[rsvp.status];
+          return (
+            <div onClick={e => e.stopPropagation()} style={{ marginTop: "12px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", padding: "10px 12px", background: done ? done.bg : "rgba(255,255,255,0.03)", border: `1px solid ${done ? done.border : "var(--border-color)"}`, borderRadius: "8px" }}>
+              {rsvp.error && !done && (<div style={{ width: "100%", marginBottom: "6px", fontSize: "0.75rem", color: "#f87171", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: "6px", padding: "5px 10px" }}>⚠️ RSVP failed — this invite may need to be accepted from the Calendar view. <span style={{ opacity: 0.6 }}>({rsvp.error})</span></div>)}
+              {rsvp.useCalendar && !done && (
+                <div style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: "0.78rem", color: "#93c5fd" }}>📅 This invite can only be accepted from the Calendar</span>
+                  <button onClick={e => { e.stopPropagation(); navigate('/calendar'); }} style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", border: "none", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: "pointer", display: "flex", alignItems: "center", gap: "6px", boxShadow: "0 3px 10px rgba(0,217,255,0.35)" }}>📅 Open Calendar →</button>
+                </div>
+              )}
+              {done ? (
+                <>
+                  <span style={{ fontSize: "0.82rem", fontWeight: "700", color: done.color }}>{done.label}</span>
+                  <button onClick={() => setInlineRsvpState(prev => ({ ...prev, [emailId]: { status: null, loading: false } }))} style={{ background: "transparent", border: "1px solid var(--border-color)", color: "var(--text-secondary)", borderRadius: "5px", padding: "2px 9px", fontSize: "0.72rem", fontWeight: "600", cursor: "pointer" }}>Change</button>
+                </>
+              ) : (
+                <>
+                  <span style={{ fontSize: "0.72rem", fontWeight: "700", letterSpacing: "0.8px", color: "var(--text-secondary)", textTransform: "uppercase", marginRight: "4px" }}>{email.category === "ZOOM" ? "📹 Zoom Invite" : "📅 Meeting Invite"}</span>
+                  <button onClick={e => { e.stopPropagation(); onRsvp(email, "Accept"); }} disabled={rsvp.loading} style={{ background: "linear-gradient(135deg, #16a34a, #15803d)", color: "white", border: "none", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: rsvp.loading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "5px", boxShadow: "0 3px 10px rgba(22,163,74,0.3)", opacity: rsvp.loading ? 0.6 : 1 }}>
+                    {rsvp.loading ? <Loader size={13} className="animate-spin" /> : "✓"} Accept
+                  </button>
+                  <button onClick={e => { e.stopPropagation(); onRsvp(email, "Tentative"); }} disabled={rsvp.loading} style={{ background: "rgba(245,158,11,0.12)", color: "#fbbf24", border: "1px solid rgba(245,158,11,0.35)", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: rsvp.loading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "5px", opacity: rsvp.loading ? 0.6 : 1 }}>? Maybe</button>
+                  <button onClick={e => { e.stopPropagation(); onRsvp(email, "Decline"); }} disabled={rsvp.loading} style={{ background: "rgba(239,68,68,0.08)", color: "#f87171", border: "1px solid rgba(239,68,68,0.25)", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: rsvp.loading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "5px", opacity: rsvp.loading ? 0.6 : 1 }}>✗ Decline</button>
+                </>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* INLINE REPLY */}
+        {replyState.showReply && !forwardState.showForward && (
+          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: "16px", padding: "16px", borderTop: "1px solid var(--border-color)", background: "var(--bg-card)", borderRadius: "8px" }}>
+            {replyState.isReplyAll && (<div style={{ display: "inline-flex", alignItems: "center", gap: "6px", background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.25)", borderRadius: "6px", padding: "4px 10px", fontSize: "0.75rem", fontWeight: "700", color: "#3b82f6", marginBottom: "12px" }}>↩️↩️ Reply All — replying to all recipients</div>)}
+            <div style={{ marginBottom: "10px", display: "flex", flexDirection: "column", gap: "12px" }}>
+              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="To" value={replyState.replyTo} onChange={(newValue) => onReplyChange(emailId, { replyTo: newValue })} placeholder="Search contacts or enter email..." /></div>
+              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="CC" value={replyState.replyCc} onChange={(newValue) => onReplyChange(emailId, { replyCc: newValue })} placeholder="Optional - Search contacts or enter email..." /></div>
+            </div>
+            <textarea placeholder="Type your reply..." value={replyState.replyBody} onClick={(e) => e.stopPropagation()} onFocus={(e) => e.stopPropagation()} onChange={(e) => onReplyChange(emailId, { replyBody: e.target.value })} style={{ width: "100%", minHeight: "90px", padding: "10px", borderRadius: "6px", border: "1px solid var(--border-color)", background: "var(--bg-main)", color: "var(--text-primary)", resize: "vertical" }} />
+            <div style={{ marginTop: "10px", marginBottom: "10px" }}>
+              <input type="file" multiple id={`reply-attach-${emailId}`} style={{ display: "none" }} onChange={(e) => onReplyAttach(emailId, e.target.files)} />
+              <label htmlFor={`reply-attach-${emailId}`} onClick={(e) => e.stopPropagation()} style={{ background: "#f3f4f6", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "0.8rem", fontWeight: "600", color: "#374151", display: "inline-flex", alignItems: "center", gap: "5px" }}>
+                <Paperclip size={14} /> Attach Files
+              </label>
+            </div>
+            {replyState.attachments.length > 0 && (
+              <div style={{ marginBottom: "10px", padding: "8px", background: "var(--bg-main)", borderRadius: "6px" }}>
+                {replyState.attachments.map((f, idx) => (
+                  <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.8rem", padding: "4px 0", borderBottom: idx < replyState.attachments.length - 1 ? "1px solid var(--border-color)" : "none" }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: "6px" }}><Paperclip size={12} color="#6b7280" /> {f.name}</span>
+                    <button onClick={(e) => { e.stopPropagation(); onRemoveReplyAttachment(emailId, idx); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", padding: "2px 6px" }} title="Remove attachment"><X size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ marginBottom: "12px" }}>
+              <button onClick={(e) => { e.stopPropagation(); onGenerateAiReply(replyState.fullBody ? { ...email, body: replyState.fullBody } : email); }} disabled={replyState.drafting} style={{ background: replyState.drafting ? "#9ca3af" : "#0ea5e9", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.85rem", cursor: replyState.drafting ? "not-allowed" : "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "6px" }}>
+                {replyState.drafting ? <><Loader size={14} className="animate-spin" /> Drafting...</> : <>✨ Auto-Draft</>}
+              </button>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginBottom: "16px" }}>
+              <button onClick={(e) => { e.stopPropagation(); onReplyChange(emailId, { showReply: false, replyBody: "", replyTo: "", replyCc: "", drafting: false, attachments: [] }); }} style={{ background: "transparent", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer" }}>Cancel</button>
+              <button onClick={(e) => { e.stopPropagation(); onSendReply(email, replyState); }} disabled={replyState.drafting || !replyState.replyBody.trim()} style={{ background: "#16a34a", color: "white", border: "none", padding: "6px 14px", borderRadius: "6px", fontWeight: "600", cursor: replyState.drafting || !replyState.replyBody.trim() ? "not-allowed" : "pointer" }}>
+                {replyState.drafting ? "Sending..." : "Send"}
+              </button>
+            </div>
+            <div style={{ marginTop: "4px", fontSize: "0.8rem", color: "var(--text-secondary)" }}>
+              <hr /><HtmlEmailRenderer body={replyState.fullBody || getEmailBody(email)} />
+            </div>
+          </div>
+        )}
+
+        {/* REPLY / REPLY ALL / FORWARD BUTTONS */}
+        {!replyState.showReply && !forwardState.showForward && (
+          <div style={{ marginTop: "12px", display: "flex", gap: "8px" }}>
+            <button onClick={(e) => { e.stopPropagation(); const toEmail = extractEmail(email.from || email.sender || ""); const ccEmails = Array.isArray(email.cc) ? email.cc.map(extractEmail).filter(Boolean).join(", ") : ""; onReplyChange(emailId, { showReply: true, replyBody: "", replyTo: toEmail, replyCc: ccEmails, attachments: [], isReplyAll: false }); }} style={{ background: "#0ea5e9", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", cursor: "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "5px" }}>↩️ Reply</button>
+            <button onClick={(e) => { e.stopPropagation(); onReplyAll(email); }}
+              disabled={isReplyAllLoading}
+              style={{ background: "transparent", color: isReplyAllLoading ? "var(--text-secondary)" : "var(--text-primary)", border: "1px solid var(--border-color)", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", cursor: isReplyAllLoading ? "not-allowed" : "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "5px", transition: "border-color 0.15s, background 0.15s", opacity: isReplyAllLoading ? 0.6 : 1 }}
+              onMouseEnter={e => { if (!isReplyAllLoading) { e.currentTarget.style.borderColor = "#0ea5e9"; e.currentTarget.style.color = "#0ea5e9"; } }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border-color)"; e.currentTarget.style.color = "var(--text-primary)"; }}>
+              {isReplyAllLoading ? <><Loader size={13} className="animate-spin" /> Loading...</> : <>↩️↩️ Reply All</>}
+            </button>
+            <button onClick={(e) => { e.stopPropagation(); onForwardChange(emailId, { showForward: true, forwardBody: "", forwardTo: "", forwardCc: "", attachments: [] }); }}
+              style={{ background: "transparent", color: "var(--text-primary)", border: "1px solid var(--border-color)", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", cursor: "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "5px", transition: "border-color 0.15s, color 0.15s" }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = "#f59e0b"; e.currentTarget.style.color = "#f59e0b"; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border-color)"; e.currentTarget.style.color = "var(--text-primary)"; }}>➡️ Forward</button>
+          </div>
+        )}
+
+        {/* INLINE FORWARD */}
+        {forwardState.showForward && (
+          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: "16px", padding: "16px", borderTop: "1px solid var(--border-color)", background: "var(--bg-card)", borderRadius: "8px" }}>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: "6px", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: "6px", padding: "4px 10px", fontSize: "0.75rem", fontWeight: "700", color: "#f59e0b", marginBottom: "12px" }}>➡️ Forwarding — original email + attachments included automatically</div>
+            <div style={{ marginBottom: "10px", display: "flex", flexDirection: "column", gap: "12px" }}>
+              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="To" value={forwardState.forwardTo} onChange={(val) => onForwardChange(emailId, { forwardTo: val })} placeholder="Search contacts or enter email..." /></div>
+              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="CC" value={forwardState.forwardCc} onChange={(val) => onForwardChange(emailId, { forwardCc: val })} placeholder="Optional CC..." /></div>
+            </div>
+            <textarea placeholder="Add a note before the forwarded message... (optional)" value={forwardState.forwardBody} onClick={(e) => e.stopPropagation()} onFocus={(e) => e.stopPropagation()} onChange={(e) => onForwardChange(emailId, { forwardBody: e.target.value })} style={{ width: "100%", minHeight: "80px", padding: "10px", borderRadius: "6px", border: "1px solid var(--border-color)", background: "var(--bg-main)", color: "var(--text-primary)", resize: "vertical", boxSizing: "border-box" }} />
+            <div style={{ marginTop: "10px", marginBottom: "10px" }}>
+              <input type="file" multiple id={`fwd-attach-${emailId}`} style={{ display: "none" }} onChange={(e) => { if (!e.target.files) return; onForwardChange(emailId, { attachments: [...forwardState.attachments, ...Array.from(e.target.files)] }); }} />
+              <label htmlFor={`fwd-attach-${emailId}`} onClick={(e) => e.stopPropagation()} style={{ background: "#f3f4f6", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "0.8rem", fontWeight: "600", color: "#374151", display: "inline-flex", alignItems: "center", gap: "5px" }}>
+                <Paperclip size={14} /> Add Extra Attachment
+              </label>
+            </div>
+            {forwardState.attachments.length > 0 && (
+              <div style={{ marginBottom: "10px", padding: "8px", background: "var(--bg-main)", borderRadius: "6px" }}>
+                {forwardState.attachments.map((f, idx) => (
+                  <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.8rem", padding: "4px 0", borderBottom: idx < forwardState.attachments.length - 1 ? "1px solid var(--border-color)" : "none" }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: "6px" }}><Paperclip size={12} color="#6b7280" /> {f.name}</span>
+                    <button onClick={(e) => { e.stopPropagation(); onForwardChange(emailId, { attachments: forwardState.attachments.filter((_, i) => i !== idx) }); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", padding: "2px 6px" }}><X size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ marginTop: "12px", padding: "10px", background: "var(--bg-main)", borderRadius: "6px", fontSize: "0.8rem", color: "var(--text-secondary)", borderLeft: "3px solid var(--border-color)" }}>
+              <div style={{ fontWeight: "700", marginBottom: "4px" }}>📧 Original message will be forwarded:</div>
+              <div><strong>From:</strong> {email.from || "Unknown"}</div>
+              <div><strong>Subject:</strong> {email.subject || "No Subject"}</div>
+              {(email.attachments || []).length > 0 && (<div style={{ marginTop: "4px" }}><strong>Attachments:</strong> {email.attachments.map(a => a.name).join(", ")}</div>)}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "14px" }}>
+              <button onClick={(e) => { e.stopPropagation(); onForwardChange(emailId, { showForward: false, forwardBody: "", forwardTo: "", forwardCc: "", sending: false, attachments: [] }); }} style={{ background: "transparent", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", color: "var(--text-secondary)", fontWeight: "600" }}>Cancel</button>
+              <button onClick={(e) => { e.stopPropagation(); onSendForward(email, forwardState); }} disabled={forwardState.sending || !forwardState.forwardTo.trim()} style={{ background: forwardState.sending || !forwardState.forwardTo.trim() ? "#9ca3af" : "#f59e0b", color: "white", border: "none", padding: "6px 16px", borderRadius: "6px", fontWeight: "700", cursor: forwardState.sending || !forwardState.forwardTo.trim() ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "6px" }}>
+                {forwardState.sending ? <><Loader size={14} className="animate-spin" /> Forwarding...</> : <>➡️ Forward</>}
+              </button>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 function InboxView({
   emails,
   filteredEmails,
@@ -567,7 +889,10 @@ function InboxView({
   senderFilter,
   setSenderFilter,
   inboxReady,
+  inboxError,
+  fetchAndAnalyze,
   isAnalyzingBackground,
+  isFetchingFullInbox = false,
   markAsRead,
   markAsReplied,
   markAsReadById,
@@ -656,6 +981,25 @@ function InboxView({
   const [trackingSyncing,   setTrackingSyncing]    = useState(false);
   const [followUpCompose,   setFollowUpCompose]    = useState(null); // { to, subject }
   const feedRef = useRef(null);
+
+  // ── Incremental list rendering ──────────────────────────────────────────
+  // Rendering hundreds of email cards at once (backend fetches up to 500)
+  // tanks scroll performance. Only render a growing slice, and load more
+  // as the user nears the bottom via IntersectionObserver.
+  const [visibleCount, setVisibleCount] = useState(60);
+  const loadMoreObserverRef = useRef(null);
+  const loadMoreSentinelCallback = useCallback((node) => {
+    if (loadMoreObserverRef.current) loadMoreObserverRef.current.disconnect();
+    if (node) {
+      loadMoreObserverRef.current = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting) setVisibleCount(c => c + 60);
+      }, { rootMargin: '600px' });
+      loadMoreObserverRef.current.observe(node);
+    }
+  }, []);
+  useEffect(() => {
+    setVisibleCount(60);
+  }, [activeFolder, activeCategory, searchQuery, senderFilter]);
 
   // Find nearest scrollable ancestor (the left pane in DashboardView scrolls, not feed-container)
   const getScrollParent = () => {
@@ -760,13 +1104,16 @@ function InboxView({
   };
   // ────────────────────────────────────────────────────────────────────────
 
-  const toggleCardSelection = (emailId) => {
+  // useCallback([]) — reads only the setter's functional-update `prev`, never
+  // outer state directly, so an empty dep array is safe and keeps this
+  // reference stable across renders (needed for EmailCard's React.memo below).
+  const toggleCardSelection = useCallback((emailId) => {
     setSelectedCards(prev => {
       const next = new Set(prev);
       next.has(emailId) ? next.delete(emailId) : next.add(emailId);
       return next;
     });
-  };
+  }, []);
   const selectAll    = (emailList) => setSelectedCards(new Set(emailList.map(e => e.id || e.messageId)));
   const clearSelection = ()         => setSelectedCards(new Set());
 
@@ -780,15 +1127,26 @@ function InboxView({
     setInlineForwardState(prev => ({ ...prev, [emailId]: { ...(prev[emailId] || DEFAULT_FORWARD_STATE), ...updates } }));
   }, []);
 
-  const handleReplyAttachmentSelect = (emailId, files) => {
+  // Rewritten to go through setInlineReplyState's functional-update form
+  // directly instead of reading getEmailReplyState(emailId) — that getter
+  // depends on inlineReplyState, so calling it from inside a useCallback
+  // would force a new reference (and re-render every EmailCard) on every
+  // keystroke in every reply box. This version needs no deps.
+  const handleReplyAttachmentSelect = useCallback((emailId, files) => {
     if (!files || !files.length) return;
-    setEmailReplyState(emailId, { attachments: [...getEmailReplyState(emailId).attachments, ...Array.from(files)] });
-  };
-  const removeReplyAttachment = (emailId, index) => {
-    setEmailReplyState(emailId, { attachments: getEmailReplyState(emailId).attachments.filter((_, i) => i !== index) });
-  };
+    setInlineReplyState(prev => {
+      const current = prev[emailId] || DEFAULT_REPLY_STATE;
+      return { ...prev, [emailId]: { ...current, attachments: [...current.attachments, ...Array.from(files)] } };
+    });
+  }, []);
+  const removeReplyAttachment = useCallback((emailId, index) => {
+    setInlineReplyState(prev => {
+      const current = prev[emailId] || DEFAULT_REPLY_STATE;
+      return { ...prev, [emailId]: { ...current, attachments: current.attachments.filter((_, i) => i !== index) } };
+    });
+  }, []);
 
-  const getRsvpState = (emailId) => inlineRsvpState[emailId] || { status: null, loading: false };
+  const getRsvpState = (emailId) => inlineRsvpState[emailId] || DEFAULT_RSVP_STATE;
 
   const handleRsvp = useCallback(async (email, action) => {
     const emailId = email.id || email.messageId;
@@ -831,9 +1189,13 @@ function InboxView({
     }
   }, []);
 
-  const sendInlineReply = useCallback(async (email) => {
+  // Takes replyState as a parameter (EmailCard already has it from its own
+  // props) instead of calling getEmailReplyState(emailId) internally — that
+  // getter depends on inlineReplyState, so referencing it here would make
+  // this callback (and every card holding it as onSendReply) unstable on
+  // every keystroke in every reply box across the whole list.
+  const sendInlineReply = useCallback(async (email, state) => {
     const emailId = email.id || email.messageId;
-    const state   = getEmailReplyState(emailId);
     markAsReplied(emailId, true);
     markAsReadById(emailId);
     setEmailReplyState(emailId, { drafting: true });
@@ -857,11 +1219,12 @@ function InboxView({
       alert("Failed to send reply");
       setEmailReplyState(emailId, { drafting: false });
     }
-  }, [getEmailReplyState, setEmailReplyState, markAsReplied, markAsReadById]);
+  }, [setEmailReplyState, markAsReplied, markAsReadById]);
 
-  const sendInlineForward = useCallback(async (email) => {
+  // Same reasoning as sendInlineReply above — forwardState comes in as a
+  // parameter so this stays stable across forward-box keystrokes.
+  const sendInlineForward = useCallback(async (email, state) => {
     const emailId = email.id || email.messageId;
-    const state   = getEmailForwardState(emailId);
     if (!state.forwardTo.trim()) return;
     setEmailForwardState(emailId, { sending: true });
     try {
@@ -880,7 +1243,7 @@ function InboxView({
       alert("Failed to forward email");
       setEmailForwardState(emailId, { sending: false });
     }
-  }, [getEmailForwardState, setEmailForwardState]);
+  }, [setEmailForwardState]);
 
   const generateAiReplyForEmail = useCallback(async (email) => {
     const emailId = email.id || email.messageId;
@@ -938,9 +1301,13 @@ function InboxView({
       return { toStr: [...toSet].join(", "), ccStr: ccList.join(", ") };
     };
 
-    // If the card already has populated To recipients, use them immediately
+    // If the card already has populated To recipients AND a body to quote,
+    // use it immediately. Cache-hit rows (see save_emails_to_id_cache in
+    // services.py) no longer carry the full body, so they fall through to
+    // the detail fetch below — which was already happening for recipients
+    // on most rows anyway, and returns body too.
     const hasRecipients = Array.isArray(email.to) && email.to.length > 0;
-    if (hasRecipients) {
+    if (hasRecipients && email.body) {
       const { toStr, ccStr } = buildRecipients(email);
       setEmailReplyState(emailId, {
         showReply: true, replyBody: "", replyTo: toStr,
@@ -950,6 +1317,7 @@ function InboxView({
     }
 
     // Otherwise fetch full detail first so we get the real recipient list
+    // (and, for cache-hit rows, the body to quote — stashed as fullBody).
     setReplyAllLoading(prev => ({ ...prev, [emailId]: true }));
     try {
       const userEmail = getActiveUserEmail();
@@ -962,7 +1330,8 @@ function InboxView({
       const { toStr, ccStr } = buildRecipients(detail);
       setEmailReplyState(emailId, {
         showReply: true, replyBody: "", replyTo: toStr,
-        replyCc: ccStr, attachments: [], isReplyAll: true
+        replyCc: ccStr, attachments: [], isReplyAll: true,
+        fullBody: detail.body || email.body || ""
       });
     } catch (err) {
       console.error("Reply All detail fetch failed:", err);
@@ -1032,11 +1401,11 @@ function InboxView({
   // Used by both entry points: the members modal's "add" row / member "×"
   // buttons, and the inbox row's folder-picker. Always asks for Y/N before
   // calling the API, per the confirm-before-commit flow that was asked for.
-  const requestAddMembers = (folderName, folderLabel, emails) => {
+  const requestAddMembers = useCallback((folderName, folderLabel, emails) => {
     const cleaned = emails.map(e => e.trim()).filter(Boolean);
     if (cleaned.length === 0) return;
     setMemberActionPending({ type: 'add', folderName, folderLabel, emails: cleaned });
-  };
+  }, []);
 
   const requestRemoveMember = (folderName, folderLabel, email) => {
     setMemberActionPending({ type: 'remove', folderName, folderLabel, emails: [email] });
@@ -1152,6 +1521,21 @@ function InboxView({
           return folderPool.filter(e => e.category === cat).length;
         };
 
+        // Every count above except the ALL_EMAILS folder badge (which is backed
+        // by the exact EWS total in totalEmailCount) is derived from whatever's
+        // currently in `emails`. While the background full-inbox fetch is still
+        // running, that's only the fast first batch — so these are a floor, not
+        // the final number. Mark them with a "+" instead of quietly showing a
+        // count that will jump once the rest of the inbox lands.
+        const renderCount = (n, isExact = false) => (
+          <>
+            {n}
+            {isFetchingFullInbox && !isExact && (
+              <span style={{ opacity: 0.65 }} title="Still counting — more emails are loading">+</span>
+            )}
+          </>
+        );
+
         const folders = [
           { name: 'ALL_EMAILS', label: 'ALL EMAILS', emoji: '📬' },
           { name: 'THREADS',    label: 'THREADS',    emoji: '🧵' },
@@ -1180,7 +1564,7 @@ function InboxView({
                     className={`tab-btn ${isActive ? 'active' : ''}`}
                     onClick={() => { setSelectedEmail(null); setActiveFolder(name); setActiveCategory('ALL'); setSelectedCards(new Set()); }}>
                     {emoji} {label}
-                    <span className={`count-badge ${isActive ? 'active' : ''}`}>{folderMsgCount(name)}</span>
+                    <span className={`count-badge ${isActive ? 'active' : ''}`}>{renderCount(folderMsgCount(name), name === 'ALL_EMAILS')}</span>
                     {hasMembers && (
                       <Users
                         size={12}
@@ -1213,7 +1597,7 @@ function InboxView({
                   <button key={tab.name} className={`tab-btn ${activeCategory === tab.name ? 'active' : ''} ${tab.name.toLowerCase()}`}
                     onClick={() => { setSelectedEmail(null); setActiveCategory(tab.name); setSelectedCards(new Set()); }}>
                     {tab.emoji} {tab.name}
-                    <span className={`count-badge badge-${tab.name.toLowerCase()}`}>{catCount(tab.name)}</span>
+                    <span className={`count-badge badge-${tab.name.toLowerCase()}`}>{renderCount(catCount(tab.name), tab.name === 'ALL' && activeFolder === 'ALL_EMAILS')}</span>
                     {hasMembers && (
                       <Users
                         size={12}
@@ -1282,6 +1666,9 @@ function InboxView({
               (e.summary || "").toLowerCase().includes(q)
             )
           : categoryPool;
+
+        const visibleEmails = displayEmails.slice(0, visibleCount);
+        const hasMoreEmails = displayEmails.length > visibleCount;
 
         const folderLabel = {
           ALL_EMAILS: 'inbox', THREADS: 'threads', GLOBAL: 'Global team',
@@ -1394,6 +1781,16 @@ function InboxView({
           <div className="email-feed">
             {!inboxReady ? (
               <div className="loading-text">Syncing inbox...</div>
+            ) : inboxError ? (
+              <div className="loading-text" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
+                <div>Couldn't reach the inbox. The Outlook connection may be down.</div>
+                <button
+                  onClick={() => fetchAndAnalyze(false)}
+                  style={{ background: 'rgba(0,217,255,0.18)', border: '1px solid rgba(0,217,255,0.45)', color: '#60a5fa', borderRadius: '8px', padding: '7px 14px', fontSize: '0.78rem', fontWeight: '700', cursor: 'pointer' }}
+                >
+                  🔄 Retry
+                </button>
+              </div>
             ) : displayEmails.length === 0 ? (
               <div className="loading-text">{emptyMsg}</div>
             ) : (
@@ -1429,269 +1826,69 @@ function InboxView({
                   </div>
                 )}
 
-                {/* EMAIL CARDS */}
-                {displayEmails.map((email) => {
-                  const atts         = email.attachments || [];
-                  const emailId      = email.id || email.messageId;
-                  const replyState   = getEmailReplyState(emailId);
-                  const forwardState = getEmailForwardState(emailId);
-                  const isChecked    = selectedCards.has(emailId);
-
+                {/* EMAIL CARDS — each row is EmailCard (React.memo'd, defined above
+                    InboxView) so editing/checking/opening one card doesn't force
+                    every other mounted card to re-render. All per-row state is
+                    resolved to plain values here, at map-time, so unaffected
+                    rows keep referentially-stable props across renders. */}
+                {visibleEmails.map((email) => {
+                  const emailId = email.id || email.messageId;
                   return (
-                    <div key={emailId}
-                      className={`email-card ${!email.isRead ? "unread-mail" : ""} ${(selectedEmail?.id === email.id || selectedEmail?.messageId === email.messageId) ? "active" : ""} border-${(email.category || 'normal').toLowerCase()}`}
-                      style={{ display: 'flex', alignItems: 'stretch', padding: 0, overflow: 'hidden', contain: 'content' }}
-                      onClick={() => setSelectedEmail(email)}>
-
-                      <div className="ec-left-border" style={{ flexShrink: 0 }}></div>
-
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 10px', flexShrink: 0, alignSelf: 'center' }}
-                        onClick={e => { e.stopPropagation(); toggleCardSelection(emailId); }}>
-                        <RoundCheckbox checked={isChecked} onClick={e => { e.stopPropagation(); toggleCardSelection(emailId); }} />
-                      </div>
-
-                      <div className="ec-content" style={{ flex: 1, minWidth: 0, padding: '14px 16px 14px 0' }}>
-
-                        {/* TOP ROW */}
-                        <div className="ec-top" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "8px" }}>
-                          <h4 style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", flex: 1, minWidth: 0, margin: 0 }}>
-                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{email.subject || "No Subject"}</span>
-                            {(() => { const tc = email.threadCount || email.thread_count || email.messages?.length || 0; return tc > 1 ? (<span style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", fontSize: "0.65rem", fontWeight: "700", padding: "2px 8px", borderRadius: "999px", whiteSpace: "nowrap", flexShrink: 0, letterSpacing: "0.3px" }}>🧵 {tc} messages</span>) : null; })()}
-                          </h4>
-                          <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
-                            <button onClick={(e) => { e.stopPropagation(); markAsRead(email); }} disabled={email.isRead}
-                              style={{ background: email.isRead ? "#22c55e" : "#0ea5e9", color: "white", border: "none", borderRadius: "5px", padding: "3px 8px", fontSize: "0.7rem", cursor: email.isRead ? "not-allowed" : "pointer", fontWeight: "600", whiteSpace: "nowrap", opacity: email.isRead ? 0.6 : 1, flexShrink: 0 }}>
-                              {email.isRead ? "✓ Read" : "Mark Read"}
-                            </button>
-                            <div className="ec-badges" style={{ flexShrink: 0 }}>
-                              {email.hasReplied && (<span style={{ background: "#16a34a", color: "white", padding: "2px 8px", borderRadius: "999px", fontSize: "0.65rem", fontWeight: "700", marginLeft: "6px", whiteSpace: "nowrap" }}>↩️ Replied</span>)}
-                              {(() => { const cat = (email.category || "PENDING").toUpperCase(); const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL; return <span className={`cat-tag ${cat.toLowerCase()}`} style={{ whiteSpace: "nowrap" }}>{meta.emoji} {meta.label}</span>; })()}
-                            </div>
-                            {/* Flag button */}
-                            <button
-                              onClick={e => { e.stopPropagation(); setFlagOpen(flagOpen === emailId ? null : emailId); }}
-                              title="Wrong classification? Flag it"
-                              style={{ background: flagOpen === emailId ? 'rgba(239,68,68,0.12)' : 'transparent', border: `1px solid ${flagOpen === emailId ? 'rgba(239,68,68,0.3)' : 'transparent'}`, color: flagOpen === emailId ? '#f87171' : 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
-                              onMouseEnter={e => { if (flagOpen !== emailId) { e.currentTarget.style.background = 'rgba(239,68,68,0.08)'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.2)'; e.currentTarget.style.color = '#f87171'; }}}
-                              onMouseLeave={e => { if (flagOpen !== emailId) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}}
-                            >
-                              <Flag size={12} /> Flag
-                            </button>
-                            {/* Add-to-folder button */}
-                            <button
-                              onClick={e => { e.stopPropagation(); setFolderPickerFor(folderPickerFor === emailId ? null : emailId); }}
-                              title="Add sender to a folder"
-                              style={{ background: folderPickerFor === emailId ? 'rgba(59,130,246,0.12)' : 'transparent', border: `1px solid ${folderPickerFor === emailId ? 'rgba(59,130,246,0.3)' : 'transparent'}`, color: folderPickerFor === emailId ? '#60a5fa' : 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
-                              onMouseEnter={e => { if (folderPickerFor !== emailId) { e.currentTarget.style.background = 'rgba(59,130,246,0.08)'; e.currentTarget.style.borderColor = 'rgba(59,130,246,0.2)'; e.currentTarget.style.color = '#60a5fa'; }}}
-                              onMouseLeave={e => { if (folderPickerFor !== emailId) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}}
-                            >
-                              <FolderPlus size={12} /> Add to Folder
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* META */}
-                        <div className="ec-meta">
-                          <span title={getEmailSender(email)} style={{ maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><User size={14} /> {getEmailSender(email)}</span>
-                          <span><Clock size={14} /> {formatDate(getEffectiveReceivedAt(email))}</span>
-                          {Array.isArray(email.cc) && email.cc.length > 0 && (<span className="cc-badge" title={email.cc.join(", ")}><Users size={12} /> CC</span>)}
-                        </div>
-
-                        {/* SUMMARY */}
-                        {email.analyzing
-                          ? <div className="ec-body ec-analyzing-text"><span className="analyzing-dot" />AI is writing the summary, please wait...</div>
-                          : <div className="ec-body">{email.summary || ""}</div>}
-
-                        {/* FLAG DROPDOWN */}
-                        {flagOpen === emailId && (
-                          <FlagDropdown
-                            email={email}
-                            onSubmit={submitCorrection}
-                            onClose={() => setFlagOpen(null)}
-                            submitting={!!flagSubmitting[emailId]}
-                            success={!!flagSuccess[emailId]}
-                          />
-                        )}
-
-                        {/* ADD-TO-FOLDER DROPDOWN */}
-                        {folderPickerFor === emailId && (() => {
-                          const senderEmail = extractEmail(getEmailSender(email));
-                          return (
-                            <FolderPickerDropdown
-                              senderEmail={senderEmail}
-                              onClose={() => setFolderPickerFor(null)}
-                              onPick={(folderName) => {
-                                setFolderPickerFor(null);
-                                requestAddMembers(folderName, MANAGEABLE_META[folderName]?.label || folderName, [senderEmail]);
-                              }}
-                            />
-                          );
-                        })()}
-
-
-                        {/* ATTACHMENTS */}
-                        {atts.length > 0 && (
-                          <div className="ec-atts">
-                            <Paperclip size={14} />
-                            {atts.map((a, k) => (
-                              <div key={k} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
-                                <span style={{ flex: 1 }}>{a.name || a.file_name || "File"}<span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>{formatFileSize(a.size)}</span></span>
-                                <button onClick={(e) => { e.stopPropagation(); handleFileDownload({ ...a, attachmentId: a.attachmentId }, email.messageId || email.id); }}
-                                  disabled={isFileDownloading(a, email.messageId || email.id)}
-                                  style={{ backgroundColor: isFileDownloading(a, email.messageId || email.id) ? "#9ca3af" : "#0ea5e9", cursor: isFileDownloading(a, email.messageId || email.id) ? "not-allowed" : "pointer", color: "white", padding: "6px 12px", borderRadius: "6px", border: "none", display: "flex", alignItems: "center", gap: "6px" }}>
-                                  {isFileDownloading(a, email.messageId || email.id) ? <><Loader size={14} className="animate-spin" /> {getFileProgress(a, email.messageId || email.id)}%</> : <><Download size={16} /> Download</>}
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-
-                        {/* RSVP — MEETING & ZOOM INVITES */}
-                        {(email.category === "MEETING" || email.category === "ZOOM") && (() => {
-                          const _subj = (email.subject || "").trim();
-                          if (/^(accepted|declined|tentative|re|fw|fwd|aw|tr)\s*:/i.test(_subj)) return null;
-                          const _body = (email.body || "").toLowerCase();
-                          const _hasSignal = _body.includes("you're invited") || _body.includes("you are invited") || _body.includes("meeting request") || _body.includes("has invited you") || _body.includes("join the meeting") || _body.includes("join meeting") || _body.includes("zoom.us") || _body.includes("teams.microsoft.com") || _body.includes("meet.google.com") || _body.includes("webex.com") || (email.attachments || []).some(a => (a.name || "").toLowerCase().endsWith(".ics"));
-                          if (!_hasSignal) return null;
-                          const rsvp = getRsvpState(emailId);
-                          const statusColors = {
-                            accepted:  { bg: "rgba(22,163,74,0.12)",  border: "rgba(22,163,74,0.35)",  color: "#4ade80", label: "✓ Accepted" },
-                            declined:  { bg: "rgba(239,68,68,0.12)",  border: "rgba(239,68,68,0.35)",  color: "#f87171", label: "✗ Declined" },
-                            tentative: { bg: "rgba(245,158,11,0.12)", border: "rgba(245,158,11,0.35)", color: "#fbbf24", label: "? Maybe"    },
-                          };
-                          const done = statusColors[rsvp.status];
-                          return (
-                            <div onClick={e => e.stopPropagation()} style={{ marginTop: "12px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", padding: "10px 12px", background: done ? done.bg : "rgba(255,255,255,0.03)", border: `1px solid ${done ? done.border : "var(--border-color)"}`, borderRadius: "8px" }}>
-                              {rsvp.error && !done && (<div style={{ width: "100%", marginBottom: "6px", fontSize: "0.75rem", color: "#f87171", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: "6px", padding: "5px 10px" }}>⚠️ RSVP failed — this invite may need to be accepted from the Calendar view. <span style={{ opacity: 0.6 }}>({rsvp.error})</span></div>)}
-                              {rsvp.useCalendar && !done && (
-                                <div style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
-                                  <span style={{ fontSize: "0.78rem", color: "#93c5fd" }}>📅 This invite can only be accepted from the Calendar</span>
-                                  <button onClick={e => { e.stopPropagation(); navigate('/calendar'); }} style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", border: "none", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: "pointer", display: "flex", alignItems: "center", gap: "6px", boxShadow: "0 3px 10px rgba(0,217,255,0.35)" }}>📅 Open Calendar →</button>
-                                </div>
-                              )}
-                              {done ? (
-                                <>
-                                  <span style={{ fontSize: "0.82rem", fontWeight: "700", color: done.color }}>{done.label}</span>
-                                  <button onClick={() => setInlineRsvpState(prev => ({ ...prev, [emailId]: { status: null, loading: false } }))} style={{ background: "transparent", border: "1px solid var(--border-color)", color: "var(--text-secondary)", borderRadius: "5px", padding: "2px 9px", fontSize: "0.72rem", fontWeight: "600", cursor: "pointer" }}>Change</button>
-                                </>
-                              ) : (
-                                <>
-                                  <span style={{ fontSize: "0.72rem", fontWeight: "700", letterSpacing: "0.8px", color: "var(--text-secondary)", textTransform: "uppercase", marginRight: "4px" }}>{email.category === "ZOOM" ? "📹 Zoom Invite" : "📅 Meeting Invite"}</span>
-                                  <button onClick={e => { e.stopPropagation(); handleRsvp(email, "Accept"); }} disabled={rsvp.loading} style={{ background: "linear-gradient(135deg, #16a34a, #15803d)", color: "white", border: "none", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: rsvp.loading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "5px", boxShadow: "0 3px 10px rgba(22,163,74,0.3)", opacity: rsvp.loading ? 0.6 : 1 }}>
-                                    {rsvp.loading ? <Loader size={13} className="animate-spin" /> : "✓"} Accept
-                                  </button>
-                                  <button onClick={e => { e.stopPropagation(); handleRsvp(email, "Tentative"); }} disabled={rsvp.loading} style={{ background: "rgba(245,158,11,0.12)", color: "#fbbf24", border: "1px solid rgba(245,158,11,0.35)", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: rsvp.loading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "5px", opacity: rsvp.loading ? 0.6 : 1 }}>? Maybe</button>
-                                  <button onClick={e => { e.stopPropagation(); handleRsvp(email, "Decline"); }} disabled={rsvp.loading} style={{ background: "rgba(239,68,68,0.08)", color: "#f87171", border: "1px solid rgba(239,68,68,0.25)", borderRadius: "6px", padding: "5px 14px", fontSize: "0.78rem", fontWeight: "700", cursor: rsvp.loading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "5px", opacity: rsvp.loading ? 0.6 : 1 }}>✗ Decline</button>
-                                </>
-                              )}
-                            </div>
-                          );
-                        })()}
-
-                        {/* INLINE REPLY */}
-                        {replyState.showReply && !forwardState.showForward && (
-                          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: "16px", padding: "16px", borderTop: "1px solid var(--border-color)", background: "var(--bg-card)", borderRadius: "8px" }}>
-                            {replyState.isReplyAll && (<div style={{ display: "inline-flex", alignItems: "center", gap: "6px", background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.25)", borderRadius: "6px", padding: "4px 10px", fontSize: "0.75rem", fontWeight: "700", color: "#3b82f6", marginBottom: "12px" }}>↩️↩️ Reply All — replying to all recipients</div>)}
-                            <div style={{ marginBottom: "10px", display: "flex", flexDirection: "column", gap: "12px" }}>
-                              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="To" value={replyState.replyTo} onChange={(newValue) => setEmailReplyState(emailId, { replyTo: newValue })} placeholder="Search contacts or enter email..." /></div>
-                              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="CC" value={replyState.replyCc} onChange={(newValue) => setEmailReplyState(emailId, { replyCc: newValue })} placeholder="Optional - Search contacts or enter email..." /></div>
-                            </div>
-                            <textarea placeholder="Type your reply..." value={replyState.replyBody} onClick={(e) => e.stopPropagation()} onFocus={(e) => e.stopPropagation()} onChange={(e) => setEmailReplyState(emailId, { replyBody: e.target.value })} style={{ width: "100%", minHeight: "90px", padding: "10px", borderRadius: "6px", border: "1px solid var(--border-color)", background: "var(--bg-main)", color: "var(--text-primary)", resize: "vertical" }} />
-                            <div style={{ marginTop: "10px", marginBottom: "10px" }}>
-                              <input type="file" multiple id={`reply-attach-${emailId}`} style={{ display: "none" }} onChange={(e) => handleReplyAttachmentSelect(emailId, e.target.files)} />
-                              <label htmlFor={`reply-attach-${emailId}`} onClick={(e) => e.stopPropagation()} style={{ background: "#f3f4f6", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "0.8rem", fontWeight: "600", color: "#374151", display: "inline-flex", alignItems: "center", gap: "5px" }}>
-                                <Paperclip size={14} /> Attach Files
-                              </label>
-                            </div>
-                            {replyState.attachments.length > 0 && (
-                              <div style={{ marginBottom: "10px", padding: "8px", background: "var(--bg-main)", borderRadius: "6px" }}>
-                                {replyState.attachments.map((f, idx) => (
-                                  <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.8rem", padding: "4px 0", borderBottom: idx < replyState.attachments.length - 1 ? "1px solid var(--border-color)" : "none" }}>
-                                    <span style={{ display: "flex", alignItems: "center", gap: "6px" }}><Paperclip size={12} color="#6b7280" /> {f.name}</span>
-                                    <button onClick={(e) => { e.stopPropagation(); removeReplyAttachment(emailId, idx); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", padding: "2px 6px" }} title="Remove attachment"><X size={14} /></button>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                            <div style={{ marginBottom: "12px" }}>
-                              <button onClick={(e) => { e.stopPropagation(); generateAiReplyForEmail(email); }} disabled={replyState.drafting} style={{ background: replyState.drafting ? "#9ca3af" : "#0ea5e9", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.85rem", cursor: replyState.drafting ? "not-allowed" : "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "6px" }}>
-                                {replyState.drafting ? <><Loader size={14} className="animate-spin" /> Drafting...</> : <>✨ Auto-Draft</>}
-                              </button>
-                            </div>
-                            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginBottom: "16px" }}>
-                              <button onClick={(e) => { e.stopPropagation(); setEmailReplyState(emailId, { showReply: false, replyBody: "", replyTo: "", replyCc: "", drafting: false, attachments: [] }); }} style={{ background: "transparent", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer" }}>Cancel</button>
-                              <button onClick={(e) => { e.stopPropagation(); sendInlineReply(email); }} disabled={replyState.drafting || !replyState.replyBody.trim()} style={{ background: "#16a34a", color: "white", border: "none", padding: "6px 14px", borderRadius: "6px", fontWeight: "600", cursor: replyState.drafting || !replyState.replyBody.trim() ? "not-allowed" : "pointer" }}>
-                                {replyState.drafting ? "Sending..." : "Send"}
-                              </button>
-                            </div>
-                            <div style={{ marginTop: "4px", fontSize: "0.8rem", color: "var(--text-secondary)" }}>
-                              <hr /><HtmlEmailRenderer body={getEmailBody(email)} />
-                            </div>
-                          </div>
-                        )}
-
-                        {/* REPLY / REPLY ALL / FORWARD BUTTONS */}
-                        {!replyState.showReply && !forwardState.showForward && (
-                          <div style={{ marginTop: "12px", display: "flex", gap: "8px" }}>
-                            <button onClick={(e) => { e.stopPropagation(); const toEmail = extractEmail(email.from || email.sender || ""); const ccEmails = Array.isArray(email.cc) ? email.cc.map(extractEmail).filter(Boolean).join(", ") : ""; setEmailReplyState(emailId, { showReply: true, replyBody: "", replyTo: toEmail, replyCc: ccEmails, attachments: [], isReplyAll: false }); }} style={{ background: "#0ea5e9", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", cursor: "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "5px" }}>↩️ Reply</button>
-                            <button onClick={(e) => { e.stopPropagation(); handleReplyAll(email); }}
-                              disabled={replyAllLoading[emailId]}
-                              style={{ background: "transparent", color: replyAllLoading[emailId] ? "var(--text-secondary)" : "var(--text-primary)", border: "1px solid var(--border-color)", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", cursor: replyAllLoading[emailId] ? "not-allowed" : "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "5px", transition: "border-color 0.15s, background 0.15s", opacity: replyAllLoading[emailId] ? 0.6 : 1 }}
-                              onMouseEnter={e => { if (!replyAllLoading[emailId]) { e.currentTarget.style.borderColor = "#0ea5e9"; e.currentTarget.style.color = "#0ea5e9"; } }}
-                              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border-color)"; e.currentTarget.style.color = "var(--text-primary)"; }}>
-                              {replyAllLoading[emailId] ? <><Loader size={13} className="animate-spin" /> Loading...</> : <>↩️↩️ Reply All</>}
-                            </button>
-                            <button onClick={(e) => { e.stopPropagation(); setEmailForwardState(emailId, { showForward: true, forwardBody: "", forwardTo: "", forwardCc: "", attachments: [] }); }}
-                              style={{ background: "transparent", color: "var(--text-primary)", border: "1px solid var(--border-color)", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", cursor: "pointer", fontWeight: "600", display: "flex", alignItems: "center", gap: "5px", transition: "border-color 0.15s, color 0.15s" }}
-                              onMouseEnter={e => { e.currentTarget.style.borderColor = "#f59e0b"; e.currentTarget.style.color = "#f59e0b"; }}
-                              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border-color)"; e.currentTarget.style.color = "var(--text-primary)"; }}>➡️ Forward</button>
-                          </div>
-                        )}
-
-                        {/* INLINE FORWARD */}
-                        {forwardState.showForward && (
-                          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: "16px", padding: "16px", borderTop: "1px solid var(--border-color)", background: "var(--bg-card)", borderRadius: "8px" }}>
-                            <div style={{ display: "inline-flex", alignItems: "center", gap: "6px", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: "6px", padding: "4px 10px", fontSize: "0.75rem", fontWeight: "700", color: "#f59e0b", marginBottom: "12px" }}>➡️ Forwarding — original email + attachments included automatically</div>
-                            <div style={{ marginBottom: "10px", display: "flex", flexDirection: "column", gap: "12px" }}>
-                              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="To" value={forwardState.forwardTo} onChange={(val) => setEmailForwardState(emailId, { forwardTo: val })} placeholder="Search contacts or enter email..." /></div>
-                              <div onClick={(e) => e.stopPropagation()}><EmailAutocomplete label="CC" value={forwardState.forwardCc} onChange={(val) => setEmailForwardState(emailId, { forwardCc: val })} placeholder="Optional CC..." /></div>
-                            </div>
-                            <textarea placeholder="Add a note before the forwarded message... (optional)" value={forwardState.forwardBody} onClick={(e) => e.stopPropagation()} onFocus={(e) => e.stopPropagation()} onChange={(e) => setEmailForwardState(emailId, { forwardBody: e.target.value })} style={{ width: "100%", minHeight: "80px", padding: "10px", borderRadius: "6px", border: "1px solid var(--border-color)", background: "var(--bg-main)", color: "var(--text-primary)", resize: "vertical", boxSizing: "border-box" }} />
-                            <div style={{ marginTop: "10px", marginBottom: "10px" }}>
-                              <input type="file" multiple id={`fwd-attach-${emailId}`} style={{ display: "none" }} onChange={(e) => { if (!e.target.files) return; setEmailForwardState(emailId, { attachments: [...forwardState.attachments, ...Array.from(e.target.files)] }); }} />
-                              <label htmlFor={`fwd-attach-${emailId}`} onClick={(e) => e.stopPropagation()} style={{ background: "#f3f4f6", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "0.8rem", fontWeight: "600", color: "#374151", display: "inline-flex", alignItems: "center", gap: "5px" }}>
-                                <Paperclip size={14} /> Add Extra Attachment
-                              </label>
-                            </div>
-                            {forwardState.attachments.length > 0 && (
-                              <div style={{ marginBottom: "10px", padding: "8px", background: "var(--bg-main)", borderRadius: "6px" }}>
-                                {forwardState.attachments.map((f, idx) => (
-                                  <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.8rem", padding: "4px 0", borderBottom: idx < forwardState.attachments.length - 1 ? "1px solid var(--border-color)" : "none" }}>
-                                    <span style={{ display: "flex", alignItems: "center", gap: "6px" }}><Paperclip size={12} color="#6b7280" /> {f.name}</span>
-                                    <button onClick={(e) => { e.stopPropagation(); setEmailForwardState(emailId, { attachments: forwardState.attachments.filter((_, i) => i !== idx) }); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", padding: "2px 6px" }}><X size={14} /></button>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                            <div style={{ marginTop: "12px", padding: "10px", background: "var(--bg-main)", borderRadius: "6px", fontSize: "0.8rem", color: "var(--text-secondary)", borderLeft: "3px solid var(--border-color)" }}>
-                              <div style={{ fontWeight: "700", marginBottom: "4px" }}>📧 Original message will be forwarded:</div>
-                              <div><strong>From:</strong> {email.from || "Unknown"}</div>
-                              <div><strong>Subject:</strong> {email.subject || "No Subject"}</div>
-                              {(email.attachments || []).length > 0 && (<div style={{ marginTop: "4px" }}><strong>Attachments:</strong> {email.attachments.map(a => a.name).join(", ")}</div>)}
-                            </div>
-                            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "14px" }}>
-                              <button onClick={(e) => { e.stopPropagation(); setEmailForwardState(emailId, { showForward: false, forwardBody: "", forwardTo: "", forwardCc: "", sending: false, attachments: [] }); }} style={{ background: "transparent", border: "1px solid var(--border-color)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", color: "var(--text-secondary)", fontWeight: "600" }}>Cancel</button>
-                              <button onClick={(e) => { e.stopPropagation(); sendInlineForward(email); }} disabled={forwardState.sending || !forwardState.forwardTo.trim()} style={{ background: forwardState.sending || !forwardState.forwardTo.trim() ? "#9ca3af" : "#f59e0b", color: "white", border: "none", padding: "6px 16px", borderRadius: "6px", fontWeight: "700", cursor: forwardState.sending || !forwardState.forwardTo.trim() ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "6px" }}>
-                                {forwardState.sending ? <><Loader size={14} className="animate-spin" /> Forwarding...</> : <>➡️ Forward</>}
-                              </button>
-                            </div>
-                          </div>
-                        )}
-
-                      </div>
-                    </div>
+                    <EmailCard
+                      key={emailId}
+                      email={email}
+                      isChecked={selectedCards.has(emailId)}
+                      isActive={selectedEmail?.id === email.id || selectedEmail?.messageId === email.messageId}
+                      replyState={getEmailReplyState(emailId)}
+                      forwardState={getEmailForwardState(emailId)}
+                      isFlagOpen={flagOpen === emailId}
+                      isFolderPickerOpen={folderPickerFor === emailId}
+                      rsvpState={getRsvpState(emailId)}
+                      isReplyAllLoading={!!replyAllLoading[emailId]}
+                      isFlagSubmitting={!!flagSubmitting[emailId]}
+                      isFlagSuccess={!!flagSuccess[emailId]}
+                      onOpen={setSelectedEmail}
+                      onToggleCheck={toggleCardSelection}
+                      onMarkRead={markAsRead}
+                      onFlagToggle={setFlagOpen}
+                      onFolderPickerToggle={setFolderPickerFor}
+                      onSubmitCorrection={submitCorrection}
+                      onRequestAddMembers={requestAddMembers}
+                      onDownloadFile={handleFileDownload}
+                      isFileDownloading={isFileDownloading}
+                      getFileProgress={getFileProgress}
+                      onRsvp={handleRsvp}
+                      setInlineRsvpState={setInlineRsvpState}
+                      onReplyChange={setEmailReplyState}
+                      onForwardChange={setEmailForwardState}
+                      onReplyAttach={handleReplyAttachmentSelect}
+                      onRemoveReplyAttachment={removeReplyAttachment}
+                      onGenerateAiReply={generateAiReplyForEmail}
+                      onSendReply={sendInlineReply}
+                      onReplyAll={handleReplyAll}
+                      onSendForward={sendInlineForward}
+                      getEmailBody={getEmailBody}
+                      formatDate={formatDate}
+                      getEffectiveReceivedAt={getEffectiveReceivedAt}
+                    />
                   );
                 })}
+
+                {/* LOAD MORE SENTINEL — grows visibleCount as it scrolls into view */}
+                {hasMoreEmails && (
+                  <div ref={loadMoreSentinelCallback} style={{ padding: '18px 0', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.8rem' }}>
+                    Loading more emails…
+                  </div>
+                )}
+
+                {/* STILL SYNCING — the fast first batch is fully shown, but the
+                    background fetch for the rest of the inbox hasn't landed yet. */}
+                {!hasMoreEmails && isFetchingFullInbox && (
+                  <div style={{ padding: '18px 0', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.8rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                    <Loader size={13} className="animate-spin" />
+                    Fetching the rest of your inbox…
+                  </div>
+                )}
               </>
             )}
           </div>

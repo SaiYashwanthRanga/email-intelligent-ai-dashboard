@@ -18,14 +18,14 @@ from dotenv import load_dotenv
 from typing import List
 from urllib.parse import unquote
 
-from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, IrisChatRequest
+from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, IrisChatRequest, ActivityPingRequest
 from iris_service import get_iris_reply
 
 import logging
 
 # ── App logger ──
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -33,7 +33,7 @@ log = logging.getLogger("hfmg")
 
 # ── Silence uvicorn access log (kills the per-request flood) ──
 logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
-logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
 from services import (
     group_emails_by_subject,
     split_reply_chain,
@@ -70,6 +70,10 @@ from services import (
     get_group_members_dict,
     add_group_member,
     remove_group_member,
+    # ── Activity tracking ──
+    is_activity_allowed,
+    record_activity_ping,
+    get_activity_summary,
 )
 
 # 1. LOAD CONFIGURATION
@@ -271,24 +275,33 @@ async def get_email_details(messageId: str, userEmail: str):
             try:
                 from services import load_tracking
                 tracking = load_tracking(userEmail)
-                for tracked_item in tracking.get("tracked", []):
-                    if tracked_item.get("messageId") == messageId:
-                        log.info(
-                            f"[email-details] .NET {resp.status_code} — "
-                            f"serving tracking-cache body for {messageId[:20]}..."
-                        )
-                        return {
-                            "messageId":          messageId,
-                            "subject":            tracked_item.get("subject", ""),
-                            "body":               tracked_item.get("body", ""),
-                            "from":               userEmail,
-                            "to":                 [],
-                            "cc":                 [],
-                            "attachments":        [],
-                            "hasAttachments":     False,
-                            "messages":           [],
-                            "_fromTrackingCache": True,
-                        }
+                # Search both active tracking AND pending AI suggestions —
+                # the "View Email" button on a pending approval card hits this
+                # same endpoint before the item has ever been approved.
+                cached_item = next(
+                    (item for item in (
+                        tracking.get("tracked", [])
+                        + tracking.get("pending_tracking_approvals", [])
+                    ) if item.get("messageId") == messageId),
+                    None
+                )
+                if cached_item:
+                    log.info(
+                        f"[email-details] .NET {resp.status_code} — "
+                        f"serving tracking-cache body for {messageId[:20]}..."
+                    )
+                    return {
+                        "messageId":          messageId,
+                        "subject":            cached_item.get("subject", ""),
+                        "body":               cached_item.get("body", ""),
+                        "from":               userEmail,
+                        "to":                 [],
+                        "cc":                 [],
+                        "attachments":        [],
+                        "hasAttachments":     False,
+                        "messages":           [],
+                        "_fromTrackingCache": True,
+                    }
             except Exception as fallback_err:
                 log.warning(f"[email-details] Tracking cache fallback failed: {fallback_err}")
             # No cache hit — propagate the original error
@@ -388,13 +401,16 @@ async def get_email_details(messageId: str, userEmail: str):
 
 
 @app.get("/api/fetch-inbox")
-def fetch_inbox(email: str):
+def fetch_inbox(email: str, count: int = 500):
     try:
         # Build the org server inbox URL from the email address.
         # Route template: GET /api/Values/inbox/{mail}/count{num}
         # "count" and the number share the same path segment — no slash between them.
+        # `count` is caller-controlled so the frontend can request a small fast
+        # batch first (near-instant paint) and the full inbox afterward, instead
+        # of blocking on all 500 emails before showing anything.
         clean_email = unquote(email).strip()
-        clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count500"
+        clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count{count}"
 
         log.debug(f"Fetching org inbox: {clean_url}")
 
@@ -1606,6 +1622,50 @@ async def check_tracking_access(user_email: str):
     return {"allowed": is_tracking_allowed(user_email)}
 
 
+# ── ACTIVITY TRACKING ENDPOINTS ───────────────────────────────────────────────
+# Shows when each person using the dashboard is active and from which
+# (best-effort) device. This is data ABOUT other people, not just the caller,
+# so /api/activity/summary is gated by activity_access.json the same way
+# tracking is gated by tracking_access.json — edit that file to add/remove
+# who can see the summary; no server restart needed.
+
+@app.post("/api/activity/ping")
+async def activity_ping(payload: ActivityPingRequest):
+    """
+    Heartbeat from an active browser tab — the frontend calls this roughly
+    every 60s while the user is NOT idle (reuses the existing idle-detection
+    state, see Dashboard.jsx). No access check here: every logged-in user can
+    report their own activity, same as they can already see their own inbox.
+    """
+    record_activity_ping(payload.user_email, payload.device_id, payload.device_label)
+    return {"ok": True}
+
+
+@app.get("/api/activity/access")
+async def check_activity_access(user_email: str):
+    """
+    Returns whether the given user may view the (everyone's) activity
+    summary. The frontend calls this once on mount to decide whether to show
+    the Activity tab. Real enforcement is in /api/activity/summary itself.
+    """
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return {"allowed": is_activity_allowed(user_email)}
+
+
+@app.get("/api/activity/summary")
+async def activity_summary(requester_email: str, days: int = 14):
+    """
+    Per-user active-hours + device summary for everyone who has ever pinged.
+    requester_email must be listed in activity_access.json.
+    """
+    if not requester_email:
+        raise HTTPException(status_code=400, detail="Missing requester_email")
+    if not is_activity_allowed(requester_email):
+        raise HTTPException(status_code=403, detail="Not authorized to view activity data.")
+    return {"users": get_activity_summary(days=days)}
+
+
 @app.get("/api/tracking")
 async def get_tracking(user_email: str):
     """
@@ -2400,5 +2460,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         access_log=False,          # silence per-request noise
-        log_level="warning"        # uvicorn internal logs: warnings+ only
+        log_level="error"          # uvicorn internal logs: errors only
     )

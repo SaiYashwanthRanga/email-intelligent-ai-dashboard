@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
   Paperclip, BarChart3, X, PieChart, Mail, ArrowLeft, Calendar,
-  FileText, Download, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader, LogOut
+  FileText, Download, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader, LogOut,
+  Radar, Users, SquarePen, Bot
 } from 'lucide-react';
 import TriageSummary from './TriageSummary';
 import ToastContainer from './Toast';
@@ -13,7 +14,7 @@ import AILoadingScreen from "./Ailoadingscreen";
 import Iris from "./Iris";
 import InboxView, {
   API_BASE, getActiveUserEmail,
-  replyToMail, markReadBackend, extractEmail,
+  replyToMail, forwardMail, markReadBackend, extractEmail,
   CATEGORY_META, HtmlEmailRenderer, FlagDropdown
 } from './InboxView';
 
@@ -171,7 +172,8 @@ const DashboardView = ({
   emails, report, loading, mainView, setMainView, activeTab, setActiveTab,
   username, greetingInfo, theme, toggleTheme, toasts, removeToast,
   isProfileOpen, setIsProfileOpen,
-  lastSyncTime, inboxReady, isSoftSyncing, autoSyncEnabled, setAutoSyncEnabled,
+  lastSyncTime, inboxReady, inboxError, isSoftSyncing, autoSyncEnabled, setAutoSyncEnabled,
+  isFetchingFullInbox = false,
   selectedEmail, setSelectedEmail, fileModalData, setFileModalData,
   parsedThread, threadLoading, replyDraft, setReplyDraft, replyLoading, copySuccess,
   realThreads, filteredEmails, groupedEmails,
@@ -183,6 +185,7 @@ const DashboardView = ({
   senderFilter, setSenderFilter,
   triageStats,
   canUseTracking = false,
+  canUseActivity = false,
   autoDigest = null,
   digestLoading = false,
   // Flag / correction props
@@ -272,20 +275,31 @@ const DashboardView = ({
   useEffect(() => { setThreadExpanded(false); setInlineQuoteExpanded({}); }, [parsedThread]);
 
   const sendModalReply = useCallback(async () => {
-    if (!selectedEmail || !replyDraft.trim()) return;
+    if (!selectedEmail) return;
+    const isForward = modalReplyMode === "forward";
+    // Forward only needs a recipient — no note required. Reply/Reply All still need drafted text.
+    if (isForward ? !modalReplyTo.trim() : !replyDraft.trim()) return;
+
     setModalReplySending(true);
     const emailId = selectedEmail.id || selectedEmail.messageId;
     try {
       const messageItemId = selectedEmail.messageId || selectedEmail.id;
       if (!messageItemId) throw new Error("Missing messageItemId");
-      await replyToMail({
-        messageItemId,
-        replyBodyHtml: `<p>${replyDraft.replace(/\n/g, "<br/>")}</p>`,
-        to: modalReplyTo.split(",").map(e => e.trim()).filter(Boolean),
-        cc: modalReplyCc.split(",").map(e => e.trim()).filter(Boolean),
-        attachments: modalReplyAttachments,
-        isReplyAll: false
-      });
+      const to = modalReplyTo.split(",").map(e => e.trim()).filter(Boolean);
+      const cc = modalReplyCc.split(",").map(e => e.trim()).filter(Boolean);
+      const bodyHtml = replyDraft.trim() ? `<p>${replyDraft.replace(/\n/g, "<br/>")}</p>` : "";
+
+      if (isForward) {
+        await forwardMail({ messageItemId, forwardBodyHtml: bodyHtml, to, cc, attachments: modalReplyAttachments });
+      } else {
+        await replyToMail({
+          messageItemId,
+          replyBodyHtml: bodyHtml,
+          to, cc,
+          attachments: modalReplyAttachments,
+          isReplyAll: modalReplyMode === "replyAll"
+        });
+      }
       await markReadBackend(selectedEmail);
       markAsReplied(emailId, true);
       markAsReadById(emailId);
@@ -294,11 +308,11 @@ const DashboardView = ({
       setSelectedEmail(null);
     } catch (err) {
       console.error("Modal reply failed:", err);
-      alert("Failed to send reply. Please try again.");
+      alert(isForward ? "Failed to forward email. Please try again." : "Failed to send reply. Please try again.");
     } finally {
       setModalReplySending(false);
     }
-  }, [selectedEmail, replyDraft, modalReplyTo, modalReplyCc, modalReplyAttachments, markAsReplied, markAsReadById, setReplyDraft, setSelectedEmail]);
+  }, [selectedEmail, replyDraft, modalReplyMode, modalReplyTo, modalReplyCc, modalReplyAttachments, markAsReplied, markAsReadById, setReplyDraft, setSelectedEmail]);
 
   const handleViewSender = useCallback((senderEmail, senderName) => {
     setSenderFilter({ email: senderEmail, name: senderName });
@@ -485,9 +499,14 @@ const DashboardView = ({
                 </button>
                 <div style={{ display: 'flex', gap: '8px' }}>
                   <button onClick={() => { setShowInsightsCompose(false); setReplyDraft(''); setModalReplyAttachments([]); }} style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', fontWeight: '600', fontSize: '0.85rem' }}>Cancel</button>
-                  <button onClick={sendModalReply} disabled={modalReplySending || !replyDraft.trim()} style={{ padding: '9px 22px', borderRadius: '8px', border: 'none', background: 'linear-gradient(135deg, #16a34a, #15803d)', color: 'white', fontWeight: '700', fontSize: '0.9rem', cursor: modalReplySending || !replyDraft.trim() ? 'not-allowed' : 'pointer', opacity: modalReplySending || !replyDraft.trim() ? 0.5 : 1, boxShadow: '0 6px 20px rgba(22,163,74,0.35)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    {modalReplySending ? <><Loader size={14} className="animate-spin" /> Sending...</> : <>➤ Send</>}
-                  </button>
+                  {(() => {
+                    const sendBlocked = modalReplySending || (modalReplyMode === "forward" ? !modalReplyTo.trim() : !replyDraft.trim());
+                    return (
+                      <button onClick={sendModalReply} disabled={sendBlocked} style={{ padding: '9px 22px', borderRadius: '8px', border: 'none', background: 'linear-gradient(135deg, #16a34a, #15803d)', color: 'white', fontWeight: '700', fontSize: '0.9rem', cursor: sendBlocked ? 'not-allowed' : 'pointer', opacity: sendBlocked ? 0.5 : 1, boxShadow: '0 6px 20px rgba(22,163,74,0.35)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        {modalReplySending ? <><Loader size={14} className="animate-spin" /> Sending...</> : <>➤ Send</>}
+                      </button>
+                    );
+                  })()}
                 </div>
               </div>
             </div>
@@ -531,7 +550,10 @@ const DashboardView = ({
               <button className={`view-btn ${mainView === 'THREADS' ? 'active' : ''}`}  onClick={() => { setSelectedEmail(null); setMainView('THREADS'); }}><Mail size={18} /> Inbox</button>
               <button className="view-btn" onClick={() => navigate('/calendar')} title="Open Calendar"><Calendar size={18} /> Calendar</button>
               {canUseTracking && (
-                <button className="view-btn" onClick={() => navigate('/tracking')} title="Follow-Up Tracking" style={{ position: 'relative' }}>📡 Tracking</button>
+                <button className="view-btn" onClick={() => navigate('/tracking')} title="Follow-Up Tracking" style={{ position: 'relative' }}><Radar size={18} /> Tracking</button>
+              )}
+              {canUseActivity && (
+                <button className="view-btn" onClick={() => navigate('/activity')} title="Team Activity"><Users size={18} /> Activity</button>
               )}
               <Iris
                 emails={emails}
@@ -542,14 +564,15 @@ const DashboardView = ({
               />
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginLeft: "20px" }}>
-              <button className="menu-btn" onClick={fetchAndAnalyze} title="Refresh Inbox"><Zap size={20} color="#374151" /></button>
+              <button className="menu-btn" onClick={fetchAndAnalyze} title="Refresh Inbox"><Zap size={20} /></button>
               <button className={`bubble-btn bubble-sync ${autoSyncEnabled ? 'bubble-sync-on' : 'bubble-sync-off'}`} onClick={() => setAutoSyncEnabled(prev => !prev)} title="Toggle Auto Sync">
-                {autoSyncEnabled ? "🟢 Auto Sync ON" : "⛔ Auto Sync OFF"}
+                <span className="sync-dot" aria-hidden="true" />
+                Auto Sync {autoSyncEnabled ? "ON" : "OFF"}
               </button>
               {lastSyncTime && (
                 <span className="sync-time-label" style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>
                   Last synced: {new Date(lastSyncTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                  {isSoftSyncing && <span className="ai-working" style={{ marginLeft: "8px" }}>🤖 AI Updating…</span>}
+                  {isSoftSyncing && <span className="ai-working" style={{ marginLeft: "8px" }}><Bot size={13} style={{ verticalAlign: '-2px' }} /> AI Updating…</span>}
                 </span>
               )}
             </div>
@@ -558,7 +581,7 @@ const DashboardView = ({
             </button>
           </div>
           <button className="bubble-btn bubble-compose" onClick={() => setShowCompose(true)} style={{ marginRight: '15px' }} title="Compose new email">
-            ✉️ <span className="compose-btn-text">Compose</span>
+            <SquarePen size={16} /> <span className="compose-btn-text">Compose</span>
           </button>
           <div className="user-profile" onClick={() => setIsProfileOpen(!isProfileOpen)}>
             <div className="user-info welcome-text" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginRight: '10px' }}>
@@ -799,7 +822,10 @@ const DashboardView = ({
                     senderFilter={senderFilter}
                     setSenderFilter={setSenderFilter}
                     inboxReady={inboxReady}
+                    inboxError={inboxError}
+                    fetchAndAnalyze={fetchAndAnalyze}
                     isAnalyzingBackground={isAnalyzingBackground}
+                    isFetchingFullInbox={isFetchingFullInbox}
                     markAsRead={markAsRead}
                     markAsReplied={markAsReplied}
                     markAsReadById={markAsReadById}
@@ -821,7 +847,10 @@ const DashboardView = ({
 
                 {/* RIGHT PANE — Email Detail */}
                 {selectedEmail && (
-                  <div ref={detailPaneRef} className="visionos-aurora-panel" style={{ flex: 1, overflowY: 'auto', borderLeft: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', animation: 'fadeSlideIn 0.25s cubic-bezier(0.2,0,0,1) both', minWidth: 0 }}>
+                  <div className="visionos-aurora-panel" style={{ flex: 1, borderLeft: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', animation: 'fadeSlideIn 0.25s cubic-bezier(0.2,0,0,1) both', minWidth: 0 }}>
+                  {/* Scrolls independently of the animated aurora background above —
+                      keeping them decoupled avoids recompositing the blur every scroll frame. */}
+                  <div ref={detailPaneRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
                     <div className="modal-header">
                       <button className="btn-close" onClick={() => setSelectedEmail(null)}><ArrowLeft size={18} /> Back</button>
                       <div className="modal-actions" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -863,12 +892,16 @@ const DashboardView = ({
                           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                             <strong style={{ color: "var(--text-primary)", fontWeight: "700", whiteSpace: "nowrap" }}>Draft Reply</strong>
                             {replyDraft && (<button onClick={handleCopy} className="btn-copy" title="Copy">{copySuccess ? <Check size={14} color="#10b981" /> : <Copy size={14} />} {copySuccess ? "Copied!" : "Copy"}</button>)}
-                            {replyDraft && (
-                              <button onClick={sendModalReply} disabled={modalReplySending || !replyDraft.trim()}
-                                style={{ background: modalReplySending ? "#9ca3af" : "linear-gradient(135deg, #16a34a, #15803d)", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", fontWeight: "700", cursor: modalReplySending || !replyDraft.trim() ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "6px", boxShadow: "0 4px 12px rgba(22,163,74,0.3)" }}>
-                                {modalReplySending ? <><Loader size={13} className="animate-spin" /> Sending...</> : <>➤ Send</>}
-                              </button>
-                            )}
+                            {/* Forward doesn't require a note — only Reply/Reply All need drafted text before Send appears */}
+                            {(modalReplyMode === "forward" || replyDraft) && (() => {
+                              const sendBlocked = modalReplySending || (modalReplyMode === "forward" ? !modalReplyTo.trim() : !replyDraft.trim());
+                              return (
+                                <button onClick={sendModalReply} disabled={sendBlocked}
+                                  style={{ background: modalReplySending ? "#9ca3af" : "linear-gradient(135deg, #16a34a, #15803d)", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", fontWeight: "700", cursor: sendBlocked ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "6px", boxShadow: "0 4px 12px rgba(22,163,74,0.3)" }}>
+                                  {modalReplySending ? <><Loader size={13} className="animate-spin" /> Sending...</> : <>➤ Send</>}
+                                </button>
+                              );
+                            })()}
                           </div>
                           <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
                             {[
@@ -951,6 +984,7 @@ const DashboardView = ({
                         </div>
                       )}
                     </div>
+                  </div>
                   </div>
                 )}
               </div>
