@@ -1010,8 +1010,17 @@ def _detect_meeting_invite(entry: dict) -> bool:
 
 def save_emails_to_id_cache(emails: list, user_email: str):
     existing = get_cached_emails_by_id(user_email)
+    skipped = 0
     for e in emails:
         eid = e.get("id") or e.get("messageId")
+        # Never persist a failed analysis. This cache is consulted before the
+        # AI runs, so caching a failure makes it permanent: the email becomes
+        # a cache hit and shows "Pending analysis" forever, even though the
+        # next sync could have summarised it fine. Leaving it out costs one
+        # re-analysis and fixes itself.
+        if e.get("_analysisFailed"):
+            skipped += 1
+            continue
         if eid:
             entry = e.copy()
             entry.pop("full_hash", None)
@@ -1032,6 +1041,8 @@ def save_emails_to_id_cache(emails: list, user_email: str):
                 ]
 
             existing[eid] = entry
+    if skipped:
+        log.error(f"[cache] not caching {skipped} failed analyses for {user_email} — they will be retried next sync")
     save_cache({EMAIL_ID_CACHE_KEY: existing}, user_email)
 
 
@@ -1288,6 +1299,7 @@ Body:{body}{CLASSIFICATION_PROMPT}{_get_correction_block()}
         log.error(f"Single mail analysis failed: {e}")
         email["category"] = "NORMAL"
         email["summary"] = "Pending analysis"
+        email["_analysisFailed"] = True   # not a result — never cache it
         return email
 
 
@@ -1455,14 +1467,32 @@ OUTPUT JSON:
 {{"results": [{{"index": 0, "category": "...", "priority": 1, "summary": "..."}}]}}
 """
         try:
-            response = await client.chat.completions.create(
-                model=ACTIVE_MODEL,
-                messages=[
-                    {"role": "system", "content": "Output JSON only."},
-                    {"role": "user", "content": chunk_prompt}
-                ],
-                response_format={"type": "json_object"}
-            )
+            # Retry transient failures (rate limits, timeouts, blips) before
+            # giving up on the whole chunk. One hiccup used to mark 20 emails
+            # "Pending analysis", and because that result was cached they were
+            # never looked at again.
+            last_err = None
+            response = None
+            for attempt in range(3):
+                try:
+                    response = await client.chat.completions.create(
+                        model=ACTIVE_MODEL,
+                        messages=[
+                            {"role": "system", "content": "Output JSON only."},
+                            {"role": "user", "content": chunk_prompt}
+                        ],
+                        response_format={"type": "json_object"}
+                    )
+                    break
+                except Exception as api_err:
+                    last_err = api_err
+                    if attempt < 2:
+                        wait = 2 ** attempt          # 1s, then 2s
+                        log.warning(f"Batch chunk attempt {attempt + 1} failed ({type(api_err).__name__}), retrying in {wait}s")
+                        await asyncio.sleep(wait)
+            if response is None:
+                raise last_err
+
             parsed = json.loads(response.choices[0].message.content)
             results_map = {r["index"]: r for r in parsed.get("results", [])}
 
@@ -1491,10 +1521,17 @@ OUTPUT JSON:
                 all_ai_results.append(email)
 
         except Exception as ex:
-            log.warning(f"Batch chunk failed: {ex}")
+            # log.error, not warning: this leaves a whole chunk of mail without
+            # a summary, and the app runs at errors-only log level.
+            log.error(f"Batch chunk failed after retries ({len(chunk_emails)} emails): {ex}")
             for email in chunk_emails:
                 email["category"] = "NORMAL"
                 email["summary"] = "Pending analysis"
+                # Marks this as a failure, not a result. save_emails_to_id_cache
+                # refuses to persist it, so the email is retried on the next
+                # sync instead of being a permanent cache hit showing
+                # "Pending analysis" forever.
+                email["_analysisFailed"] = True
                 all_ai_results.append(email)
 
     return pre_classified + all_ai_results
