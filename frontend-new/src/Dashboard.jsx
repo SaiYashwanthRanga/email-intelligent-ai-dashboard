@@ -31,15 +31,50 @@ function Dashboard() {
   
   // ✅ FIX: Prevent double fetch on mount
   const hasInitiallyFetched = useRef(false);
+
+  // True once the inbox has shown real data (live or cache-fallback) at
+  // least once this session. Used to decide whether a cache-fallback
+  // /fetch-inbox response is safe to apply: on a truly empty screen it's a
+  // clear win (something real beats nothing), but once the user already has
+  // a populated view, a cache response must never overwrite it — the local
+  // cache lags behind actions like markAsRead (see markAsRead below, which
+  // updates React state + the org server directly but not this cache), so
+  // reapplying stale cache data could visibly un-read an email the user
+  // just read. A ref (not state) so it's readable synchronously mid-fetch
+  // without waiting on a re-render.
+  const hasShownInboxRef = useRef(false);
   
   // --- STATE ---
   const [emails, setEmails] = useState([]);
   const [lastUserActivityTime, setLastUserActivityTime] = useState(Date.now());
-  const [lastSyncTime, setLastSyncTime] = useState(null);
+  // Rehydrate from the previous session rather than starting at null: it was
+  // already being written to localStorage but never read back, so a fresh
+  // page load showed no sync time at all until the first sync returned. That
+  // also covers the deploy gap where a user's cache predates the backend's
+  // meta_last_fetch_ok_at key and the X-Cache-As-Of header can't be sent.
+  const [lastSyncTime, setLastSyncTime] = useState(() => {
+    try {
+      const saved = localStorage.getItem("lastSyncTime");
+      return saved && !Number.isNaN(new Date(saved).getTime()) ? saved : null;
+    } catch {
+      return null;   // private mode / storage disabled
+    }
+  });
   const [isIdle, setIsIdle] = useState(false);
   const [inboxReady, setInboxReady] = useState(false);
   const [inboxError, setInboxError] = useState(false);
+  // Which hop failed: "server" (our own API unreachable), "timeout", or
+  // "upstream" (API answered with an error). Drives the message shown, so a
+  // backend that simply isn't running never gets reported as Outlook being down.
+  const [inboxErrorKind, setInboxErrorKind] = useState(null);
   const [isSoftSyncing, setIsSoftSyncing] = useState(false);
+  // True when /fetch-inbox couldn't reach the org mail server and the
+  // backend served the last known inbox from cache instead (see
+  // X-Data-Source response header). This is a *successful* response with
+  // real data — not the inboxError dead-end — so the inbox keeps rendering
+  // normally with a small "reconnecting" banner instead of going blank.
+  const [usingCachedInbox, setUsingCachedInbox] = useState(false);
+  const [cacheAsOf, setCacheAsOf] = useState(null);
   // True while phase 2 (the full-inbox background fetch) is still running,
   // so the inbox list can show a "still fetching" indicator once the user
   // scrolls past the fast first batch instead of the list just ending.
@@ -499,25 +534,40 @@ function Dashboard() {
   };
 
   // --- NEW HELPER: Get sender details (emails + attachments from a specific sender) ---
-  const getSenderDetails = (senderEmail) => {
+  // Resolve a sender to their mail. Matches on the email address inside the
+  // `from` field, not a substring of the whole string: the old version did
+  // `from.includes(name)`, so a sender displayed as "IT" also matched
+  // "Smith <smith@…>" and "Whitney <…>" (both contain "it"), while any
+  // difference in casing or spacing matched nothing at all.
+  const getSenderDetails = (sender) => {
+    const wanted = String(sender || "").trim().toLowerCase();
+    if (!wanted) return { mails: [], attachments: [] };   // never match everything
+
+    const addressOf = (raw) => {
+      const m = String(raw || "").match(/[\w.+-]+@[\w.-]+/);
+      return m ? m[0].toLowerCase() : "";
+    };
+    const wantedAddress = addressOf(wanted);
+
     const senderMails = emails.filter(e => {
-      const from = (e.from || "").toLowerCase();
-      return from.includes(senderEmail.toLowerCase());
+      const from = (e.from || e.sender || "");
+      const address = addressOf(from);
+      // Preferred: exact address-to-address match.
+      if (wantedAddress) return address === wantedAddress;
+      // Fallback for a display-name-only sender: compare against just the
+      // display portion, so the match can't stray into the address.
+      const displayName = String(from).split("<")[0].trim().toLowerCase();
+      return displayName === wanted;
     });
 
     const attachments = [];
-
     senderMails.forEach(e => {
-      // Attachments are now in email.attachments
       if (e.attachments && Array.isArray(e.attachments)) {
         attachments.push(...e.attachments);
       }
     });
 
-    return {
-      mails: senderMails,
-      attachments
-    };
+    return { mails: senderMails, attachments };
   };
 
   // --- PERSISTENCE & AUTH ---
@@ -726,6 +776,7 @@ function Dashboard() {
     if (!silent) {
       setInboxReady(false);   // only block UI on manual refresh
       setInboxError(false);
+      setInboxErrorKind(null);
       addToast("Syncing Inbox...", "loading");
       setLoading(true);
     }
@@ -746,6 +797,37 @@ function Dashboard() {
       setLastSyncTime(now);
     };
 
+    // Read the X-Data-Source header the backend stamps on every /fetch-inbox
+    // response and react accordingly: "live" is a real sync (mark it as
+    // such); "cache" means the org mail server is unreachable right now and
+    // this is a fallback to the last inbox we successfully fetched — keep
+    // showing the *real* last-synced time instead of overwriting it with
+    // "now", and flag the banner so the UI reads as "reconnecting", not stuck.
+    const applyDataSource = (res) => {
+      if (res.headers?.["x-data-source"] === "cache") {
+        setUsingCachedInbox(true);
+        const asOf = res.headers?.["x-cache-as-of"];
+        if (asOf) {
+          localStorage.setItem("lastSyncTime", asOf);
+          setLastSyncTime(asOf);
+          setCacheAsOf(asOf);
+        }
+      } else {
+        setUsingCachedInbox(false);
+        markSynced();
+      }
+    };
+
+    // Whether a /fetch-inbox response is safe to apply to the visible inbox.
+    // Live data always is. Cache-fallback data only is when the screen is
+    // still empty this session — once something real is already showing,
+    // a cache response is a no-op for the list (badge/timestamp still
+    // update via applyDataSource) so a connectivity blip can never make
+    // already-read mail look unread again or drop something the user is
+    // actively looking at.
+    const isCacheSource = (res) => res.headers?.["x-data-source"] === "cache";
+    const canApply = (res) => !isCacheSource(res) || !hasShownInboxRef.current;
+
     try {
       if (silent) {
         // 🟢 SILENT AUTO-SYNC — the user is idle and not watching, so there's
@@ -758,10 +840,16 @@ function Dashboard() {
         });
 
         if (Array.isArray(res.data)) {
-          await runAnalysis(res.data, true);
-          fetchStats();
-          restoreSelectionFields(res.data, currentSelectedId);
-          markSynced();
+          if (canApply(res)) {
+            await runAnalysis(res.data, true);
+            fetchStats();
+            restoreSelectionFields(res.data, currentSelectedId);
+            if (res.data.length > 0) hasShownInboxRef.current = true;
+          }
+          // else: org server is unreachable and the user already has a live
+          // view on screen — leave it exactly as-is, just surface the
+          // "reconnecting" badge below. The next silent poll retries.
+          applyDataSource(res);
         }
         return;
       }
@@ -781,40 +869,88 @@ function Dashboard() {
         return;
       }
 
-      addToast(`Loaded your latest ${fastRes.data.length} emails — analyzing…`, "success");
-      setEmails(fastRes.data);
-      setInboxReady(true);
-      await runAnalysis(fastRes.data, false);
-      restoreSelectionFields(fastRes.data, currentSelectedId);
-      fetchStats();
-      markSynced();
+      const fastApplies = canApply(fastRes);
+
+      if (isCacheSource(fastRes)) {
+        addToast(
+          hasShownInboxRef.current
+            ? "Can't reach Outlook right now — keeping your current inbox."
+            : "Can't reach Outlook right now — showing your last synced inbox.",
+          "error"
+        );
+      } else {
+        addToast(`Loaded your latest ${fastRes.data.length} emails — analyzing…`, "success");
+      }
+
+      if (fastApplies) {
+        setEmails(fastRes.data);
+        if (fastRes.data.length > 0) hasShownInboxRef.current = true;
+        setInboxReady(true);
+        await runAnalysis(fastRes.data, false);
+        restoreSelectionFields(fastRes.data, currentSelectedId);
+        fetchStats();
+      } else {
+        setInboxReady(true);   // something is already on screen — just not from this fetch
+      }
+      applyDataSource(fastRes);
       setLoading(false);   // unblock the UI now — phase 2 continues quietly below
 
       // PHASE 2: fetch the full inbox in the background and merge it in.
-      // Emails already shown (and already analyzed) win over the raw
-      // re-fetched copy for the same id — dedupeById keeps the *last*
-      // entry per id, and `prev` (already-analyzed) is placed last below.
-      setIsFetchingFullInbox(true);
-      try {
-        const fullRes = await axios.get(`${API_BASE}/fetch-inbox`, {
-          params: { email: userEmail, count: FULL_FETCH_COUNT },
-          timeout: 130000
-        });
+      // Skipped when phase 1 just found the org server down and there was
+      // already a live view on screen — it won't have recovered in the
+      // handful of milliseconds since, so retrying immediately only adds a
+      // doomed 130s-timeout call; the next autosync cycle (or manual
+      // refresh) retries naturally instead.
+      if (fastApplies) {
+        setIsFetchingFullInbox(true);
+        try {
+          const fullRes = await axios.get(`${API_BASE}/fetch-inbox`, {
+            params: { email: userEmail, count: FULL_FETCH_COUNT },
+            timeout: 130000
+          });
 
-        if (Array.isArray(fullRes.data)) {
-          setEmails(prev => dedupeById([...fullRes.data, ...prev]));
-          await runAnalysis(fullRes.data, true);   // silent=true → no second "Inbox loaded!" toast
-          restoreSelectionFields(fullRes.data, currentSelectedId);
-          markSynced();
+          if (Array.isArray(fullRes.data)) {
+            if (canApply(fullRes)) {
+              // Emails already shown (and already analyzed) win over the raw
+              // re-fetched copy for the same id — dedupeById keeps the *last*
+              // entry per id, and `prev` (already-analyzed) is placed last below.
+              setEmails(prev => dedupeById([...fullRes.data, ...prev]));
+              if (fullRes.data.length > 0) hasShownInboxRef.current = true;
+              await runAnalysis(fullRes.data, true);   // silent=true → no second "Inbox loaded!" toast
+              restoreSelectionFields(fullRes.data, currentSelectedId);
+            }
+            applyDataSource(fullRes);
+          }
+        } catch (err) {
+          console.warn("Background full-inbox sync failed; fast batch remains shown:", err.message);
+        } finally {
+          setIsFetchingFullInbox(false);
         }
-      } catch (err) {
-        console.warn("Background full-inbox sync failed; fast batch remains shown:", err.message);
-      } finally {
-        setIsFetchingFullInbox(false);
       }
     } catch (err) {
       if (!silent) {
-        addToast(`Sync Error: ${err.message}`, "error");
+        // Say which hop actually failed. These used to all surface as
+        // "the Outlook connection may be down", which pointed at the wrong
+        // culprit when it was really our own backend that wasn't running —
+        // and sent people looking in entirely the wrong place.
+        //   no response at all  → the dashboard's own API is unreachable
+        //   timeout             → API answered too slowly (often a stalled
+        //                         upstream mail server behind it)
+        //   response with status→ the API answered, but with an error
+        const kind = err.code === "ECONNABORTED" || /timeout/i.test(err.message || "")
+          ? "timeout"
+          : !err.response
+            ? "server"
+            : "upstream";
+        setInboxErrorKind(kind);
+        addToast(
+          kind === "server"
+            ? "Can't reach the dashboard server — is the backend running?"
+            : kind === "timeout"
+              ? "The mail server is taking too long to respond."
+              : `Sync Error: ${err.message}`,
+          "error"
+        );
         setInboxError(true);
         setInboxReady(true);   // stop the infinite "Syncing inbox..." spinner
       }
@@ -1021,8 +1157,19 @@ function Dashboard() {
       setThreadLoading(true);
       setParsedThread([]);
       
-      // If email has messages array, use it; otherwise treat as single message
-      if (selectedEmail.messages && Array.isArray(selectedEmail.messages)) {
+      // Use the thread array only if those messages actually carry bodies.
+      //
+      // The inbox sync payload includes a messages[] with the thread's shape
+      // but no content — bodies are stripped to keep syncs light, and only
+      // /api/email-details fills them in. Rendering that array as-is produces
+      // a conversation where every message reads "No content available",
+      // which is what shows if enrichment is slow, fails, or ever returns a
+      // partial copy. Falling through to the single-body view instead means
+      // the reader always has real content, and the full thread appears the
+      // moment enrichment lands (it bumps threadKey, re-running this).
+      const threadMsgs = Array.isArray(selectedEmail.messages) ? selectedEmail.messages : [];
+      const threadHasBodies = threadMsgs.some(m => m && (m.body || m.Body));
+      if (threadMsgs.length > 0 && threadHasBodies) {
         // .NET returns oldest→newest — reverse so newest is idx 0 (LATEST), matching Outlook order
         const sorted = [...selectedEmail.messages].sort((a, b) => {
           try {
@@ -1031,7 +1178,15 @@ function Dashboard() {
           } catch { return 0; }
         });
         const segments = sorted.map((msg, idx) => {
-          const { visible, quoted } = splitAtQuote(msg.body || msg.Body || "");
+          const raw = msg.body || msg.Body || "";
+          let { visible, quoted } = splitAtQuote(raw);
+          // A reply whose quote separator sits at the very top splits to an
+          // empty "visible" half. Showing the whole body (quote included)
+          // beats rendering a blank message.
+          if (!visible || !visible.trim()) {
+            visible = raw;
+            quoted  = '';
+          }
           const msgFrom = msg.from || msg.From || "Unknown";
           const msgDate = msg.received || msg.received_at || msg.date || msg.Received || "";
           return {
@@ -1344,8 +1499,11 @@ function Dashboard() {
       
       // --- NEW PROPS PASSED DOWN ---
       lastSyncTime={lastSyncTime}
+      usingCachedInbox={usingCachedInbox}
+      cacheAsOf={cacheAsOf}
       inboxReady={inboxReady}
       inboxError={inboxError}
+      inboxErrorKind={inboxErrorKind}
       isSoftSyncing={isSoftSyncing}
       autoSyncEnabled={autoSyncEnabled}
       setAutoSyncEnabled={setAutoSyncEnabled}

@@ -1,10 +1,10 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
   Paperclip, BarChart3, X, PieChart, Mail, ArrowLeft, Calendar,
   FileText, Download, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader, LogOut,
-  Radar, Users, SquarePen, Bot
+  Radar, Users, SquarePen, Bot, WifiOff
 } from 'lucide-react';
 import TriageSummary from './TriageSummary';
 import ToastContainer from './Toast';
@@ -42,7 +42,7 @@ function InsightsInstantPanel({ emails, onViewSender }) {
   const topSenders = Object.values(senderMap).sort((a, b) => b.count - a.count).slice(0, 6);
   if (!topSenders.length) return null;
   return (
-    <div className="insta-glass-card" style={{ padding: "18px", marginBottom: "16px", animation: "fadeSlideUp 0.4s ease 0.1s both" }}>
+    <div className="insta-glass-card" style={{ padding: "18px", marginBottom: "16px" }}>
       <div style={{ fontSize: "0.72rem", fontWeight: "700", letterSpacing: "1px", color: "var(--text-secondary)", textTransform: "uppercase", marginBottom: "14px" }}>👥 Top Senders by Volume</div>
       <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
         {topSenders.map((s, i) => (
@@ -57,7 +57,7 @@ function InsightsInstantPanel({ emails, onViewSender }) {
                 </div>
               </div>
               <div style={{ height: "4px", background: "var(--border-color)", borderRadius: "4px", overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${(s.count / topSenders[0].count) * 100}%`, background: `hsl(${(i * 47 + 210) % 360}, 60%, 45%)`, borderRadius: "4px", transition: "width 0.8s ease" }} />
+                <div style={{ height: "100%", width: `${(s.count / topSenders[0].count) * 100}%`, background: `hsl(${(i * 47 + 210) % 360}, 60%, 45%)`, borderRadius: "4px" }} />
               </div>
             </div>
             {s.unread > 0 && (<span style={{ background: "#f59e0b", color: "#000", fontSize: "0.6rem", fontWeight: "800", borderRadius: "999px", padding: "1px 6px", flexShrink: 0 }}>{s.unread} new</span>)}
@@ -167,12 +167,27 @@ const collectThreadAtts = (email, parsed) => {
   return all;
 };
 
+// "Last synced" label. Time alone is fine for today, but stale data from a
+// previous day rendered as a bare "14:03" reads as if it were today —
+// exactly the wrong impression while the Outlook fallback is serving a
+// cached inbox, so anything not from today carries its date.
+const formatSyncTime = (iso) => {
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return "unknown";
+  const time = dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const isToday = dt.toDateString() === new Date().toDateString();
+  return isToday ? time : `${dt.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
+};
+
+// How many emails/files a sender card shows before "Show all".
+const SENDER_PREVIEW_LIMIT = 5;
+
 // ─── DASHBOARD VIEW ───────────────────────────────────────────────────────
 const DashboardView = ({
   emails, report, loading, mainView, setMainView, activeTab, setActiveTab,
   username, greetingInfo, theme, toggleTheme, toasts, removeToast,
   isProfileOpen, setIsProfileOpen,
-  lastSyncTime, inboxReady, inboxError, isSoftSyncing, autoSyncEnabled, setAutoSyncEnabled,
+  lastSyncTime, usingCachedInbox, cacheAsOf, inboxReady, inboxError, inboxErrorKind, isSoftSyncing, autoSyncEnabled, setAutoSyncEnabled,
   isFetchingFullInbox = false,
   selectedEmail, setSelectedEmail, fileModalData, setFileModalData,
   parsedThread, threadLoading, replyDraft, setReplyDraft, replyLoading, copySuccess,
@@ -319,6 +334,23 @@ const DashboardView = ({
     setMainView('THREADS');
     setActiveTab('ALL');
   }, [setSenderFilter, setMainView, setActiveTab]);
+
+  // Sender cards preview this many emails/files before "Show all".
+  const [expandedSenders, setExpandedSenders] = useState({});
+
+  // Executive Summary cards, deduped by subject. Computed once here and used
+  // for BOTH the THREADS stat and the rendered list — previously the stat
+  // counted report.briefing_cards raw while the list deduped them inline, so
+  // the tile could show a higher number than the cards visible beneath it.
+  const briefingCards = useMemo(() => {
+    const seen = new Set();
+    return (report?.briefing_cards || []).filter(card => {
+      const key = (card.subject || card.topic || card.id || "").trim().toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [report]);
 
   // ── ATTACHMENT LIST RENDERER (used in both detail panels) ──────────────
   const renderAttList = (atts) => (
@@ -569,9 +601,23 @@ const DashboardView = ({
                 <span className="sync-dot" aria-hidden="true" />
                 Auto Sync {autoSyncEnabled ? "ON" : "OFF"}
               </button>
+              {usingCachedInbox && (
+                <span
+                  className="stale-inbox-badge"
+                  title={
+                    "Can't reach the Outlook mail server right now — showing the last inbox " +
+                    (cacheAsOf
+                      ? `we successfully synced, at ${new Date(cacheAsOf).toLocaleString([], { hour: "2-digit", minute: "2-digit" })}.`
+                      : "we successfully synced.") +
+                    " Retrying automatically."
+                  }
+                >
+                  <WifiOff size={13} /> Reconnecting to Outlook…
+                </span>
+              )}
               {lastSyncTime && (
                 <span className="sync-time-label" style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>
-                  Last synced: {new Date(lastSyncTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  Last synced: {formatSyncTime(lastSyncTime)}
                   {isSoftSyncing && <span className="ai-working" style={{ marginLeft: "8px" }}><Bot size={13} style={{ verticalAlign: '-2px' }} /> AI Updating…</span>}
                 </span>
               )}
@@ -605,11 +651,11 @@ const DashboardView = ({
             {mainView === 'INSIGHTS' && (
               <div className="dashboard-grid">
                 <div className="col-left">
-                  <TriageSummary stats={triageStats} realThreads={realThreads} emails={emails} report={report}
+                  <TriageSummary stats={triageStats} emails={emails} report={report} threadCount={(realThreads || []).length}
                     onAttachmentClick={() => { const allFiles = getAllAttachments(); setFileModalData({ title: `All Attachments (${allFiles.length})`, files: allFiles }); }}
                     onEmailsClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('ALL'); }}
                     onThreadsClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('THREADS'); setActiveCategory('ALL'); }}
-                    onInvitesClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('ZOOM'); }} />
+                    onInvitesClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('INVITES'); }} />
 
                   {emails.length > 0 && (<div style={{ marginBottom: "4px" }}><InsightsInstantPanel emails={emails} onViewSender={handleViewSender} /></div>)}
 
@@ -654,7 +700,7 @@ const DashboardView = ({
                             } catch { return item.date; }
                           })();
                           return (
-                            <div key={i} className="insta-glass-card" style={{ borderLeft: `4px solid ${i === 0 ? "#00d9ff" : "#3b82f6"}`, padding: "18px 20px", animation: `fadeSlideUp 0.35s ease ${i * 0.08}s both` }}>
+                            <div key={i} className="insta-glass-card" style={{ borderLeft: `4px solid ${i === 0 ? "#00d9ff" : "#3b82f6"}`, padding: "18px 20px" }}>
                               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px" }}>
                                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                                   <span style={{ fontSize: "1rem", fontWeight: "800", color: i === 0 ? "#00d9ff" : "#3b82f6", letterSpacing: "0.3px" }}>{dateLabel}</span>
@@ -702,17 +748,9 @@ const DashboardView = ({
                         )}
                       </div>
                       <div className="ts-content">
-                        {(report.briefing_cards || []).length > 0 ? (
+                        {briefingCards.length > 0 ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
-                            {(() => {
-                              const seenSubjects = new Set();
-                              return report.briefing_cards.filter(card => {
-                                const key = (card.subject || card.topic || card.id || "").trim().toLowerCase();
-                                if (!key || seenSubjects.has(key)) return false;
-                                seenSubjects.add(key);
-                                return true;
-                              });
-                            })().map((card) => {
+                            {briefingCards.map((card) => {
                               const searchPool  = groupedEmails || emails;
                               const threadEmail =
                                 searchPool.find(e => String(e.id).trim() === String(card.id).trim() || String(e.messageId).trim() === String(card.id).trim()) ||
@@ -758,29 +796,47 @@ const DashboardView = ({
                   ) : (
                     <div className="sender-list-grid">
                       {(report.sender_summaries || []).map((s, i) => {
-                        const { mails, attachments } = getSenderDetails(s.name);
+                        // Match on the address the backend grouped by (`s.email`),
+                        // falling back to the display name for older cached reports
+                        // that predate that field.
+                        const senderKey = s.email || s.name;
+                        const { mails, attachments } = getSenderDetails(senderKey);
+                        // Prefer the locally resolved numbers so the header, the
+                        // list below it, and the "Show all" label always agree.
+                        // The backend's own count only stands in when nothing
+                        // resolved locally (the sender's mail isn't in the loaded
+                        // set), so the card never reads "0 Emails" underneath a
+                        // summary describing them.
+                        const mailCount = mails.length || s.count || 0;
+                        const attCount  = attachments.length || s.attachments || 0;
+                        const isOpen    = !!expandedSenders[senderKey];
+                        const shownMails = isOpen ? mails : mails.slice(0, SENDER_PREVIEW_LIMIT);
+                        const shownAtts  = isOpen ? attachments : attachments.slice(0, SENDER_PREVIEW_LIMIT);
                         return (
                           <div key={i} className="sender-card-large">
                             <div className="sender-top">
-                              <div className="avatar-small">{s.name.charAt(0).toUpperCase()}</div>
+                              <div className="avatar-small">{(s.name || "?").charAt(0).toUpperCase()}</div>
                               <div style={{ flex: 1, minWidth: 0 }}>
                                 <strong>{s.name}</strong>
-                                <div style={{ fontSize: "0.75rem", color: "#94a3b8" }}>{mails.length} Emails • {attachments.length} Attachments</div>
+                                <div style={{ fontSize: "0.75rem", color: "#94a3b8" }}>{mailCount} Emails • {attCount} Attachments</div>
                               </div>
-                              <button onClick={() => handleViewSender(s.name, s.name)} style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", border: "none", borderRadius: "6px", padding: "4px 12px", fontSize: "0.72rem", fontWeight: "700", cursor: "pointer", flexShrink: 0, boxShadow: "0 2px 8px rgba(0,217,255,0.35)", whiteSpace: "nowrap" }}>View Emails</button>
+                              <button onClick={() => handleViewSender(senderKey, s.name)} style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", border: "none", borderRadius: "6px", padding: "4px 12px", fontSize: "0.72rem", fontWeight: "700", cursor: "pointer", flexShrink: 0, boxShadow: "0 2px 8px rgba(0,217,255,0.35)", whiteSpace: "nowrap" }}>View Emails</button>
                             </div>
                             <div className="sender-desc">{s.summary || "No summary available"}</div>
                             {mails.length > 0 && (
                               <div style={{ marginTop: "10px" }}>
                                 <strong style={{ fontSize: "0.9rem" }}>Emails Sent:</strong>
-                                <ul style={{ fontSize: "0.8rem", paddingLeft: "18px", marginTop: "5px" }}>{mails.map((m, idx) => <li key={idx}>{m.subject || "No Subject"}</li>)}</ul>
+                                {/* Capped: this used to render every email from the
+                                    sender, so a busy sender put hundreds of rows in
+                                    one card. */}
+                                <ul style={{ fontSize: "0.8rem", paddingLeft: "18px", marginTop: "5px" }}>{shownMails.map((m, idx) => <li key={idx}>{m.subject || "No Subject"}</li>)}</ul>
                               </div>
                             )}
                             {attachments.length > 0 && (
                               <div style={{ marginTop: "10px" }}>
                                 <strong style={{ fontSize: "0.9rem" }}>Attachments:</strong>
                                 <div className="ec-atts" style={{ marginTop: "5px" }}>
-                                  {attachments.map((a, idx) => (
+                                  {shownAtts.map((a, idx) => (
                                     <div key={idx} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
                                       <span style={{ flex: 1 }}>{a.name || "File"}<span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>{formatFileSize(a.size)}</span></span>
                                       <button onClick={(e) => { e.stopPropagation(); handleFileDownload(a, a.messageId); }} disabled={isFileDownloading(a, a.messageId)}
@@ -791,6 +847,16 @@ const DashboardView = ({
                                   ))}
                                 </div>
                               </div>
+                            )}
+                            {(mails.length > SENDER_PREVIEW_LIMIT || attachments.length > SENDER_PREVIEW_LIMIT) && (
+                              <button
+                                onClick={() => setExpandedSenders(p => ({ ...p, [senderKey]: !p[senderKey] }))}
+                                style={{ marginTop: "10px", width: "100%", padding: "6px 12px", background: "rgba(255,255,255,0.03)", border: "1px solid var(--border-color)", borderRadius: "8px", cursor: "pointer", fontSize: "0.75rem", fontWeight: "700", color: "var(--text-secondary)" }}
+                              >
+                                {isOpen
+                                  ? "Show less"
+                                  : `Show all (${mails.length} email${mails.length === 1 ? "" : "s"}, ${attachments.length} file${attachments.length === 1 ? "" : "s"})`}
+                              </button>
                             )}
                           </div>
                         );
@@ -823,6 +889,7 @@ const DashboardView = ({
                     setSenderFilter={setSenderFilter}
                     inboxReady={inboxReady}
                     inboxError={inboxError}
+                    inboxErrorKind={inboxErrorKind}
                     fetchAndAnalyze={fetchAndAnalyze}
                     isAnalyzingBackground={isAnalyzingBackground}
                     isFetchingFullInbox={isFetchingFullInbox}

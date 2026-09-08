@@ -354,6 +354,28 @@ body {
   background: #fff;
   box-shadow: 0 0 6px rgba(255,255,255,0.85);
 }
+
+/* "Reconnecting to Outlook" badge — shown when /fetch-inbox is falling back
+   to the last cached inbox because the org mail server can't be reached. */
+.stale-inbox-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  cursor: default;
+  animation: stale-pulse 2s ease-in-out infinite;
+}
+.stale-inbox-badge svg { flex-shrink: 0; }
+@keyframes stale-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
 .bubble-sync-on {
   background: linear-gradient(160deg, rgba(74,222,128,0.6) 0%, rgba(22,163,74,0.6) 100%);
   box-shadow: 0 6px 18px rgba(22,163,74,0.35), inset 0 1px 0 rgba(255,255,255,0.3), inset 0 -6px 10px rgba(0,0,0,0.12);
@@ -692,8 +714,7 @@ body.light-mode .sticky-folders-header {
   border: var(--glass-border); box-shadow: 0 4px 15px rgba(0,0,0,0.1);
   cursor: pointer;
 }
-.email-card:hover { 
-  transform: translateY(-4px); 
+.email-card:hover {
   box-shadow: 0 12px 30px rgba(0, 217, 255, 0.15), 0 0 20px rgba(59, 130, 246, 0.1);
   border-color: #00d9ff;
 }
@@ -1901,18 +1922,19 @@ body.light-mode .toast-item {
   border-left: 4px solid #2563eb;
 }
 
-/* ✨ Active Email Card */
+/* ✨ Active Email Card — colour/shadow only, no scale: a transformed card
+   in a scrolling list shifts its neighbours' perceived position. */
 .email-card.active {
   box-shadow: 0 0 10px rgba(59,130,246,0.6);
-  transform: scale(1.01);
 }
 
-/* 🪶 Inbox Hover Lift */
+/* Hover feedback without movement. `transition: all` was also transitioning
+   layout-affecting properties on every card — scoped to the two that
+   actually change. */
 .email-card {
-  transition: all 0.15s ease;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
 }
 .email-card:hover {
-  transform: translateY(-2px);
   box-shadow: 0 6px 14px rgba(0,0,0,0.08);
 }
 

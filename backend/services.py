@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 import asyncio
 import hashlib
 import html
@@ -816,12 +817,180 @@ def set_last_email_count(count, user_email: str):
 def get_cached_emails_by_id(user_email: str) -> dict:
     return load_cache(user_email).get(EMAIL_ID_CACHE_KEY, {})
 
-# Phrases/domains that mean "this is a meeting/call invite" — mirrors the
-# sniff InboxView.jsx runs over email.body to decide whether to show the
-# RSVP bar on a card. Kept in sync deliberately: we compute this once here,
-# while the body is still around, then drop the body from what gets cached
-# (see save_emails_to_id_cache) so the flag substitutes for the body on
-# every future cache hit instead of re-shipping the full HTML forever.
+# ── Live-fetch fallback — when the org mail server can't be reached ────────
+# Stamped every time /api/fetch-inbox gets a real 200 back, so the UI can
+# show "last synced <time>" even while it's currently serving stale data.
+LAST_FETCH_OK_KEY = "meta_last_fetch_ok_at"
+
+def get_last_fetch_ok_at(user_email: str):
+    return load_cache(user_email).get(LAST_FETCH_OK_KEY)
+
+def set_last_fetch_ok_at(ts, user_email: str):
+    save_cache({LAST_FETCH_OK_KEY: ts}, user_email)
+
+# ── Email body/detail cache — makes mail readable during an outage ────────
+# The id-cache above deliberately drops bodies to keep syncs light, so
+# without this the inbox list would render during an outage but every email
+# would open blank. Stored one file per message rather than one big blob:
+# the access pattern is "read one, write one", and a single JSON file of a
+# few hundred HTML bodies would mean rewriting megabytes on every open.
+DETAIL_CACHE_DIR = "detail_cache"
+DETAIL_CACHE_MAX = 300          # per user; oldest pruned first
+DETAIL_BODY_MAX_CHARS = 400_000  # skip absurd bodies rather than bloat the disk
+
+def _detail_dir_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", (user_email or "default").lower().strip())
+    return os.path.join(DETAIL_CACHE_DIR, safe)
+
+def _detail_path_for(user_email: str, message_id: str) -> str:
+    # messageIds are long base64-ish EWS strings with characters that are not
+    # filename-safe, so key by hash.
+    digest = hashlib.sha1((message_id or "").encode("utf-8")).hexdigest()
+    return os.path.join(_detail_dir_for(user_email), f"{digest}.json")
+
+def detail_is_complete(detail) -> bool:
+    """
+    True when a cached detail carries everything the reader actually needs:
+    a body, and — for a conversation — a body on every message in the thread.
+
+    This is the guard against serving a half-populated copy. Only the
+    /api/Values/inbox/onemail response carries per-message bodies; anything
+    derived from the inbox listing has the thread's shape but none of its
+    content, and rendering that produces a conversation of blank messages.
+    Entries failing this check are treated as a cache miss, so they get
+    refetched and overwritten with a real copy on first use.
+    """
+    if not isinstance(detail, dict):
+        return False
+    if not detail.get("body"):
+        return False
+    messages = detail.get("messages") or []
+    if messages:
+        return all(isinstance(m, dict) and m.get("body") for m in messages)
+    return True
+
+def cached_detail_age_seconds(user_email: str, message_id: str):
+    """
+    Age of the cached copy in seconds, or None if there isn't one. Used to
+    decide whether a cached detail is fresh enough to serve without going to
+    the mail server: an individual message's body never changes, but the
+    conversation thread around it can gain replies, so a copy is only trusted
+    for a short window.
+    """
+    if not message_id:
+        return None
+    path = _detail_path_for(user_email, message_id)
+    try:
+        if os.path.exists(path):
+            return max(0.0, time.time() - os.path.getmtime(path))
+    except Exception:
+        pass
+    return None
+
+def has_cached_detail(user_email: str, message_id: str) -> bool:
+    """
+    Cheap existence check — the prefetcher asks this for every email in the
+    inbox on every sync, so it must not pay to parse hundreds of JSON bodies
+    just to find out they're already there.
+    """
+    if not message_id:
+        return False
+    return os.path.exists(_detail_path_for(user_email, message_id))
+
+def get_cached_detail(user_email: str, message_id: str):
+    """Return a previously cached email-details payload, or None."""
+    if not message_id:
+        return None
+    path = _detail_path_for(user_email, message_id)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"[detail-cache] read failed for {message_id[:20]}...: {e}")
+    return None
+
+def _prune_detail_cache(directory: str):
+    """Keep the newest DETAIL_CACHE_MAX files; drop the rest."""
+    try:
+        entries = [os.path.join(directory, n) for n in os.listdir(directory) if n.endswith(".json")]
+        if len(entries) <= DETAIL_CACHE_MAX:
+            return
+        entries.sort(key=lambda p: os.path.getmtime(p))   # oldest first
+        for stale in entries[:len(entries) - DETAIL_CACHE_MAX]:
+            try:
+                os.remove(stale)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"[detail-cache] prune failed: {e}")
+
+def save_cached_detail(user_email: str, message_id: str, detail: dict):
+    """
+    Persist one email-details payload for offline reading. Best-effort: a
+    cache write must never break the live request that triggered it.
+    """
+    if not message_id or not isinstance(detail, dict):
+        return
+    # Refuse to store a half-populated copy. Caching one is worse than
+    # caching nothing: it would later be served in place of a live fetch and
+    # render a thread of empty messages, and it would mask the email from the
+    # prefetcher that could have fetched it properly.
+    if not detail_is_complete(detail):
+        log.debug(f"[detail-cache] skipping incomplete payload for {message_id[:20]}...")
+        return
+    body = detail.get("body")
+    if isinstance(body, str) and len(body) > DETAIL_BODY_MAX_CHARS:
+        return
+    try:
+        directory = _detail_dir_for(user_email)
+        os.makedirs(directory, exist_ok=True)
+        path = _detail_path_for(user_email, message_id)
+        tmp = f"{path}.tmp"
+        # Write-then-rename so a crash mid-write can't leave a truncated file
+        # that later reads would choke on.
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(detail, f)
+        os.replace(tmp, path)
+        _prune_detail_cache(directory)
+    except Exception as e:
+        log.warning(f"[detail-cache] write failed for {message_id[:20]}...: {e}")
+
+def get_last_known_inbox(user_email: str, limit: int = None) -> list:
+    """
+    Best-effort reconstruction of "the inbox as we last knew it" from the
+    per-id analysis cache (meta_emails_by_id) — used as a fallback when the
+    live Outlook fetch fails (firewall/timeout/org server down) so the UI
+    can keep showing real data instead of going blank. Pointer stubs left
+    behind by thread dedup (see save_emails_to_id_cache's _threadRef) carry
+    no displayable fields, so only primary entries are returned.
+
+    `limit` mirrors the caller's requested `count` on /api/fetch-inbox so a
+    fallback for the "fast batch" phase doesn't hand back the entire
+    (possibly much larger, accumulated-over-time) cache — the id-cache is
+    an upsert-only dict that keeps every email ever analyzed for this user,
+    not just the most recent fetch.
+    """
+    by_id = get_cached_emails_by_id(user_email)
+    primaries = [e for e in by_id.values() if not e.get("_threadRef")]
+
+    def _sort_key(e):
+        raw = e.get("received_at") or e.get("received") or ""
+        try:
+            return datetime.fromisoformat(raw).timestamp()
+        except Exception:
+            return 0.0
+
+    primaries.sort(key=_sort_key, reverse=True)
+    return primaries[:limit] if limit else primaries
+
+# Phrases/domains that mean "this is a meeting/call invite" — the server-side
+# mirror of BODY_SIGNALS in frontend-new/src/meetingInvite.js, which is where
+# the UI's RSVP bar, the Insights INVITES tile, and the INVITES filter all
+# get their definition. Keep the two lists in sync. We compute this once
+# here, while the body is still around, then drop the body from what gets
+# cached (see save_emails_to_id_cache) so the flag substitutes for the body
+# on every future cache hit instead of re-shipping the full HTML forever.
 _MEETING_INVITE_SIGNALS = (
     "you're invited", "you are invited", "meeting request", "has invited you",
     "join the meeting", "join meeting", "zoom.us", "teams.microsoft.com",
@@ -1377,7 +1546,17 @@ async def generate_sender_report(emails):
             display_name = msgs[0].get('from').split('<')[0].strip()
             if not display_name:
                 display_name = name
-            final_list.append({"name": display_name, "count": len(msgs), "attachments": att_count, "summary": summary_text})
+            # `email` is the address these messages were actually grouped by.
+            # The UI needs it to match this sender back to their mail exactly —
+            # matching on display_name meant a substring test, where a sender
+            # shown as "IT" also matched "Smith <smith@…>" and "Whitney <…>".
+            final_list.append({
+                "name": display_name,
+                "email": name,
+                "count": len(msgs),
+                "attachments": att_count,
+                "summary": summary_text,
+            })
         return final_list
     except Exception as e:
         log.error(f"Sender report error: {e}")

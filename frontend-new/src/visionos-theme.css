@@ -227,13 +227,15 @@ a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visib
   border: var(--glass-border);
   border-radius: var(--vos-radius-md);
   box-shadow: var(--vos-sheen), var(--vos-shadow);
-  transition: transform 0.28s ease, box-shadow 0.28s ease, background 0.28s ease;
+  transition: box-shadow 0.15s ease, background 0.15s ease;
 }
 
+/* No translate on hover — these are rows in scrolling lists, and lifting
+   them as the pointer passes during a scroll is what read as "the scroll
+   is animating". Colour and shadow still respond. */
 .sender-card-large:hover,
 .email-card:hover,
 .file-row:hover {
-  transform: translateY(-3px);
   background: rgba(255, 255, 255, 0.08);
   box-shadow: var(--vos-sheen), 0 26px 50px rgba(0, 0, 0, 0.4);
   border-color: rgba(255, 255, 255, 0.24);

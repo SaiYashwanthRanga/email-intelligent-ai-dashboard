@@ -25,11 +25,6 @@
   50%       { box-shadow: 0 0 18px 4px rgba(0, 217, 255, 0.12); }
 }
 
-@keyframes shimmerSweep {
-  0%   { transform: translateX(0%); }
-  100% { transform: translateX(280%); }
-}
-
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%       { opacity: 0.45; transform: scale(0.82); }
@@ -68,11 +63,6 @@
 
 @keyframes spinSlow {
   to { transform: rotate(360deg); }
-}
-
-@keyframes unreadDot {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50%       { opacity: 0.6; transform: scale(0.85); }
 }
 
 @keyframes auroraDrift {
@@ -154,59 +144,27 @@
 }
 
 /* ── EMAIL CARDS ── */
+/* Deliberately animation-free: the list is the thing people scroll, and
+   entrance/stagger/shimmer effects here all fought the scroll — cards
+   re-ran their fade-in on every list change, and per-card infinite
+   animations kept the compositor busy on every frame. Colour-only hover
+   feedback is kept (it costs nothing during scroll); movement is not.
+   `contain` stays — it *helps* scrolling by isolating each card's layout. */
 
 .email-card {
-  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1),
-              box-shadow 0.2s ease,
-              border-color 0.2s ease,
-              background 0.2s ease !important;
-  animation: fadeSlideUp 0.35s cubic-bezier(0.2, 0, 0, 1) both;
-  will-change: transform;
+  transition: box-shadow 0.15s ease,
+              border-color 0.15s ease,
+              background 0.15s ease !important;
   contain: layout style;
 }
 
-/* Stagger cards on load */
-.email-card:nth-child(1)  { animation-delay: 0.04s; }
-.email-card:nth-child(2)  { animation-delay: 0.08s; }
-.email-card:nth-child(3)  { animation-delay: 0.12s; }
-.email-card:nth-child(4)  { animation-delay: 0.16s; }
-.email-card:nth-child(5)  { animation-delay: 0.20s; }
-.email-card:nth-child(6)  { animation-delay: 0.24s; }
-.email-card:nth-child(7)  { animation-delay: 0.27s; }
-.email-card:nth-child(8)  { animation-delay: 0.30s; }
-.email-card:nth-child(9)  { animation-delay: 0.33s; }
-.email-card:nth-child(10) { animation-delay: 0.35s; }
-
 .email-card:hover {
-  transform: translateY(-2px) !important;
   border-color: rgba(0, 217, 255, 0.3) !important;
 }
 
-/* Shimmer effect on unread cards — transform-based (GPU composited, zero repaint) */
 .unread-mail {
   position: relative;
   overflow: hidden;
-}
-
-.unread-mail::after {
-  content: '';
-  position: absolute;
-  top: 0; left: -60%; bottom: 0;
-  width: 60%;
-  background: linear-gradient(
-    105deg,
-    transparent 0%,
-    rgba(0, 217, 255, 0.04) 50%,
-    transparent 100%
-  );
-  animation: shimmerSweep 5s ease infinite;
-  pointer-events: none;
-  will-change: transform;
-}
-
-/* Unread indicator dot pulse */
-.unread-dot {
-  animation: unreadDot 2s ease infinite;
 }
 
 /* ── CATEGORY TAGS ── */
@@ -233,21 +191,11 @@
 
 /* ── BRIEFING CARDS ── */
 
+/* Scrollable list — no entrance animation, no movement on hover (same
+   reasoning as .email-card above). */
 .briefing-card-row {
-  transition: background 0.2s ease, transform 0.2s ease,
-              box-shadow 0.2s ease, border-color 0.2s ease !important;
-  animation: fadeSlideIn 0.3s cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-.briefing-card-row:nth-child(1) { animation-delay: 0.03s; }
-.briefing-card-row:nth-child(2) { animation-delay: 0.07s; }
-.briefing-card-row:nth-child(3) { animation-delay: 0.11s; }
-.briefing-card-row:nth-child(4) { animation-delay: 0.15s; }
-.briefing-card-row:nth-child(5) { animation-delay: 0.19s; }
-.briefing-card-row:nth-child(6) { animation-delay: 0.22s; }
-
-.briefing-card-row:hover {
-  transform: translateX(4px);
+  transition: background 0.15s ease,
+              box-shadow 0.15s ease, border-color 0.15s ease !important;
 }
 
 /* ── BUTTONS ── */
@@ -296,18 +244,7 @@
 /* ── FILE / ATTACHMENT ROWS ── */
 
 .file-row {
-  transition: background 0.18s ease, transform 0.18s ease !important;
-  animation: fadeSlideIn 0.28s ease both;
-}
-
-.file-row:nth-child(1) { animation-delay: 0.02s; }
-.file-row:nth-child(2) { animation-delay: 0.05s; }
-.file-row:nth-child(3) { animation-delay: 0.08s; }
-.file-row:nth-child(4) { animation-delay: 0.11s; }
-.file-row:nth-child(5) { animation-delay: 0.14s; }
-
-.file-row:hover {
-  transform: translateX(3px);
+  transition: background 0.15s ease !important;
 }
 
 /* ── LOGO BOX ── */
@@ -329,20 +266,8 @@
 
 /* ── VISIONOS AURORA — EMAIL DETAIL ── */
 
-.visionos-meta-card {
-  animation: fadeSlideUp 0.35s cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-.visionos-meta-card:nth-child(1) { animation-delay: 0.02s; }
-.visionos-meta-card:nth-child(2) { animation-delay: 0.06s; }
-.visionos-meta-card:nth-child(3) { animation-delay: 0.10s; }
-.visionos-meta-card:nth-child(4) { animation-delay: 0.14s; }
-
-.visionos-aurora-panel .modal-header,
-.visionos-aurora-panel .modal-summary-box,
-.visionos-aurora-panel .reply-section {
-  animation: fadeSlideUp 0.4s cubic-bezier(0.2, 0, 0, 1) both;
-}
+/* The email detail pane scrolls too — no entrance animation on its
+   contents, so opening an email paints in one step. */
 
 /* ── REDUCE MOTION (accessibility) ── */
 

@@ -1,6 +1,8 @@
 import os
 import uuid
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import requests
 import httpx
@@ -56,6 +58,14 @@ from services import (
     set_last_email_count,
     get_cached_emails_by_id,
     save_emails_to_id_cache,
+    get_last_known_inbox,
+    get_last_fetch_ok_at,
+    set_last_fetch_ok_at,
+    get_cached_detail,
+    save_cached_detail,
+    has_cached_detail,
+    cached_detail_age_seconds,
+    detail_is_complete,
     generate_day_brief_summary,
     extract_sender_email,
     # ── Tracking system ──
@@ -95,7 +105,10 @@ MEETINGS_CACHE_TTL = 300  # seconds
 _analysis_jobs: dict = {}
 
 # ─── ORG SERVER CONFIG ───
-ORG_BASE = "http://172.22.6.188:177"
+# Overridable via env (same pattern as ALLOWED_ORIGINS) so the mail-server
+# outage path can be exercised — point it at a dead port and every call
+# fails the way a firewall block does — without editing this file.
+ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177")
 
 # =====================================================
 # 🔧 CONFIGURE THIS: Your org server's endpoint to
@@ -149,6 +162,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Custom response headers are NOT readable by browser JS cross-origin
+    # unless listed here — without this, the frontend's
+    # res.headers["x-data-source"] check on /api/fetch-inbox silently reads
+    # undefined and treats every stale-cache fallback as a fresh live sync.
+    expose_headers=["X-Data-Source", "X-Cache-As-Of"],
 )
 
 # --- HELPER FUNCTIONS ---
@@ -246,6 +264,159 @@ async def login(credentials: LoginRequest):
         raise HTTPException(status_code=500, detail="Login failed.")
 
 
+def _normalize_onemail(data, messageId: str) -> dict:
+    """
+    Normalise a .NET GetOneMail response into the detail shape the frontend
+    expects. Shared by /api/email-details and the background prefetcher so
+    a prefetched copy is byte-for-byte what a live open would have produced.
+
+    The updated .NET GetOneMail returns List<MailDto> — the full EWS
+    conversation thread (Inbox + SentItems), ordered oldest→newest. A legacy
+    / single-message response may still come back as a plain dict.
+
+    Strategy:
+      1. Find the specific email that was asked for (matched by messageId).
+      2. Use that as the primary data object (FROM / TO / CC / BODY / ATTS).
+      3. Attach the full list as data["messages"] so the frontend can render
+         the complete conversation thread without a separate call.
+    """
+    if isinstance(data, list):
+        if not data:
+            raise HTTPException(status_code=404, detail="Email not found")
+
+        # Find the requested email by its EWS messageId. Fall back to the
+        # most-recent message if not found (edge case where EWS regenerates
+        # IDs after a move).
+        thread_messages = data
+        primary = next(
+            (m for m in thread_messages
+             if isinstance(m, dict) and
+                (m.get("messageId") or m.get("MessageId") or "").strip() == (messageId or "").strip()),
+            thread_messages[-1]
+        )
+        # Normalise PascalCase .NET fields on the primary so downstream code
+        # always sees camelCase regardless of serializer config.
+        def _lc(d, *keys):
+            for k in keys:
+                v = d.get(k) or d.get(k[0].upper() + k[1:])
+                if v is not None:
+                    d[k] = v
+        _lc(primary, "from", "to", "cc", "body", "subject",
+            "received", "messageId", "conversationId", "attachments")
+        data = dict(primary)                 # shallow copy so we can mutate safely
+        data["messages"] = thread_messages   # full thread for conversation view
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Unexpected response shape from mail server")
+
+    def _norm_atts(raw, owner_id):
+        return [
+            {
+                "name":         a.get("name", ""),
+                "type":         a.get("type", "application/octet-stream"),
+                "size":         a.get("size", 0),
+                "attachmentId": a.get("attachmentId") or a.get("AttachmentId", ""),
+                "storage":      "api",
+                "messageId":    owner_id,
+            }
+            for a in (raw or []) if isinstance(a, dict)
+        ]
+
+    data["attachments"] = _norm_atts(data.get("attachments"), messageId)
+    data["hasAttachments"] = len(data["attachments"]) > 0
+
+    for msg in data.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        msg["attachments"] = _norm_atts(
+            msg.get("attachments"),
+            msg.get("messageId") or msg.get("MessageId") or messageId,
+        )
+
+    return data
+
+
+# ─── BACKGROUND DETAIL PREFETCH ──────────────────────────────────────────────
+# After an inbox fetch we already know every messageId, so the bodies can be
+# pulled in the background instead of waiting for the user to click. Two wins:
+# opening an email becomes a local disk read rather than a round trip to the
+# org server, and the whole inbox — not just what happens to have been opened
+# — is readable when that server is unreachable.
+#
+# Deliberately conservative about the org server: only ever fetches what
+# isn't already cached, caps how much it pulls per sync, runs a small number
+# of workers, and never lets one run stack on top of another for the same
+# user. In steady state this is a handful of requests for genuinely new mail.
+PREFETCH_WORKERS = 3
+PREFETCH_BUDGET_PER_SYNC = 120     # spread the initial backfill over syncs
+
+# How long a cached detail is served without re-checking the mail server.
+# The body itself is immutable; this bounds how stale the surrounding
+# conversation thread can be. Comfortably longer than the inbox sync
+# interval, so prefetched mail opens instantly, but short enough that a
+# thread gaining a reply corrects itself quickly.
+DETAIL_CACHE_FRESH_SECONDS = 600   # 10 minutes
+_prefetch_active: set = set()
+_prefetch_lock = threading.Lock()
+
+def _prefetch_one_detail(message_id: str, user_email: str) -> bool:
+    try:
+        resp = requests.get(
+            f"{ORG_BASE}/api/Values/inbox/onemail",
+            params={"messageId": message_id, "targetUserEmail": user_email},
+            timeout=45,
+        )
+        if resp.status_code != 200:
+            return False
+        detail = _normalize_onemail(resp.json(), message_id)
+        save_cached_detail(user_email, message_id, detail)
+        return True
+    except Exception:
+        # Best effort by design — a prefetch failure is a non-event, the
+        # email simply gets fetched live when someone opens it.
+        return False
+
+def _run_prefetch(message_ids: list, user_email: str):
+    done = 0
+    try:
+        with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as pool:
+            for ok in pool.map(lambda mid: _prefetch_one_detail(mid, user_email), message_ids):
+                if ok:
+                    done += 1
+        log.info(f"[prefetch] cached {done}/{len(message_ids)} email bodies for {user_email}")
+    except Exception as e:
+        log.warning(f"[prefetch] run failed for {user_email}: {e}")
+    finally:
+        with _prefetch_lock:
+            _prefetch_active.discard(user_email)
+
+def schedule_detail_prefetch(emails: list, user_email: str):
+    """Queue background body-fetching for emails we don't have cached yet."""
+    try:
+        with _prefetch_lock:
+            if user_email in _prefetch_active:
+                return           # a run is already in flight for this user
+            pending = []
+            for e in emails or []:
+                if not isinstance(e, dict):
+                    continue
+                mid = e.get("messageId") or e.get("id")
+                if mid and not has_cached_detail(user_email, mid):
+                    pending.append(mid)
+                if len(pending) >= PREFETCH_BUDGET_PER_SYNC:
+                    break
+            if not pending:
+                return
+            _prefetch_active.add(user_email)
+
+        log.info(f"[prefetch] fetching {len(pending)} email bodies in background for {user_email}")
+        threading.Thread(
+            target=_run_prefetch, args=(pending, user_email), daemon=True
+        ).start()
+    except Exception as e:
+        log.warning(f"[prefetch] could not schedule for {user_email}: {e}")
+
+
 @app.get("/api/email-details")
 async def get_email_details(messageId: str, userEmail: str):
     """
@@ -262,6 +433,22 @@ async def get_email_details(messageId: str, userEmail: str):
     org_url = f"{ORG_BASE}/api/Values/inbox/onemail"
     params  = {"messageId": messageId, "targetUserEmail": userEmail}
     log.debug(f"email-details: {messageId[:20]}... user={userEmail}")
+
+    # ── Cache-first for recently prefetched mail ──────────────────────────────
+    # The background prefetcher pulls bodies right after each inbox sync, so
+    # most opens can be answered from local disk in milliseconds instead of a
+    # round trip to the org server. A message's own body never changes once
+    # received, but the thread around it can gain replies — so a cached copy
+    # is only trusted inside a short window, after which we go live again.
+    age = cached_detail_age_seconds(userEmail, messageId)
+    if age is not None and age < DETAIL_CACHE_FRESH_SECONDS:
+        cached = get_cached_detail(userEmail, messageId)
+        # Only a complete copy may short-circuit the live call. A partial one
+        # would render a conversation of empty messages; treating it as a miss
+        # means we refetch and overwrite it with a real copy instead.
+        if cached and detail_is_complete(cached):
+            log.debug(f"email-details: serving fresh cache ({int(age)}s old) for {messageId[:20]}...")
+            return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -304,124 +491,105 @@ async def get_email_details(messageId: str, userEmail: str):
                     }
             except Exception as fallback_err:
                 log.warning(f"[email-details] Tracking cache fallback failed: {fallback_err}")
+
+            # ── Fallback: offline detail cache ────────────────────────────────
+            # An error status is just as unusable as an unreachable server, so
+            # serve the copy saved while it was healthy rather than a dead panel.
+            cached = get_cached_detail(userEmail, messageId)
+            if cached:
+                log.warning(
+                    f"[email-details] .NET {resp.status_code} — "
+                    f"serving cached copy for {messageId[:20]}..."
+                )
+                return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
+
             # No cache hit — propagate the original error
             raise HTTPException(
                 status_code=resp.status_code,
                 detail=f"Mail server error: {resp.text[:300]}"
             )
 
-        data = resp.json()
-
-        # ── Shape normalisation ───────────────────────────────────────────────
-        # The updated .NET GetOneMail returns List<MailDto> — the full EWS
-        # conversation thread (Inbox + SentItems), ordered oldest→newest.
-        # A legacy / single-message response may still come back as a plain dict.
-        #
-        # Strategy:
-        #   1. Find the specific email the user clicked (matched by messageId).
-        #   2. Use that as the primary data object (FROM / TO / CC / BODY / ATTS).
-        #   3. Attach the full list as data["messages"] so the frontend can
-        #      render the complete conversation thread without a separate call.
-        if isinstance(data, list):
-            if not data:
-                raise HTTPException(status_code=404, detail="Email not found")
-
-            # Find the clicked email by its EWS messageId (case-insensitive).
-            # Fall back to the most-recent message if not found (edge case where
-            # EWS regenerates IDs after a move).
-            thread_messages = data
-            primary = next(
-                (m for m in thread_messages
-                 if isinstance(m, dict) and
-                    (m.get("messageId") or m.get("MessageId") or "").strip() == messageId.strip()),
-                thread_messages[-1]   # newest as fallback (EWS ID regen edge case)
-            )
-            # Normalise PascalCase .NET fields on the primary so downstream
-            # code always sees camelCase regardless of serializer config.
-            def _lc(d, *keys):
-                for k in keys:
-                    v = d.get(k) or d.get(k[0].upper() + k[1:])
-                    if v is not None:
-                        d[k] = v
-            _lc(primary, "from", "to", "cc", "body", "subject",
-                "received", "messageId", "conversationId", "attachments")
-            data = dict(primary)          # shallow copy so we can mutate safely
-            data["messages"] = thread_messages   # full thread for conversation view
-
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=502, detail="Unexpected response shape from mail server")
-
-        # ── Normalise attachments on the primary email ────────────────────────
-        raw_atts = data.get("attachments") or []
-
-        data["attachments"] = [
-            {
-                "name":         att.get("name", ""),
-                "type":         att.get("type", "application/octet-stream"),
-                "size":         att.get("size", 0),
-                "attachmentId": att.get("attachmentId") or att.get("AttachmentId", ""),
-                "storage":      "api",
-                "messageId":    messageId,
-            }
-            for att in raw_atts if isinstance(att, dict)
-        ]
-        data["hasAttachments"] = len(data["attachments"]) > 0
-
-        # ── Normalise attachments on every thread message too ─────────────────
-        for msg in data.get("messages", []):
-            if not isinstance(msg, dict):
-                continue
-            msg_id   = msg.get("messageId") or msg.get("MessageId") or messageId
-            msg_atts = msg.get("attachments") or []
-            msg["attachments"] = [
-                {
-                    "name":         a.get("name", ""),
-                    "type":         a.get("type", "application/octet-stream"),
-                    "size":         a.get("size", 0),
-                    "attachmentId": a.get("attachmentId") or a.get("AttachmentId", ""),
-                    "storage":      "api",
-                    "messageId":    msg_id,
-                }
-                for a in msg_atts if isinstance(a, dict)
-            ]
+        data = _normalize_onemail(resp.json(), messageId)
 
         thread_count = len(data.get("messages", []))
         log.debug(f"email-details OK: {len(data['attachments'])} attachments, {thread_count} thread messages")
-        return data
+
+        # Keep this exact payload so the same email still opens during an
+        # outage. Best-effort — never fail a good response over a cache write.
+        try:
+            save_cached_detail(userEmail, messageId, data)
+        except Exception as e:
+            log.warning(f"email-details: detail cache write failed: {e}")
+
+        return JSONResponse(content=data, headers={"X-Data-Source": "live"})
 
     except HTTPException:
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Mail server timeout")
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach mail server")
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
+        # Mail server unreachable/slow — serve the copy we saved when it was
+        # last reachable, so reading mail keeps working while it's down.
+        cached = get_cached_detail(userEmail, messageId)
+        if cached:
+            log.warning(f"email-details: org server unreachable ({type(e).__name__}) — serving cached copy for {messageId[:20]}...")
+            return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
+        status = 504 if isinstance(e, httpx.TimeoutException) else 503
+        raise HTTPException(status_code=status, detail="Cannot reach mail server, and this email isn't saved offline.")
     except Exception as e:
         log.error(f"get_email_details error: {e}")
+        cached = get_cached_detail(userEmail, messageId)
+        if cached:
+            log.warning(f"email-details: falling back to cached copy for {messageId[:20]}...")
+            return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/fetch-inbox")
 def fetch_inbox(email: str, count: int = 500):
+    # Build the org server inbox URL from the email address.
+    # Route template: GET /api/Values/inbox/{mail}/count{num}
+    # "count" and the number share the same path segment — no slash between them.
+    # `count` is caller-controlled so the frontend can request a small fast
+    # batch first (near-instant paint) and the full inbox afterward, instead
+    # of blocking on all 500 emails before showing anything.
+    clean_email = unquote(email).strip()
+    clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count{count}"
+
+    def _serve_stale(reason: str, hard_status: int, hard_detail: str):
+        """
+        The org mail server is unreachable or erroring (firewall down,
+        timeout, 5xx, ...). Fall back to the last inbox we successfully
+        fetched+analyzed for this user (from the /api/analyze id-cache) so
+        the UI keeps showing real data instead of going blank — flagged via
+        response headers so the frontend can show a "reconnecting" banner
+        instead of treating this as a normal live sync. Only raise the hard
+        error if there's truly nothing cached yet to fall back to.
+        """
+        fallback = get_last_known_inbox(clean_email, limit=count)
+        if fallback:
+            as_of = get_last_fetch_ok_at(clean_email)
+            log.warning(f"fetch_inbox: {reason} — serving {len(fallback)} cached emails for {clean_email}")
+            resp_obj = JSONResponse(content=fallback)
+            resp_obj.headers["X-Data-Source"] = "cache"
+            if as_of:
+                resp_obj.headers["X-Cache-As-Of"] = as_of
+            return resp_obj
+        log.error(f"fetch_inbox: {reason} — no cache to fall back to for {clean_email}")
+        raise HTTPException(status_code=hard_status, detail=hard_detail)
+
     try:
-        # Build the org server inbox URL from the email address.
-        # Route template: GET /api/Values/inbox/{mail}/count{num}
-        # "count" and the number share the same path segment — no slash between them.
-        # `count` is caller-controlled so the frontend can request a small fast
-        # batch first (near-instant paint) and the full inbox afterward, instead
-        # of blocking on all 500 emails before showing anything.
-        clean_email = unquote(email).strip()
-        clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count{count}"
-
         log.debug(f"Fetching org inbox: {clean_url}")
-
         resp = requests.get(clean_url, timeout=120)
+    except requests.exceptions.RequestException as e:
+        return _serve_stale(f"org server unreachable ({e})", 502, f"Mail server unreachable: {e}")
 
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Mail server error: {resp.text}"
-            )
+    if resp.status_code != 200:
+        return _serve_stale(
+            f"org server returned {resp.status_code}",
+            resp.status_code,
+            f"Mail server error: {resp.text[:300]}"
+        )
 
+    try:
         raw = resp.json()
 
         # ─── FIX: Unwrap PagedMailResponse if .NET returns the paged shape ───
@@ -490,13 +658,31 @@ def fetch_inbox(email: str, count: int = 500):
 
         data.sort(key=_sort_key, reverse=True)
 
-        return data
+        set_last_fetch_ok_at(datetime.now(timezone.utc).isoformat(), clean_email)
 
-    except HTTPException:
-        raise
+        # Pull bodies in the background so opening an email is a local read
+        # rather than a round trip, and so the whole inbox — not just what's
+        # been opened — survives the mail server going away.
+        #
+        # This is deliberately the ONLY writer of the detail cache. An earlier
+        # version also warmed it straight from this inbox payload, which was a
+        # mistake twice over: the inbox list carries no per-message bodies, so
+        # those entries rendered a thread of empty messages, and their mere
+        # existence made the prefetcher skip the emails that needed it most.
+        schedule_detail_prefetch(data, clean_email)
+
+        resp_final = JSONResponse(content=data)
+        resp_final.headers["X-Data-Source"] = "live"
+        return resp_final
+
     except Exception as e:
-        log.error(f"fetch_inbox error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Org server answered 200 but the body was unusable (malformed JSON,
+        # an HTML error page served with a 200 status, or a bug in the
+        # processing above) — treat it the same as "unreachable" rather than
+        # showing the user a hard error when we have real cached data to
+        # fall back to instead. log.error keeps this visible operationally.
+        log.error(f"fetch_inbox: processing error on 200 response: {e}")
+        return _serve_stale(f"org response unusable ({e})", 500, f"Mail server response error: {e}")
 
 
 @app.post("/api/analyze")
@@ -1373,6 +1559,9 @@ async def get_meetings(email: str, startDate: str = None, endDate: str = None):
     if cached and (time.time() - cached["fetched_at"]) < MEETINGS_CACHE_TTL:
         log.debug(f"Meetings cache HIT: {cache_key}")
         return cached["data"]
+    # Past its TTL, but still real data from the last successful call — kept
+    # as a fallback for the handlers below if the server can't be reached.
+    stale = cached
 
     org_url = f"{ORG_BASE}/api/Values/meetings"
     params  = {"email": email, "startDate": startDate, "endDate": endDate}
@@ -1404,14 +1593,22 @@ async def get_meetings(email: str, startDate: str = None, endDate: str = None):
         log.debug(f"Returning {len(meetings)} meetings")
         return meetings
 
-    except HTTPException:
+    except HTTPException as e:
+        # Serve the expired cache rather than an error: a stale calendar beats
+        # a blank one, and this entry was real data when it was fetched.
+        if stale and stale.get("data") is not None:
+            log.warning(f"get_meetings: calendar server error {e.status_code} — serving stale cache for {cache_key}")
+            return stale["data"]
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Calendar server timeout")
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach calendar server")
     except Exception as e:
         log.error(f"get_meetings error: {e}")
+        if stale and stale.get("data") is not None:
+            log.warning(f"get_meetings: {type(e).__name__} — serving stale cache for {cache_key}")
+            return stale["data"]
+        if isinstance(e, httpx.TimeoutException):
+            raise HTTPException(status_code=504, detail="Calendar server timeout")
+        if isinstance(e, httpx.ConnectError):
+            raise HTTPException(status_code=503, detail="Cannot reach calendar server")
         raise HTTPException(status_code=500, detail=str(e))
 
 

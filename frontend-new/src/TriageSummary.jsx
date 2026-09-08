@@ -1,36 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
+import { isMeetingInvite } from './meetingInvite';
 
-// --- HELPER COMPONENT: ANIMATED COUNTER ---
-const CountUp = ({ end, duration = 1500 }) => {
-  const [count, setCount] = useState(0);
-
-  useEffect(() => {
-    let startTime = null;
-    let animationFrame;
-
-    const animate = (currentTime) => {
-      if (!startTime) startTime = currentTime;
-      const progress = currentTime - startTime;
-      
-      const percentage = Math.min(progress / duration, 1);
-      const easeOut = percentage === 1 ? 1 : 1 - Math.pow(2, -10 * percentage);
-      
-      const currentCount = Math.floor(easeOut * end);
-      setCount(currentCount);
-
-      if (progress < duration) {
-        animationFrame = requestAnimationFrame(animate);
-      } else {
-        setCount(end); 
-      }
-    };
-
-    animationFrame = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(animationFrame);
-  }, [end, duration]);
-
-  return <span>{count}</span>;
-};
+// Stats render as plain numbers. This used to be a requestAnimationFrame
+// counter that tweened 0 → value, but its effect re-ran on every value
+// change — so a background auto-sync made every figure on the page spin up
+// from zero again, which read as the dashboard reloading itself.
+const CountUp = ({ end }) => <span>{Number.isFinite(end) ? end : 0}</span>;
 
 // --- FILE TYPE ICONS MAP ---
 const FILE_ICONS = {
@@ -54,25 +29,30 @@ const FILE_ICONS = {
 const emojiStyleMain = { fontSize: "1.4rem", marginRight: "6px", verticalAlign: "middle" };
 const emojiStyleSub = { fontSize: "1.2rem", marginRight: "5px", verticalAlign: "middle" };
 
-const TriageSummary = ({ stats, realThreads, emails, report, onAttachmentClick, onThreadsClick, onEmailsClick, onInvitesClick }) => {
+const TriageSummary = ({ stats, emails, report, threadCount, onAttachmentClick, onThreadsClick, onEmailsClick, onInvitesClick }) => {
   if (!stats) return null;
 
-  const { 
-    vol_emails, 
-    vol_meetings, 
-    att_total, 
+  const {
+    vol_emails,
+    att_total,
     att_breakdown,
     to = 0,
-    cc = 0 
+    cc = 0
   } = stats;
 
-  // THREADS = number of cards currently shown in the Executive Summary.
-  const trueThreadCount = (report?.briefing_cards || []).length;
+  // THREADS = real multi-message threads, which is exactly what the THREADS
+  // folder shows when you click this tile. It used to count
+  // report.briefing_cards instead — AI summary cards, a different set from
+  // both the label and the click destination, and one the list below
+  // deduped further before rendering.
+  const trueThreadCount = threadCount ?? (report?.briefing_cards || []).length;
 
-  // INVITES = emails that contain an actual zoom.us link in the body.
-  const zoomInviteCount = (emails || []).filter(e =>
-    (e.body || '').toLowerCase().includes('zoom.us')
-  ).length;
+  // INVITES = real meeting invites, via the shared predicate the inbox
+  // filter and the RSVP bar also use (see meetingInvite.js). The old check
+  // scanned e.body for "zoom.us" only: it missed Teams/Meet/Webex/.ics
+  // entirely, and — because cached emails have no body — undercounted more
+  // and more the longer a session ran.
+  const inviteCount = (emails || []).filter(isMeetingInvite).length;
 
   return (
     <div className="triage-glass-panel triage-premium">
@@ -118,14 +98,14 @@ const TriageSummary = ({ stats, realThreads, emails, report, onAttachmentClick, 
         <div
           className="triage-metric-block"
           onClick={onInvitesClick}
-          title="View Zoom invites in Inbox"
+          title="View meeting invites in Inbox"
           style={onInvitesClick ? { cursor: 'pointer' } : {}}
         >
           <span className="triage-label">
             <span style={emojiStyleMain}>📅</span> INVITES
           </span>
           <span className="triage-number" style={{}}>
-            <CountUp end={zoomInviteCount} />
+            <CountUp end={inviteCount} />
           </span>
         </div>
 
@@ -133,11 +113,19 @@ const TriageSummary = ({ stats, realThreads, emails, report, onAttachmentClick, 
 
       {/* SECOND ROW */}
       <div className="triage-sub-row">
-        <div className="triage-sub-left">
+        {/* onAttachmentClick was being passed in but never wired to anything,
+            so this stat looked clickable-adjacent yet did nothing while every
+            tile above it opened a view. It opens the all-attachments modal. */}
+        <div
+          className="triage-sub-left"
+          onClick={onAttachmentClick}
+          title={onAttachmentClick ? "View all attachments" : undefined}
+          style={onAttachmentClick ? { cursor: 'pointer' } : {}}
+        >
           <span className="triage-sub-label">
             <span style={emojiStyleSub}>📎</span> ATTACHMENTS
           </span>
-          
+
           <span className="triage-sub-value">
             <CountUp end={att_total} />
           </span>

@@ -7,6 +7,7 @@ import {
 import EmailAutocomplete from './EmailAutocomplete';
 import ComposeMailModal from './ComposeMailModal';
 import ToastContainer from './Toast';
+import { isMeetingInvite } from './meetingInvite';
 
 // ─── SHARED EXPORTS (also used by DashboardView) ──────────────────────────
 export const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
@@ -719,20 +720,11 @@ const EmailCard = React.memo(function EmailCard({
         )}
 
         {/* RSVP — MEETING & ZOOM INVITES */}
-        {(email.category === "MEETING" || email.category === "ZOOM") && (() => {
-          const _subj = (email.subject || "").trim();
-          if (/^(accepted|declined|tentative|re|fw|fwd|aw|tr)\s*:/i.test(_subj)) return null;
-          // email.body is only present for emails fetched fresh this session
-          // (new mail, or ones already opened). Cache-hit rows from a prior
-          // sync carry isMeetingInvite instead — computed server-side from the
-          // body once, then the body itself is dropped to keep syncs light
-          // (see save_emails_to_id_cache in services.py). Fall back to the
-          // live body scan whenever it's actually available.
-          const _body = (email.body || "").toLowerCase();
-          const _hasSignal = email.body
-            ? (_body.includes("you're invited") || _body.includes("you are invited") || _body.includes("meeting request") || _body.includes("has invited you") || _body.includes("join the meeting") || _body.includes("join meeting") || _body.includes("zoom.us") || _body.includes("teams.microsoft.com") || _body.includes("meet.google.com") || _body.includes("webex.com") || (email.attachments || []).some(a => (a.name || "").toLowerCase().endsWith(".ics")))
-            : (email.isMeetingInvite === true);
-          if (!_hasSignal) return null;
+        {(() => {
+          // Shared with the Insights INVITES tile and the INVITES filter —
+          // see meetingInvite.js. Kept in one place so the RSVP bar, the
+          // count, and the filtered list can't drift apart again.
+          if (!isMeetingInvite(email)) return null;
           const rsvp = rsvpState;
           const statusColors = {
             accepted:  { bg: "rgba(22,163,74,0.12)",  border: "rgba(22,163,74,0.35)",  color: "#4ade80", label: "✓ Accepted" },
@@ -890,6 +882,7 @@ function InboxView({
   setSenderFilter,
   inboxReady,
   inboxError,
+  inboxErrorKind,
   fetchAndAnalyze,
   isAnalyzingBackground,
   isFetchingFullInbox = false,
@@ -1012,20 +1005,16 @@ function InboxView({
     return null;
   };
 
-  // Show back-to-top button after scrolling 300px
+  // Show back-to-top button after scrolling 300px.
+  // `passive: true` lets the browser scroll without waiting to see whether
+  // this handler calls preventDefault — it never does.
+  // (This effect used to be duplicated verbatim below, attaching two
+  // identical listeners that both ran on every scroll event.)
   useEffect(() => {
     const parent = getScrollParent();
     if (!parent) return;
     const onScroll = () => setShowScrollTop(parent.scrollTop > 300);
-    parent.addEventListener('scroll', onScroll);
-    return () => parent.removeEventListener('scroll', onScroll);
-  }, []);
-
-  useEffect(() => {
-    const parent = getScrollParent();
-    if (!parent) return;
-    const onScroll = () => setShowScrollTop(parent.scrollTop > 300);
-    parent.addEventListener('scroll', onScroll);
+    parent.addEventListener('scroll', onScroll, { passive: true });
     return () => parent.removeEventListener('scroll', onScroll);
   }, []);
 
@@ -1518,6 +1507,7 @@ function InboxView({
         // Category counts reflect within the CURRENT active folder pool
         const catCount = (cat) => {
           if (cat === 'ALL') return folderMsgCount(activeFolder);
+          if (cat === 'INVITES') return folderPool.filter(isMeetingInvite).length;
           return folderPool.filter(e => e.category === cat).length;
         };
 
@@ -1653,10 +1643,16 @@ function InboxView({
           folderPool = folderPool.filter(e => (e.from || e.sender || "").toLowerCase().includes(senderFilter.email.toLowerCase()));
         }
 
-        // Step 3: apply category filter
+        // Step 3: apply category filter.
+        // INVITES is not an AI category — it's the same predicate the
+        // Insights tile counts with, so clicking that number lands on
+        // exactly the emails it counted (it used to filter on ZOOM, which
+        // was a different set from the number shown).
         let categoryPool = activeCategory === 'ALL'
           ? folderPool
-          : folderPool.filter(e => e.category === activeCategory);
+          : activeCategory === 'INVITES'
+            ? folderPool.filter(isMeetingInvite)
+            : folderPool.filter(e => e.category === activeCategory);
 
         // Step 4: apply search
         const displayEmails = q
@@ -1783,7 +1779,32 @@ function InboxView({
               <div className="loading-text">Syncing inbox...</div>
             ) : inboxError ? (
               <div className="loading-text" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
-                <div>Couldn't reach the inbox. The Outlook connection may be down.</div>
+                {/* Name the hop that actually failed. This used to always blame
+                    Outlook, including when the real problem was that the
+                    backend wasn't running — which sends you debugging the
+                    wrong machine. */}
+                {inboxErrorKind === 'server' ? (
+                  <>
+                    <div>Can't reach the dashboard server.</div>
+                    <div style={{ fontSize: '0.78rem', opacity: 0.75, fontStyle: 'normal' }}>
+                      Outlook may be perfectly fine — the backend API isn't responding. Check that it's running.
+                    </div>
+                  </>
+                ) : inboxErrorKind === 'timeout' ? (
+                  <>
+                    <div>The mail server is taking too long to respond.</div>
+                    <div style={{ fontSize: '0.78rem', opacity: 0.75, fontStyle: 'normal' }}>
+                      It may just be slow right now. Retrying usually works.
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div>Couldn't reach Outlook, and there's no saved copy to fall back on yet.</div>
+                    <div style={{ fontSize: '0.78rem', opacity: 0.75, fontStyle: 'normal' }}>
+                      Once one sync succeeds, outages like this will show your last synced inbox instead.
+                    </div>
+                  </>
+                )}
                 <button
                   onClick={() => fetchAndAnalyze(false)}
                   style={{ background: 'rgba(0,217,255,0.18)', border: '1px solid rgba(0,217,255,0.45)', color: '#60a5fa', borderRadius: '8px', padding: '7px 14px', fontSize: '0.78rem', fontWeight: '700', cursor: 'pointer' }}
@@ -1897,7 +1918,7 @@ function InboxView({
       {/* BACK TO TOP BUTTON */}
       {showScrollTop && (
         <button
-          onClick={() => getScrollParent()?.scrollTo({ top: 0, behavior: 'smooth' })}
+          onClick={() => getScrollParent()?.scrollTo({ top: 0 })}
           style={{
             position: 'fixed',
             bottom: '32px',

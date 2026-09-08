@@ -7,6 +7,8 @@ backend/cache_*.json
 backend/tracking_*@*.json
 backend/not_tracked_*@*.json
 backend/activity_log.json
+# Cached email bodies for offline reading — real mail content, never commit
+backend/detail_cache/
 
 # Node frontend
 frontend-new/node_modules/
