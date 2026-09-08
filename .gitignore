@@ -22,3 +22,6 @@ frontend/
 backend/.claude/
 backend/*.code-workspace
 Thumbs.db
+# Cache backups — same real mail content as the caches themselves
+backend/*.bak
+*.bak
