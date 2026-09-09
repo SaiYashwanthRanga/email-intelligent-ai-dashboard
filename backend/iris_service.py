@@ -5,18 +5,27 @@ Kept separate from services.py on purpose so this feature stays easy to
 find, iterate on, and (if needed) rip out, without touching the existing
 analysis/tracking/reply logic.
 
-PHASE 3 SCOPE: on top of the Phase 2 inbox snapshot, Iris can now call
-three tools mid-conversation:
+Iris can call these tools mid-conversation:
   - draft_reply            -> reuses services.draft_email_reply() as-is
   - check_tracking_status   -> reuses services.get_tracking_summary() /
                                 get_tracking_digest() as-is (gated by
                                 services.is_tracking_allowed())
-  - search_emails           -> new: searches services.get_cached_emails_by_id(),
-                                which accumulates every email the analysis
+  - search_emails           -> keyword search over
+                                services.get_cached_emails_by_id(), which
+                                accumulates every email the analysis
                                 pipeline has ever seen for this user
                                 (NOT the person's entire mailbox — see
                                 search_cached_emails() below for the exact
                                 scope/caveats)
+  - list_emails             -> the same scope browsed by facet instead of
+                                keyword (category / sender / last N days),
+                                for questions with no word to search on
+  - read_email              -> full body + reply chain from the offline
+                                detail cache. Without this Iris only ever
+                                saw one-line summaries and had never
+                                actually read an email
+  - get_calendar            -> upcoming meetings, via main.get_meetings so
+                                its caching and stale-fallback are reused
 
 Iris still cannot SEND anything or take any other action — draft_reply
 only returns text for the person to review. That distinction is spelled
@@ -30,8 +39,9 @@ as they already exist — none of those were modified.
 
 import json
 import re
+import asyncio
 import html as _html
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from services import (
@@ -124,8 +134,19 @@ before saying you can't help — you have three:
    wasn't found in what's been analyzed rather than concluding it
    doesn't exist anywhere.
 
-4. read_email — opens ONE email's full text and reply chain, by the
-   messageId that search_emails returns. The snapshot and search results
+4. list_emails — browse by filter instead of by keyword: category
+   (URGENT, PRIORITY, NEWSLETTER, ...), sender, or "last N days". Reach
+   for this whenever the question has no specific word to search on —
+   "what's urgent", "what came in today", "anything from Deepa this
+   week". search_emails finds a known topic; list_emails surveys. Both
+   cover only what has been analysed so far.
+
+5. get_calendar — the person's upcoming meetings. Use for schedule
+   questions, whether they are free at a given time, or whether a time
+   someone is proposing by email clashes with something already booked.
+
+6. read_email — opens ONE email's full text and reply chain, by the
+   messageId that search_emails or list_emails returns. Those results
    only carry one-line summaries, so reach for this whenever the answer
    depends on what was actually written: exact figures, dates, names,
    what someone specifically asked for, or before drafting a reply to a
@@ -138,10 +159,11 @@ specific senders, subjects, dates, drafts, or tracking statuses that
 didn't come from the snapshot, a tool result, or the conversation itself.
 
 CURRENT CAPABILITIES (be honest if asked): you can chat, answer
-questions grounded in the snapshot, read the full text of emails that
-have been cached, draft (but not send) email replies, and check
-tracking/follow-up status. You cannot send email, schedule anything, or
-search the person's full mailbox beyond what's already been analyzed.
+questions grounded in the snapshot, browse and search analysed email,
+read the full text of emails that have been cached, look at the person's
+upcoming calendar, draft (but not send) email replies, and check
+tracking/follow-up status. You cannot send email, change the calendar,
+or reach beyond the mail that has already been analysed.
 """.strip()
 
 
@@ -191,6 +213,25 @@ def _build_context_block(inbox_context: Optional[dict]) -> str:
         snapshot_json = snapshot_json[:MAX_SNAPSHOT_CHARS] + "\n... (truncated)"
 
     return f"INBOX SNAPSHOT (JSON):\n{snapshot_json}"
+
+
+async def _chat_with_retry(**kwargs):
+    """
+    One transient network blip should not turn into "Something went wrong
+    reaching Iris". Retries connection/timeout style failures a couple of
+    times before giving up, the same way the analysis pipeline does.
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                wait = 1.5 * (attempt + 1)
+                log.warning(f"Iris model call attempt {attempt + 1} failed ({type(e).__name__}), retrying in {wait}s")
+                await asyncio.sleep(wait)
+    raise last_err
 
 
 def _to_openai_messages(history: list) -> list:
@@ -319,6 +360,62 @@ TOOLS = [
                     },
                 },
                 "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_emails",
+            "description": (
+                "Browse analysed emails by filter rather than by keyword — "
+                "use this whenever there is no specific word to search for. "
+                "Handles 'what's urgent', 'anything from Deepa this week', "
+                "'what came in today', 'show me the newsletters'. Returns "
+                "newest first. Combine filters freely; omit them all for a "
+                "plain recent list."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["VIP", "PRIORITY", "URGENT", "CONFIDENTIAL",
+                                 "MEETING", "ZOOM", "NEWSLETTER", "NORMAL"],
+                        "description": "Restrict to one category.",
+                    },
+                    "sender": {
+                        "type": "string",
+                        "description": "Full or partial sender name/address.",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Only emails from the last N days (1 = today).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar",
+            "description": (
+                "The person's upcoming meetings from the org calendar. Use "
+                "for anything about their schedule — what's on today or "
+                "tomorrow, whether they're free, or whether a proposed time "
+                "clashes with something already booked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "How far forward to look. 1 = today only, 7 = the week ahead.",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -496,6 +593,133 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
     return [item for _, _, _, item in pool[:limit]]
 
 
+def _parse_received(raw) -> Optional[datetime]:
+    """
+    Best-effort parse of the assorted date shapes the mail server returns.
+    Returns None rather than raising — a row with an unreadable date should
+    drop out of a date filter, not break the whole listing.
+    """
+    if not raw:
+        return None
+    text = str(raw).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception:
+        return None
+
+
+def list_cached_emails(
+    user_email: str,
+    category: str = None,
+    sender: str = None,
+    days: int = None,
+    limit: int = MAX_SEARCH_RESULTS,
+) -> dict:
+    """
+    Browse the analysed cache by facet rather than by keyword.
+
+    search_emails can only answer when there's a word to match on, so
+    "what's urgent this week" had no route at all — this fills that gap.
+    Scope is the emails already analysed for this user, same as search.
+    """
+    try:
+        cached = get_cached_emails_by_id(user_email) or {}
+    except Exception as e:
+        log.error(f"list_cached_emails: cache read failed: {e}")
+        return {"error": "Couldn't read the analysed inbox just now."}
+
+    cat = (category or "").strip().upper() or None
+    who = (sender or "").strip().lower() or None
+    cutoff = datetime.now() - timedelta(days=days) if days else None
+
+    rows = []
+    for entry in cached.values():
+        if not isinstance(entry, dict) or entry.get("_threadRef"):
+            continue
+        if cat and (entry.get("category") or "NORMAL").upper() != cat:
+            continue
+        frm = entry.get("from") or entry.get("sender") or ""
+        if who and who not in frm.lower():
+            continue
+
+        when = _parse_received(entry.get("received_at") or entry.get("received"))
+        if cutoff and (when is None or when < cutoff):
+            continue
+
+        eid = entry.get("id") or entry.get("messageId")
+        rows.append({
+            "messageId": eid,
+            "from": frm or "Unknown Sender",
+            "subject": entry.get("subject") or "No Subject",
+            "category": entry.get("category") or "NORMAL",
+            "summary": entry.get("summary") or "",
+            "received_at": entry.get("received_at") or entry.get("received"),
+            "unread": entry.get("isRead") is False,
+            "has_attachments": bool(entry.get("hasAttachments")),
+            "has_full_text": has_cached_detail(user_email, eid) if eid else False,
+            "_sort": when or datetime.min,
+        })
+
+    rows.sort(key=lambda r: r["_sort"], reverse=True)
+    total = len(rows)
+    for r in rows:
+        r.pop("_sort", None)
+
+    return {
+        "emails": rows[:limit],
+        "returned": min(total, limit),
+        "total_matching": total,
+        "filters": {"category": cat, "sender": who, "days": days},
+        "note": (
+            "Scope is the emails analysed so far for this person, newest "
+            "first — not their entire mailbox history."
+        ),
+    }
+
+
+async def get_calendar_window(user_email: str, days_ahead: int = 7) -> dict:
+    """
+    Upcoming meetings from the org calendar.
+
+    Imported lazily from main so this module keeps working standalone and
+    doesn't create a circular import (main imports this module at startup).
+    Reuses the endpoint's own caching and its stale-cache fallback, so a
+    calendar question during an outage still gets the last known schedule.
+    """
+    try:
+        from main import get_meetings   # local import: avoids a cycle at load
+        today = datetime.now().date()
+        end = today + timedelta(days=max(1, min(days_ahead, 60)))
+        meetings = await get_meetings(
+            email=user_email,
+            startDate=today.isoformat(),
+            endDate=end.isoformat(),
+        )
+    except Exception as e:
+        log.error(f"get_calendar_window failed: {e}")
+        return {"error": "Couldn't reach the calendar just now."}
+
+    items = meetings if isinstance(meetings, list) else []
+    slim = []
+    for m in items[:25]:
+        if not isinstance(m, dict):
+            continue
+        slim.append({
+            "subject": m.get("subject") or m.get("Subject") or "No Subject",
+            "start": m.get("start") or m.get("Start") or m.get("startTime"),
+            "end": m.get("end") or m.get("End") or m.get("endTime"),
+            "organizer": m.get("organizer") or m.get("Organizer") or "",
+            "location": m.get("location") or m.get("Location") or "",
+        })
+    return {
+        "from": datetime.now().date().isoformat(),
+        "days_ahead": days_ahead,
+        "count": len(slim),
+        "meetings": slim,
+    }
+
+
 def _slim_tracking_item(item: dict) -> dict:
     """
     Strips a tracking item down to what's useful in a chat answer —
@@ -574,6 +798,23 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
             message_id = (arguments or {}).get("message_id", "")
             return json.dumps(read_cached_email(user_email, message_id), default=str)
 
+        elif name == "list_emails":
+            a = arguments or {}
+            return json.dumps(
+                list_cached_emails(
+                    user_email,
+                    category=a.get("category"),
+                    sender=a.get("sender"),
+                    days=a.get("days"),
+                ),
+                default=str,
+            )
+
+        elif name == "get_calendar":
+            days_ahead = (arguments or {}).get("days_ahead") or 7
+            result = await get_calendar_window(user_email, int(days_ahead))
+            return json.dumps(result, default=str)
+
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -611,7 +852,7 @@ async def get_iris_reply(
     messages.append({"role": "user", "content": message})
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = await client.chat.completions.create(
+        response = await _chat_with_retry(
             model=ACTIVE_MODEL,
             messages=messages,
             tools=TOOLS,
@@ -666,7 +907,7 @@ async def get_iris_reply(
         "role": "system",
         "content": "Stop calling tools now and answer the person directly with whatever you have so far.",
     })
-    final = await client.chat.completions.create(
+    final = await _chat_with_retry(
         model=ACTIVE_MODEL,
         messages=messages,
         temperature=0.6,
