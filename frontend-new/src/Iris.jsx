@@ -269,9 +269,24 @@ const Iris = ({
     window.addEventListener("touchend", end);
   }, [fabY, clampFabY]);
 
+  // Panel sits centred on the button, but never hangs off either edge.
+  const panelTop = useMemo(() => {
+    const panelH = Math.min(PANEL_HEIGHT, window.innerHeight - EDGE_GAP * 2);
+    const ideal = fabY - panelH / 2;
+    return Math.min(Math.max(ideal, EDGE_GAP), window.innerHeight - panelH - EDGE_GAP);
+  }, [fabY]);
+
+  const getSender = getParticipantDisplay || fallbackGetParticipantDisplay;
+  const getReceived = getEffectiveReceivedAt || fallbackGetEffectiveReceivedAt;
+
   // Standing brief, derived from the inbox the dashboard already loaded.
   // No API call, so it's on screen the instant the panel opens; each line
   // is a shortcut into the question it raises.
+  //
+  // Must stay BELOW getReceived: this memo names it in its dependency
+  // array, which is evaluated during render, so declaring it any earlier
+  // hits the temporal dead zone and takes the whole app down with a blank
+  // page. A bundler won't catch that — it builds clean and fails at runtime.
   const brief = useMemo(() => {
     const list = Array.isArray(emails) ? emails : [];
     if (!list.length) return null;
@@ -286,16 +301,6 @@ const Iris = ({
     if (unread) rows.push({ color: "#fbbf24", text: `${unread} unread`, ask: "What needs my reply first?" });
     return rows.length ? rows : null;
   }, [emails, getReceived]);
-
-  // Panel sits centred on the button, but never hangs off either edge.
-  const panelTop = useMemo(() => {
-    const panelH = Math.min(PANEL_HEIGHT, window.innerHeight - EDGE_GAP * 2);
-    const ideal = fabY - panelH / 2;
-    return Math.min(Math.max(ideal, EDGE_GAP), window.innerHeight - panelH - EDGE_GAP);
-  }, [fabY]);
-
-  const getSender = getParticipantDisplay || fallbackGetParticipantDisplay;
-  const getReceived = getEffectiveReceivedAt || fallbackGetEffectiveReceivedAt;
 
   // ── Build the compact "inbox snapshot" sent alongside each message ──
   // Recomputed only when the underlying inbox data actually changes, not
