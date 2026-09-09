@@ -6,6 +6,7 @@ import axios from 'axios';
 import { useMemo, useRef } from "react";
 import InboxView from './InboxView.jsx';
 import { getDeviceId, getDeviceLabel } from './deviceIdentity';
+import { IRIS_USE_DRAFT_EVENT } from './Iris';
 
 const API_BASE = import.meta.env.VITE_API_URL;
 
@@ -1230,6 +1231,20 @@ function Dashboard() {
     } catch (err) { addToast("Failed to generate reply.", "error"); }
     setReplyLoading(false);
   };
+
+  // "Use as reply" in Iris drops its draft straight into the reply box.
+  // A window event rather than props: Iris is portaled to document.body and
+  // sits outside this component's tree entirely.
+  useEffect(() => {
+    const onUseDraft = (e) => {
+      const text = e.detail?.text;
+      if (!text) return;
+      setReplyDraft(text);
+      addToast("Draft added to your reply box", "success");
+    };
+    window.addEventListener(IRIS_USE_DRAFT_EVENT, onUseDraft);
+    return () => window.removeEventListener(IRIS_USE_DRAFT_EVENT, onUseDraft);
+  }, []);
 
   const handleCopy = async () => {
     if (!replyDraft) return;

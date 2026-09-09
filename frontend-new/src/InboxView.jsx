@@ -663,14 +663,17 @@ const EmailCard = React.memo(function EmailCard({
             </button>
             {/* Opens Iris already looking at this email, so you don't have to
                 describe something you're staring at so it can go find it. */}
+            {/* Styled to stand out rather than sit among the muted secondary
+                actions — as a faint text button it read as decoration and
+                went unnoticed. */}
             <button
               onClick={e => { e.stopPropagation(); askIrisAbout(email); }}
-              title="Ask Iris about this email"
-              style={{ background: 'transparent', border: '1px solid transparent', color: 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
-              onMouseEnter={e => { e.currentTarget.style.background = 'rgba(0,217,255,0.10)'; e.currentTarget.style.borderColor = 'rgba(0,217,255,0.30)'; e.currentTarget.style.color = '#00d9ff'; }}
-              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+              title="Ask Iris about this email — draft a reply, summarise it, or see what they're asking for"
+              style={{ background: 'linear-gradient(135deg, rgba(0,217,255,0.22), rgba(139,92,246,0.22))', border: '1px solid rgba(0,217,255,0.55)', color: '#8be9ff', borderRadius: '999px', padding: '4px 12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px', flexShrink: 0, fontSize: '0.75rem', fontWeight: '800', letterSpacing: '0.2px', boxShadow: '0 0 10px rgba(0,217,255,0.20)', transition: 'all 0.15s' }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'linear-gradient(135deg, rgba(0,217,255,0.38), rgba(139,92,246,0.38))'; e.currentTarget.style.color = '#ffffff'; e.currentTarget.style.boxShadow = '0 0 16px rgba(0,217,255,0.40)'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'linear-gradient(135deg, rgba(0,217,255,0.22), rgba(139,92,246,0.22))'; e.currentTarget.style.color = '#8be9ff'; e.currentTarget.style.boxShadow = '0 0 10px rgba(0,217,255,0.20)'; }}
             >
-              <Sparkles size={12} /> Ask Iris
+              <Sparkles size={13} /> Ask Iris
             </button>
           </div>
         </div>

@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck } from "lucide-react";
+import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck, CornerDownLeft } from "lucide-react";
 
 /**
  * Iris — Inbox Assistant (frontend shell)
@@ -128,6 +128,41 @@ const FOCUS_SUGGESTIONS = [
 // than prop drilling: Iris is mounted once, deep inside the dashboard, and
 // the buttons live on cards several layers away.
 export const IRIS_ASK_EVENT = "iris:ask";
+export const IRIS_USE_DRAFT_EVENT = "iris:use-draft";
+
+// Iris wraps a draft in conversational packaging — "Here's a draft you can
+// send:", --- rules, "Feel free to modify it!". Pasting all that into the
+// reply box would mean deleting it by hand every time, so strip the wrapper
+// and keep the letter. Falls back to the whole message if nothing is left,
+// since a bad guess must never lose the text.
+export function extractDraftBody(text) {
+  let lines = String(text ?? "").split("\n");
+
+  const isRule = (l) => /^\s*([-—_*]\s*){3,}\s*$/.test(l);
+  const isPreamble = (l) => /^\s*(here'?s|here is|sure|of course)\b.*:\s*$/i.test(l)
+                         || /^\s*(draft|suggested reply|reply)\s*:\s*$/i.test(l);
+  const isTrailer = (l) => /^\s*(feel free|let me know|hope this helps|you can (edit|modify|adjust))\b/i.test(l);
+
+  while (lines.length && (isPreamble(lines[0]) || isRule(lines[0]) || !lines[0].trim())) lines.shift();
+  while (lines.length && (isTrailer(lines[lines.length - 1]) || isRule(lines[lines.length - 1]) || !lines[lines.length - 1].trim())) lines.pop();
+
+  // Drop a leading "Subject: ..." line — the reply already has its subject.
+  if (lines.length && /^\s*subject\s*:/i.test(lines[0])) {
+    lines.shift();
+    while (lines.length && !lines[0].trim()) lines.shift();
+  }
+
+  const body = lines.join("\n").trim();
+  return body || String(text ?? "").trim();
+}
+
+// Push a draft into the reply composer. Same window-event approach as
+// askIrisAbout: the composer lives several layers away from this panel.
+export function useDraftInComposer(text) {
+  window.dispatchEvent(new CustomEvent(IRIS_USE_DRAFT_EVENT, {
+    detail: { text: extractDraftBody(text) },
+  }));
+}
 export function askIrisAbout(email) {
   const messageId = email?.id || email?.messageId;
   if (!messageId) return;
@@ -184,7 +219,8 @@ const Iris = ({
   const [messages, setMessages] = useState([{ role: "iris", text: GREETING }]);
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
-  const [copiedIndex, setCopiedIndex] = useState(null);   // index of message showing "Copied" feedback
+  const [copiedIndex, setCopiedIndex] = useState(null);
+  const [usedIndex, setUsedIndex] = useState(null);   // "Added" feedback on Use-as-reply   // index of message showing "Copied" feedback
 
   const containerRef = useRef(null);
   const listRef = useRef(null);
@@ -542,14 +578,26 @@ const Iris = ({
                         </div>
                       );
                     })}
-                    <button
-                      className="iris-copy-btn"
-                      onClick={() => handleCopyMessage(m.text, i)}
-                      title="Copy this message"
-                    >
-                      {copiedIndex === i ? <Check size={12} /> : <Copy size={12} />}
-                      {copiedIndex === i ? "Copied" : "Copy"}
-                    </button>
+                    <div className="iris-msg-actions">
+                      <button
+                        className="iris-copy-btn"
+                        onClick={() => handleCopyMessage(m.text, i)}
+                        title="Copy this message"
+                      >
+                        {copiedIndex === i ? <Check size={12} /> : <Copy size={12} />}
+                        {copiedIndex === i ? "Copied" : "Copy"}
+                      </button>
+                      {/* Drops the drafted letter straight into the reply box,
+                          minus Iris's "here's a draft…" packaging. */}
+                      <button
+                        className="iris-use-btn"
+                        onClick={() => { useDraftInComposer(m.text); setUsedIndex(i); setTimeout(() => setUsedIndex(null), 1800); }}
+                        title="Put this into the reply box"
+                      >
+                        {usedIndex === i ? <Check size={12} /> : <CornerDownLeft size={12} />}
+                        {usedIndex === i ? "Added" : "Use as reply"}
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -790,6 +838,17 @@ const IRIS_CSS = `
 .iris-brief-dot {
   width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
 }
+
+.iris-msg-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.iris-use-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  margin-top: 4px; padding: 3px 9px;
+  border-radius: 6px; cursor: pointer;
+  font-size: 0.68rem; font-weight: 700;
+  color: #04121c; border: none;
+  background: var(--glow-gradient);
+}
+.iris-use-btn:hover { filter: brightness(1.08); }
 
 .iris-steps {
   display: flex; flex-wrap: wrap; gap: 5px;
