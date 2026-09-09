@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
-import { Sparkles, X, Send, Copy, Check } from "lucide-react";
+import { Sparkles, X, Send, Copy, Check, RotateCcw } from "lucide-react";
 
 /**
  * Iris — Inbox Assistant (frontend shell)
@@ -66,6 +66,16 @@ const fallbackGetEffectiveReceivedAt = (email) => {
 // a 700-email inbox should send the same small snapshot as a 20-email one.
 const MAX_THREADS = 25;
 const MAX_RECENT_EMAILS = 25;
+
+// Starter prompts for an empty conversation. Chosen to show what Iris is
+// actually good at now that it can open and read full email text, rather
+// than leaving people to guess at a blank input box.
+const SUGGESTIONS = [
+  "Catch me up on what I missed today",
+  "What needs my reply first?",
+  "Who hasn't replied to me yet?",
+  "Summarise the latest thread from Deepa",
+];
 
 // ─── SINGLE INTEGRATION SEAM ───────────────────────────────────────────────
 // Calls the real backend. Phase 3: also sends user_email (not just the
@@ -206,8 +216,15 @@ const Iris = ({
     }
   };
 
-  const handleSend = async () => {
-    const text = input.trim();
+  const handleNewChat = () => {
+    setMessages([{ role: "iris", text: GREETING }]);
+    setInput("");
+    textareaRef.current?.focus();
+  };
+
+  // `preset` lets a suggestion chip send directly without going via the box.
+  const handleSend = async (preset) => {
+    const text = (typeof preset === "string" ? preset : input).trim();
     if (!text || thinking) return;
 
     const priorMessages = messages;   // history BEFORE this new message
@@ -247,8 +264,20 @@ const Iris = ({
               <div className="iris-header-icon"><Sparkles size={17} /></div>
               <div>
                 <div className="iris-header-title">Iris</div>
-                <div className="iris-header-sub">Inbox Assistant · Preview</div>
+                <div className="iris-header-sub">
+                  <span className="iris-status-dot" /> Reads your inbox
+                </div>
               </div>
+            </div>
+            <div className="iris-header-actions">
+              {messages.length > 1 && (
+                <button className="iris-icon-btn" onClick={handleNewChat} title="Start a new chat">
+                  <RotateCcw size={14} />
+                </button>
+              )}
+              <button className="iris-icon-btn" onClick={() => setIsOpen(false)} title="Close">
+                <X size={15} />
+              </button>
             </div>
           </div>
 
@@ -262,6 +291,10 @@ const Iris = ({
                   <div className="iris-bubble-user">{m.text}</div>
                 ) : (
                   <div className="iris-bubble-iris-wrap">
+                    <div className="iris-msg-head">
+                      <span className="iris-avatar"><Sparkles size={11} /></span>
+                      <span className="iris-msg-name">Iris</span>
+                    </div>
                     <div className="iris-bubble-iris">{m.text}</div>
                     <button
                       className="iris-copy-btn"
@@ -278,9 +311,30 @@ const Iris = ({
 
             {thinking && (
               <div className="iris-bubble-row iris-row-iris">
-                <div className="iris-bubble-iris iris-typing">
-                  <span /><span /><span />
+                <div className="iris-bubble-iris-wrap">
+                  <div className="iris-msg-head">
+                    <span className="iris-avatar"><Sparkles size={11} /></span>
+                    <span className="iris-msg-name">Iris</span>
+                  </div>
+                  <div className="iris-bubble-iris iris-thinking-line">
+                    <span className="iris-typing"><span /><span /><span /></span>
+                    <span className="iris-thinking-text">Reading your inbox…</span>
+                  </div>
                 </div>
+              </div>
+            )}
+
+            {/* Starter prompts — shown only on a fresh conversation. Iris can
+                now read full email text, so these lead with what it's newly
+                good at rather than leaving people guessing at a blank box. */}
+            {messages.length === 1 && !thinking && (
+              <div className="iris-suggestions">
+                <div className="iris-suggestions-label">Try asking</div>
+                {SUGGESTIONS.map((s) => (
+                  <button key={s} className="iris-chip" onClick={() => handleSend(s)}>
+                    {s}
+                  </button>
+                ))}
               </div>
             )}
           </div>
@@ -356,9 +410,9 @@ const IRIS_CSS = `
   top: 50%;
   right: 92px;
   transform: translateY(-50%);
-  width: 380px;
+  width: 430px;
   max-width: calc(100vw - 32px);
-  height: 540px;
+  height: 620px;
   max-height: calc(100vh - 48px);
   background: rgba(16, 18, 24, 0.92);
   backdrop-filter: blur(40px) saturate(160%);
@@ -383,6 +437,94 @@ const IRIS_CSS = `
   flex-shrink: 0;
 }
 .iris-header-left { display: flex; align-items: center; gap: 11px; }
+.iris-header-actions { display: flex; align-items: center; gap: 4px; }
+.iris-icon-btn {
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.iris-icon-btn:hover {
+  background: rgba(255,255,255,0.07);
+  border-color: rgba(255,255,255,0.12);
+  color: var(--text-primary);
+}
+.iris-status-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 6px rgba(34,197,94,0.8);
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+/* Sender line above each Iris reply — makes a long answer read as a message
+   from someone, rather than an unattributed wall of text. */
+.iris-msg-head {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 5px;
+  padding-left: 2px;
+}
+.iris-avatar {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--glow-gradient);
+  color: #04121c;
+  flex-shrink: 0;
+}
+.iris-msg-name {
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.iris-thinking-line { display: flex; align-items: center; gap: 9px; }
+.iris-thinking-text { font-size: 0.8rem; color: var(--text-secondary); }
+
+/* Starter prompts on an empty conversation — a blank box gives no hint of
+   what Iris can now do, so lead with the things it's actually good at. */
+.iris-suggestions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 6px;
+  padding-left: 2px;
+}
+.iris-suggestions-label {
+  font-size: 0.64rem;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  opacity: 0.75;
+  margin-bottom: 1px;
+}
+.iris-chip {
+  text-align: left;
+  padding: 8px 13px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 217, 255, 0.28);
+  background: rgba(0, 217, 255, 0.07);
+  color: var(--text-primary);
+  font-size: 0.79rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.iris-chip:hover {
+  background: rgba(0, 217, 255, 0.15);
+  border-color: rgba(0, 217, 255, 0.5);
+}
+
 .iris-header-icon {
   width: 32px; height: 32px; border-radius: 9px;
   display: flex; align-items: center; justify-content: center;

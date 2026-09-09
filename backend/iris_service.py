@@ -29,6 +29,9 @@ as they already exist — none of those were modified.
 """
 
 import json
+import re
+import html as _html
+from datetime import datetime
 from typing import Optional
 
 from services import (
@@ -40,7 +43,22 @@ from services import (
     get_tracking_summary,
     get_tracking_digest,
     get_cached_emails_by_id,
+    get_cached_detail,
+    has_cached_detail,
 )
+
+# Words carried by ordinary questions that would otherwise have to appear in
+# the email itself for a match — "the report from Deepa" should search for
+# "report" and "Deepa", not for "from" and "the".
+_SEARCH_STOPWORDS = {
+    "the", "a", "an", "of", "for", "from", "to", "in", "on", "at", "by",
+    "with", "about", "and", "or", "is", "was", "are", "were", "be", "been",
+    "my", "me", "i", "we", "our", "you", "your", "it", "this", "that",
+    "any", "all", "get", "show", "find", "search", "look", "tell", "give",
+    "what", "which", "who", "when", "where", "how", "did", "do", "does",
+    "email", "emails", "mail", "mails", "message", "messages", "please",
+    "latest", "recent", "last", "new",
+}
 
 IRIS_SYSTEM_PROMPT = """
 You are Iris, the inbox assistant built into the HFMG (Horizon Family
@@ -106,16 +124,41 @@ before saying you can't help — you have three:
    wasn't found in what's been analyzed rather than concluding it
    doesn't exist anywhere.
 
+4. read_email — opens ONE email's full text and reply chain, by the
+   messageId that search_emails returns. The snapshot and search results
+   only carry one-line summaries, so reach for this whenever the answer
+   depends on what was actually written: exact figures, dates, names,
+   what someone specifically asked for, or before drafting a reply to a
+   particular email. Prefer reading the email over hedging from a
+   summary. Typical flow: search_emails to find it, then read_email to
+   actually read it.
+
 If a tool returns an error or empty result, say so plainly. Never invent
 specific senders, subjects, dates, drafts, or tracking statuses that
 didn't come from the snapshot, a tool result, or the conversation itself.
 
 CURRENT CAPABILITIES (be honest if asked): you can chat, answer
-questions grounded in the snapshot, draft (but not send) email replies,
-and check tracking/follow-up status. You cannot send email, schedule
-anything, or search the person's full mailbox beyond what's already
-been analyzed.
+questions grounded in the snapshot, read the full text of emails that
+have been cached, draft (but not send) email replies, and check
+tracking/follow-up status. You cannot send email, schedule anything, or
+search the person's full mailbox beyond what's already been analyzed.
 """.strip()
+
+
+def _build_session_block(user_name: str, user_email: str) -> str:
+    """
+    Who is asking and what day it is. Without this the model has no idea
+    what "today", "this week" or "overdue" mean, so anything time-relative
+    was guesswork — and it couldn't address the person by name.
+    """
+    now = datetime.now()
+    return (
+        f"CURRENT SESSION\n"
+        f"You are speaking with: {user_name} ({user_email})\n"
+        f"Today is {now.strftime('%A, %d %B %Y')}, local time {now.strftime('%H:%M')}.\n"
+        f"Resolve relative dates against this — 'today', 'yesterday', 'this week', "
+        f"'overdue' — and prefer concrete dates over vague wording in your answers."
+    )
 
 # Defensive backstop — the frontend already caps list sizes before
 # sending, but this protects against a runaway payload regardless.
@@ -169,8 +212,9 @@ def _to_openai_messages(history: list) -> list:
 
 # ─── PHASE 3: TOOL DEFINITIONS ──────────────────────────────────────────────
 
-MAX_SEARCH_RESULTS = 8   # keep tool results small — this is a chat reply, not a report
-MAX_TOOL_ROUNDS = 4      # hard cap on model<->tool round-trips per message, prevents runaway loops
+MAX_SEARCH_RESULTS = 12  # keep tool results small — this is a chat reply, not a report
+MAX_TOOL_ROUNDS = 5      # hard cap on model<->tool round-trips per message, prevents runaway loops
+MAX_HISTORY_MESSAGES = 12  # recent turns kept; older ones dropped to bound cost
 
 TOOLS = [
     {
@@ -244,14 +288,120 @@ TOOLS = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Keyword(s) — a sender name/email, subject topic, etc.",
+                        "description": (
+                            "Keyword(s) — a sender name/email, subject topic, etc. "
+                            "Words are matched individually, so a natural phrase is fine."
+                        ),
                     },
                 },
                 "required": ["query"],
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_email",
+            "description": (
+                "Read the FULL text of one email, including the whole reply "
+                "chain. Use this whenever answering needs the actual wording "
+                "rather than a one-line summary — what someone specifically "
+                "asked for, exact figures, dates, names, commitments, or "
+                "before drafting a reply to a particular email. Find the "
+                "email with search_emails first, then pass its messageId."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "The messageId returned by search_emails.",
+                    },
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
 ]
+
+
+# Roughly how much of one email's text to hand the model. Generous enough for
+# a long thread, bounded so a newsletter can't crowd out the conversation.
+MAX_EMAIL_TEXT_CHARS = 6000
+MAX_THREAD_MESSAGES = 6
+
+
+def _html_to_text(raw: str) -> str:
+    """
+    Flatten an HTML email body to readable plain text. The model reasons far
+    better over prose than over Outlook's nested tables and inline styles,
+    and it keeps the token cost of a full body sane.
+    """
+    if not raw:
+        return ""
+    text = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", raw)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|tr|li|h[1-6])>", "\n", text)
+    text = re.sub(r"(?i)</t[dh]>", "\t", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    text = re.sub(r"[ \t ]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def read_cached_email(user_email: str, message_id: str) -> dict:
+    """
+    Return the full readable text of one email plus its reply chain, from
+    the offline detail cache that the background prefetcher fills.
+
+    This is the capability Iris was missing entirely: the id-cache it
+    searched has bodies stripped, so every answer was a paraphrase of a
+    one-line summary. The bodies were already on disk — nothing could read
+    them.
+    """
+    if not message_id:
+        return {"error": "read_email needs a message_id from search_emails."}
+
+    detail = get_cached_detail(user_email, message_id)
+    if not detail:
+        return {
+            "error": (
+                "That email's full text isn't cached yet. Answer from its "
+                "summary and say the full text wasn't available."
+            )
+        }
+
+    body_text = _html_to_text(detail.get("body") or "")
+    payload = {
+        "subject": detail.get("subject") or "No Subject",
+        "from": detail.get("from") or "Unknown",
+        "to": detail.get("to") or [],
+        "cc": detail.get("cc") or [],
+        "received": detail.get("received") or "",
+        "body": body_text[:MAX_EMAIL_TEXT_CHARS],
+        "attachments": [a.get("name") for a in (detail.get("attachments") or []) if a.get("name")],
+    }
+    if len(body_text) > MAX_EMAIL_TEXT_CHARS:
+        payload["body_truncated"] = True
+
+    # Newest-first, so a long chain spends its budget on what matters most.
+    messages = detail.get("messages") or []
+    if len(messages) > 1:
+        trimmed = []
+        for m in list(reversed(messages))[:MAX_THREAD_MESSAGES]:
+            if not isinstance(m, dict):
+                continue
+            mt = _html_to_text(m.get("body") or m.get("Body") or "")
+            trimmed.append({
+                "from": m.get("from") or m.get("From") or "Unknown",
+                "received": m.get("received") or m.get("Received") or "",
+                "text": mt[:2000],
+            })
+        payload["thread"] = trimmed
+        payload["thread_message_count"] = len(messages)
+
+    return payload
 
 
 def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RESULTS) -> list:
@@ -267,13 +417,20 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
     {id, messageId, _threadRef}) — those are filtered out here since
     they have no subject/summary and would just show up as noise.
 
-    Simple case-insensitive substring match against sender/subject/
-    summary — intentionally basic (no fuzzy matching, no ranking)
-    since this is meant for quick conversational lookups, not a search
-    product in its own right.
+    Matching is per-word, not whole-phrase. The previous version required
+    the entire query to appear as one contiguous substring, so a natural
+    question like "report from Deepa" scored zero even when both "report"
+    and "Deepa" were present — which read as "Iris can't find anything".
+    Every meaningful word must appear somewhere in the email (subject,
+    summary or sender), in any order.
+
+    Results are ranked rather than taken in whatever order the cache
+    happens to iterate: subject hits beat summary hits, then newest first.
+    Asking "the latest from X" used to be able to return the oldest match.
     """
-    query_clean = (query or "").strip().lower()
-    if not query_clean:
+    words = [w for w in re.split(r"\W+", (query or "").lower()) if len(w) > 1]
+    words = [w for w in words if w not in _SEARCH_STOPWORDS]
+    if not words:
         return []
 
     try:
@@ -282,12 +439,10 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
         log.error(f"search_cached_emails: get_cached_emails_by_id failed: {e}")
         return []
 
-    results = []
+    scored = []
     seen_ids = set()
 
     for entry in cached.values():
-        if len(results) >= limit:
-            break
         if not isinstance(entry, dict):
             continue
         if entry.get("_threadRef"):   # skip thread-pointer stubs — no real content
@@ -296,8 +451,11 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
         subject = entry.get("subject") or ""
         summary = entry.get("summary") or ""
         sender = entry.get("from") or entry.get("sender") or ""
-        haystack = f"{subject} {summary} {sender}".lower()
-        if query_clean not in haystack:
+        subject_l, summary_l, sender_l = subject.lower(), summary.lower(), sender.lower()
+        haystack = f"{subject_l} {summary_l} {sender_l}"
+
+        matched = [w for w in words if w in haystack]
+        if not matched:
             continue
 
         eid = entry.get("id") or entry.get("messageId")
@@ -306,15 +464,36 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
         if eid:
             seen_ids.add(eid)
 
-        results.append({
+        # Weight where the words landed — a subject or sender match is a
+        # stronger signal of relevance than a passing mention in a summary.
+        score = sum(
+            (3 if w in subject_l else 0) + (2 if w in sender_l else 0) + (1 if w in summary_l else 0)
+            for w in matched
+        )
+        received = entry.get("received_at") or entry.get("received") or ""
+
+        scored.append((len(matched), score, str(received), {
+            "messageId": eid,
             "from": sender or "Unknown Sender",
             "subject": subject or "No Subject",
             "category": entry.get("category") or "NORMAL",
             "summary": summary,
-            "received_at": entry.get("received_at") or entry.get("received"),
-        })
+            "received_at": received,
+            "unread": entry.get("isRead") is False,
+            "has_full_text": has_cached_detail(user_email, eid) if eid else False,
+        }))
 
-    return results
+    # Prefer emails matching every word; if none do, fall back to the best
+    # partial matches rather than returning nothing. A conversational query
+    # like "what did Shahana send about productivity" rarely has all its
+    # words in one subject line, and an empty answer reads as "Iris can't
+    # find anything" when the email is sitting right there.
+    full_matches = [t for t in scored if t[0] == len(words)]
+    pool = full_matches if full_matches else scored
+
+    # Most words matched first, then relevance weighting, then most recent.
+    pool.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    return [item for _, _, _, item in pool[:limit]]
 
 
 def _slim_tracking_item(item: dict) -> dict:
@@ -381,7 +560,19 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
         elif name == "search_emails":
             query = (arguments or {}).get("query", "")
             results = search_cached_emails(user_email, query)
-            return json.dumps({"results": results, "count": len(results)})
+            return json.dumps({
+                "results": results,
+                "count": len(results),
+                "hint": (
+                    "Entries with has_full_text can be opened with read_email "
+                    "using their messageId — do that before answering anything "
+                    "that needs the actual wording."
+                ),
+            })
+
+        elif name == "read_email":
+            message_id = (arguments or {}).get("message_id", "")
+            return json.dumps(read_cached_email(user_email, message_id), default=str)
 
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
@@ -410,9 +601,13 @@ async def get_iris_reply(
     """
     messages = [
         {"role": "system", "content": IRIS_SYSTEM_PROMPT},
+        {"role": "system", "content": _build_session_block(user_name, user_email)},
         {"role": "system", "content": _build_context_block(inbox_context)},
     ]
-    messages.extend(_to_openai_messages(history))
+    # Only the recent turns. The frontend sends the whole conversation, so a
+    # long chat previously grew the request without bound — cost climbing
+    # every message until it eventually hit the context limit.
+    messages.extend(_to_openai_messages(history)[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": message})
 
     for _ in range(MAX_TOOL_ROUNDS):
