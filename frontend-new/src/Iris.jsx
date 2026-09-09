@@ -70,6 +70,31 @@ const MAX_RECENT_EMAILS = 25;
 // Starter prompts for an empty conversation. Chosen to show what Iris is
 // actually good at now that it can open and read full email text, rather
 // than leaving people to guess at a blank input box.
+// The system prompt asks for plain text, but the model still emits markdown
+// often enough that "**Normal Updates:**" was showing up literally on screen.
+// Rather than trusting it to comply, render the common markers properly:
+// **bold** becomes bold, ### headings lose their hashes, and "- " list items
+// become real bullets. Built as React nodes, never raw HTML, so model output
+// can't inject markup.
+function renderRichText(text) {
+  const lines = String(text ?? "").split("\n");
+  return lines.map((line, li) => {
+    let clean = line.replace(/^\s{0,3}#{1,6}\s+/, "");           // ### Heading
+    clean = clean.replace(/^(\s*)[-*]\s+/, "$1• ");              // - item
+    const parts = clean.split(/(\*\*[^*]+\*\*)/g).filter(Boolean);
+    return (
+      <span key={li} className="iris-line">
+        {parts.map((p, pi) =>
+          /^\*\*[^*]+\*\*$/.test(p)
+            ? <strong key={pi}>{p.slice(2, -2)}</strong>
+            : <span key={pi}>{p}</span>
+        )}
+        {li < lines.length - 1 ? "\n" : null}
+      </span>
+    );
+  });
+}
+
 const SUGGESTIONS = [
   "Catch me up on what I missed today",
   "What needs my reply first?",
@@ -295,7 +320,7 @@ const Iris = ({
                       <span className="iris-avatar"><Sparkles size={11} /></span>
                       <span className="iris-msg-name">Iris</span>
                     </div>
-                    <div className="iris-bubble-iris">{m.text}</div>
+                    <div className="iris-bubble-iris">{renderRichText(m.text)}</div>
                     <button
                       className="iris-copy-btn"
                       onClick={() => handleCopyMessage(m.text, i)}
@@ -412,8 +437,12 @@ const IRIS_CSS = `
   transform: translateY(-50%);
   width: 430px;
   max-width: calc(100vw - 32px);
-  height: 620px;
+  /* Never taller than the viewport allows. dvh accounts for mobile browser
+     chrome; the vh line is the fallback for browsers without dvh. */
+  height: min(620px, calc(100vh - 48px));
+  height: min(620px, calc(100dvh - 48px));
   max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
   background: rgba(16, 18, 24, 0.92);
   backdrop-filter: blur(40px) saturate(160%);
   -webkit-backdrop-filter: blur(40px) saturate(160%);
@@ -540,6 +569,11 @@ const IRIS_CSS = `
 .iris-messages {
   flex: 1; overflow-y: auto; padding: 16px 14px;
   display: flex; flex-direction: column; gap: 9px;
+  /* Without min-height:0 a flex item won't shrink below its content height,
+     so a long conversation grew the column past the panel and pushed the
+     input row off the bottom of the screen. This is what keeps the message
+     list scrolling inside the panel instead of stretching it. */
+  min-height: 0;
 }
 .iris-bubble-row { display: flex; width: 100%; }
 .iris-row-user { justify-content: flex-end; }
