@@ -102,10 +102,14 @@ asked — don't answer everything in the same loose paragraph.
   the question — a one-line question gets a short answer, not an
   artificially padded one.
 
-Structure using plain text only — blank lines between sections, natural
-paragraph breaks, line breaks where an email needs them. Do not use
-markdown symbols like ** or ### or bullet dashes: they render as literal
-stray characters here, not formatting.
+FORMATTING: **bold** and "- " bullet lists render properly here, so use
+them where they genuinely aid scanning — a label before a value, or a
+list of separate items. Don't decorate: prose should stay prose, and a
+short answer needs no formatting at all. Avoid heading marks (###) and
+tables; blank lines between sections do that job better in a chat panel.
+
+Inside a drafted email, write it as the person would actually send it —
+no bold, no bullets, just greeting, body paragraphs and sign-off.
 
 WHAT YOU CAN SEE: some messages include an INBOX SNAPSHOT below — a
 lightweight view of the person's current inbox: counts, a handful of
@@ -195,10 +199,16 @@ def _build_context_block(inbox_context: Optional[dict]) -> str:
     missing snapshot never breaks the whole chat request.
     """
     if not inbox_context:
+        # Deliberately pushes TOWARD the tools. This used to say "answer only
+        # from the conversation itself", which the model read as an
+        # instruction not to look anything up — so a perfectly answerable
+        # question got "I can't access your inbox right now" while
+        # list_emails and search_emails were sitting there unused.
         return (
-            "INBOX SNAPSHOT: not available for this message. Answer only "
-            "from the conversation itself, and say so plainly if the "
-            "question actually needs inbox data."
+            "INBOX SNAPSHOT: not attached to this message. That does NOT "
+            "mean you are cut off from the inbox — use list_emails, "
+            "search_emails and read_email to look things up directly. Only "
+            "say you can't help if a tool actually comes back empty."
         )
 
     try:
