@@ -41,3 +41,7 @@ class IrisChatRequest(BaseModel):
     user_name: str = "User"            # display name — used for tone/sign-off
     user_email: str = "default"        # identifies which user's cache/tracking data tools should read
     inbox_context: Optional[dict] = None   # {stats, threads, recent_emails} — see iris_service.py
+    # Set when the chat was opened from a specific email ("Ask Iris about
+    # this"), so Iris starts already looking at it instead of having to
+    # search for something the person is staring at.
+    focus_message_id: Optional[str] = None

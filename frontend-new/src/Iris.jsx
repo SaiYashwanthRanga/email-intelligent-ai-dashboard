@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Sparkles, X, Send, Copy, Check, RotateCcw } from "lucide-react";
+import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck } from "lucide-react";
 
 /**
  * Iris — Inbox Assistant (frontend shell)
@@ -113,7 +113,30 @@ const SUGGESTIONS = [
 // Calls the real backend. Phase 3: also sends user_email (not just the
 // display name) since the backend's tools — tracking status, email
 // search — look data up by email, not by display name.
-async function sendToIris(message, history, inboxContext) {
+// Fired by "Ask Iris" buttons elsewhere in the app. A window event rather
+// than prop drilling: Iris is mounted once, deep inside the dashboard, and
+// the buttons live on cards several layers away.
+export const IRIS_ASK_EVENT = "iris:ask";
+export function askIrisAbout(email) {
+  const messageId = email?.id || email?.messageId;
+  if (!messageId) return;
+  window.dispatchEvent(new CustomEvent(IRIS_ASK_EVENT, {
+    detail: { messageId, subject: email?.subject || "this email" },
+  }));
+}
+
+async function confirmIrisAction(proposal) {
+  const res = await fetch(`${API_BASE}/iris/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(proposal),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "That didn't go through.");
+  return data;
+}
+
+async function sendToIris(message, history, inboxContext, focusMessageId) {
   const userName = localStorage.getItem("loggedInUser") || "User";
   const userEmail = localStorage.getItem("userEmail") || "default";
 
@@ -126,6 +149,7 @@ async function sendToIris(message, history, inboxContext) {
       user_name: userName,
       user_email: userEmail,
       inbox_context: inboxContext || null,
+      focus_message_id: focusMessageId || null,
     }),
   });
 
@@ -134,7 +158,8 @@ async function sendToIris(message, history, inboxContext) {
   }
 
   const data = await res.json();
-  return data.reply;
+  // steps = what Iris did; proposals = actions awaiting confirmation
+  return { text: data.reply, steps: data.steps || [], proposals: data.proposals || [] };
 }
 
 const Iris = ({
@@ -166,6 +191,38 @@ const Iris = ({
     return window.innerHeight / 2;
   });
   const dragRef = useRef({ active: false, moved: false, offset: 0 });
+
+  // The email the chat was opened from, if any. A ref rather than state so
+  // handleSend always reads the current value without being re-created.
+  const focusRef = useRef(null);
+  const [focusSubject, setFocusSubject] = useState(null);
+  const [actionState, setActionState] = useState({});   // actionId -> "running" | "done" | error text
+
+  // "Ask Iris about this email" from anywhere in the app.
+  useEffect(() => {
+    const onAsk = (e) => {
+      const { messageId, subject } = e.detail || {};
+      if (!messageId) return;
+      focusRef.current = messageId;
+      setFocusSubject(subject || "this email");
+      setMessages([{ role: "iris", text: `Looking at "${subject}". What would you like to know or do with it?` }]);
+      setIsOpen(true);
+      setTimeout(() => textareaRef.current?.focus(), 80);
+    };
+    window.addEventListener(IRIS_ASK_EVENT, onAsk);
+    return () => window.removeEventListener(IRIS_ASK_EVENT, onAsk);
+  }, []);
+
+  const handleConfirm = async (proposal) => {
+    setActionState((s) => ({ ...s, [proposal.actionId]: "running" }));
+    try {
+      const res = await confirmIrisAction(proposal);
+      setActionState((s) => ({ ...s, [proposal.actionId]: "done" }));
+      setMessages((prev) => [...prev, { role: "iris", text: res.message || "Done." }]);
+    } catch (err) {
+      setActionState((s) => ({ ...s, [proposal.actionId]: err.message || "Failed" }));
+    }
+  };
 
   const clampFabY = useCallback((y) => {
     const half = FAB_SIZE / 2;
@@ -211,6 +268,24 @@ const Iris = ({
     window.addEventListener("touchmove", onTouchMove, { passive: true });
     window.addEventListener("touchend", end);
   }, [fabY, clampFabY]);
+
+  // Standing brief, derived from the inbox the dashboard already loaded.
+  // No API call, so it's on screen the instant the panel opens; each line
+  // is a shortcut into the question it raises.
+  const brief = useMemo(() => {
+    const list = Array.isArray(emails) ? emails : [];
+    if (!list.length) return null;
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+    const urgent = list.filter((e) => ["URGENT", "PRIORITY"].includes((e?.category || "").toUpperCase())).length;
+    const today = list.filter((e) => { try { return getReceived(e).getTime() >= since; } catch { return false; } }).length;
+    const unread = list.filter((e) => e?.isRead === false).length;
+
+    const rows = [];
+    if (urgent) rows.push({ color: "#f87171", text: `${urgent} urgent or priority`, ask: "What is urgent right now?" });
+    if (today) rows.push({ color: "#00d9ff", text: `${today} arrived in the last 24 hours`, ask: "Catch me up on what I missed today" });
+    if (unread) rows.push({ color: "#fbbf24", text: `${unread} unread`, ask: "What needs my reply first?" });
+    return rows.length ? rows : null;
+  }, [emails, getReceived]);
 
   // Panel sits centred on the button, but never hangs off either edge.
   const panelTop = useMemo(() => {
@@ -330,8 +405,13 @@ const Iris = ({
     setThinking(true);
 
     try {
-      const reply = await sendToIris(text, priorMessages, inboxContext);
-      setMessages((prev) => [...prev, { role: "iris", text: reply }]);
+      const reply = await sendToIris(text, priorMessages, inboxContext, focusRef.current);
+      setMessages((prev) => [...prev, {
+        role: "iris",
+        text: reply.text,
+        steps: reply.steps,
+        proposals: reply.proposals,
+      }]);
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -392,7 +472,55 @@ const Iris = ({
                       <span className="iris-avatar"><Sparkles size={11} /></span>
                       <span className="iris-msg-name">Iris</span>
                     </div>
+                    {/* What Iris actually did to answer — turns a silent
+                        pause into visible work, and shows its receipts. */}
+                    {m.steps?.length > 0 && (
+                      <div className="iris-steps">
+                        {m.steps.map((s, si) => (
+                          <span key={si} className="iris-step"><Check size={9} /> {s}</span>
+                        ))}
+                      </div>
+                    )}
                     <div className="iris-bubble-iris">{renderRichText(m.text)}</div>
+
+                    {/* Actions wait here for an explicit press. Iris never
+                        performs them itself — this button is the only path. */}
+                    {m.proposals?.map((p) => {
+                      const state = actionState[p.actionId];
+                      const isSend = p.action === "send_reply" || p.action === "forward";
+                      return (
+                        <div key={p.actionId} className={`iris-action-card ${isSend ? "iris-action-send" : ""}`}>
+                          <div className="iris-action-title">
+                            <ShieldCheck size={13} /> Needs your confirmation
+                          </div>
+                          <div className="iris-action-summary">{p.summary}</div>
+                          {isSend && (
+                            <div className="iris-action-detail">
+                              <div><span className="iris-action-label">To</span> {(p.to || []).join(", ") || "—"}</div>
+                              {p.cc?.length > 0 && <div><span className="iris-action-label">Cc</span> {p.cc.join(", ")}</div>}
+                              {p.subject && <div><span className="iris-action-label">Subject</span> {p.subject}</div>}
+                              <div className="iris-action-body">{p.body}</div>
+                            </div>
+                          )}
+                          {state === "done" ? (
+                            <div className="iris-action-done"><Check size={12} /> Done</div>
+                          ) : (
+                            <div className="iris-action-buttons">
+                              <button
+                                className="iris-action-go"
+                                disabled={state === "running"}
+                                onClick={() => handleConfirm(p)}
+                              >
+                                {state === "running" ? "Working…" : (isSend ? "Send it" : "Confirm")}
+                              </button>
+                              {state && state !== "running" && (
+                                <span className="iris-action-error">{state}</span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                     <button
                       className="iris-copy-btn"
                       onClick={() => handleCopyMessage(m.text, i)}
@@ -418,6 +546,21 @@ const Iris = ({
                     <span className="iris-thinking-text">Reading your inbox…</span>
                   </div>
                 </div>
+              </div>
+            )}
+
+            {/* Proactive brief. Computed from data the dashboard already has,
+                so it's instant and costs no API call — Iris opens by telling
+                you where you stand rather than waiting to be asked. */}
+            {messages.length === 1 && !thinking && !focusRef.current && brief && (
+              <div className="iris-brief">
+                <div className="iris-brief-label">Where you stand</div>
+                {brief.map((b) => (
+                  <button key={b.text} className="iris-brief-row" onClick={() => handleSend(b.ask)}>
+                    <span className="iris-brief-dot" style={{ background: b.color }} />
+                    {b.text}
+                  </button>
+                ))}
               </div>
             )}
 
@@ -599,6 +742,91 @@ const IRIS_CSS = `
   letter-spacing: 0.4px;
   text-transform: uppercase;
   color: var(--text-secondary);
+}
+
+/* Standing brief shown when the panel opens on a fresh conversation. */
+.iris-brief {
+  display: flex; flex-direction: column; gap: 5px;
+  margin: 4px 0 12px; padding: 10px 12px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.035);
+  border-radius: 12px;
+}
+.iris-brief-label {
+  font-size: 0.62rem; font-weight: 800; letter-spacing: 1px;
+  text-transform: uppercase; color: var(--text-secondary);
+  opacity: 0.75; margin-bottom: 3px;
+}
+.iris-brief-row {
+  display: flex; align-items: center; gap: 8px;
+  background: transparent; border: none; padding: 3px 0;
+  color: var(--text-primary); font-size: 0.81rem; font-weight: 600;
+  cursor: pointer; text-align: left;
+}
+.iris-brief-row:hover { color: #00d9ff; }
+.iris-brief-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+}
+
+.iris-steps {
+  display: flex; flex-wrap: wrap; gap: 5px;
+  margin-bottom: 6px; padding-left: 2px;
+}
+.iris-step {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 0.66rem; font-weight: 600;
+  color: var(--text-secondary);
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 999px; padding: 2px 8px;
+}
+
+/* Confirmation card. Nothing Iris proposes happens until this is pressed,
+   so it deliberately looks like a decision point rather than a message. */
+.iris-action-card {
+  margin-top: 8px;
+  border: 1px solid rgba(0, 217, 255, 0.35);
+  background: rgba(0, 217, 255, 0.06);
+  border-radius: 12px;
+  padding: 11px 13px;
+  max-width: 84%;
+}
+.iris-action-send {
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.07);
+}
+.iris-action-title {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 0.62rem; font-weight: 800; letter-spacing: 0.8px;
+  text-transform: uppercase; color: var(--text-secondary); margin-bottom: 6px;
+}
+.iris-action-summary { font-size: 0.84rem; font-weight: 700; color: var(--text-primary); }
+.iris-action-detail {
+  margin-top: 8px; font-size: 0.76rem; color: var(--text-secondary);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.iris-action-label {
+  display: inline-block; min-width: 52px;
+  font-weight: 800; font-size: 0.62rem; letter-spacing: 0.6px;
+  text-transform: uppercase; opacity: 0.75;
+}
+.iris-action-body {
+  margin-top: 6px; padding: 8px 10px;
+  background: rgba(0,0,0,0.28); border-radius: 8px;
+  white-space: pre-wrap; color: var(--text-primary);
+  max-height: 190px; overflow-y: auto;
+}
+.iris-action-buttons { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+.iris-action-go {
+  border: none; border-radius: 8px; padding: 7px 15px;
+  font-size: 0.78rem; font-weight: 800; cursor: pointer;
+  background: var(--glow-gradient); color: #04121c;
+}
+.iris-action-go:disabled { opacity: 0.6; cursor: default; }
+.iris-action-error { font-size: 0.72rem; color: #f87171; }
+.iris-action-done {
+  display: flex; align-items: center; gap: 5px; margin-top: 8px;
+  font-size: 0.76rem; font-weight: 700; color: #22c55e;
 }
 
 .iris-thinking-line { display: flex; align-items: center; gap: 9px; }

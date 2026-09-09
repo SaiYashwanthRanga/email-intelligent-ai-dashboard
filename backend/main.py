@@ -1024,17 +1024,121 @@ async def iris_chat(payload: IrisChatRequest):
     tool-calling loop itself.
     """
     try:
-        reply_text = await get_iris_reply(
+        result = await get_iris_reply(
             payload.message,
             payload.history,
             payload.user_name,
             payload.inbox_context,
             payload.user_email,
+            payload.focus_message_id,
         )
-        return {"reply": reply_text}
+        # steps  = what Iris actually did, so the UI isn't a silent pause
+        # proposals = actions waiting on the person's confirmation. Iris
+        # never performs them; /api/iris/confirm does, after they press it.
+        return {
+            "reply": result.get("reply", ""),
+            "steps": result.get("steps", []),
+            "proposals": result.get("proposals", []),
+        }
     except Exception as e:
         log.error(f"iris_chat error: {e}")
         raise HTTPException(status_code=500, detail="Iris couldn't respond right now.")
+
+
+# Action ids already carried out, so a double-click or a retry after a
+# timeout can't run the same thing twice. In memory by design: the worst a
+# restart can do is allow a repeat the person has to press for again.
+_iris_done_actions: dict = {}
+IRIS_ACTION_TTL = 3600
+
+
+@app.post("/api/iris/confirm")
+async def iris_confirm(payload: dict = Body(...)):
+    """
+    Carry out an action Iris proposed, after the person pressed confirm.
+
+    Iris itself can only ever propose — this is the single place any of it
+    actually happens, and it only runs on an explicit click. Sends are
+    deliberately NOT retried: if the mail server times out we cannot know
+    whether it went, and silently retrying could send the same email twice.
+    """
+    action_id = (payload.get("actionId") or "").strip()
+    action = (payload.get("action") or "").strip()
+    user_email = (payload.get("userEmail") or "").strip()
+    message_id = (payload.get("messageId") or "").strip()
+
+    if not action_id or not action:
+        raise HTTPException(status_code=400, detail="Missing actionId or action.")
+
+    now = time.time()
+    for k, ts in list(_iris_done_actions.items()):
+        if now - ts > IRIS_ACTION_TTL:
+            _iris_done_actions.pop(k, None)
+    if action_id in _iris_done_actions:
+        return {"ok": True, "duplicate": True, "message": "Already done — not repeating it."}
+
+    try:
+        if action == "mark_read":
+            if not message_id:
+                raise HTTPException(status_code=400, detail="mark_read needs a messageId.")
+            resp = requests.post(
+                f"{ORG_BASE}/api/Values/mail/read-status",
+                params={"messageId": message_id, "targetUserEmail": user_email, "isRead": "true"},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Mail server refused: {resp.text[:200]}")
+            update_cache_mark_read(message_id, user_email)
+            result = {"ok": True, "message": "Marked as read."}
+
+        elif action in ("send_reply", "forward"):
+            body = payload.get("body") or ""
+            to = [x for x in (payload.get("to") or []) if x]
+            if not body or not to:
+                raise HTTPException(status_code=400, detail="A recipient and a message body are required.")
+            html_body = body if "<" in body else "<p>" + body.replace("\n", "<br>") + "</p>"
+            endpoint = "reply" if action == "send_reply" else "forwardmail"
+            parts = [
+                ("MessageItemId", (None, message_id, "text/plain")),
+                ("ReplyBodyHtml", (None, html_body, "text/plain")),
+                ("IsReplyAll", (None, "false", "text/plain")),
+            ]
+            for t in to:
+                parts.append(("To", (None, t, "text/plain")))
+            for c in (payload.get("cc") or []):
+                parts.append(("Cc", (None, c, "text/plain")))
+            if user_email:
+                parts.append(("TargetUserEmail", (None, user_email, "text/plain")))
+            # No retry here, on purpose — see the docstring above.
+            async with httpx.AsyncClient(timeout=120) as client_:
+                resp = await client_.post(f"{ORG_BASE}/api/Values/mail/{endpoint}", files=parts)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Send failed: {resp.text[:200]}")
+            result = {"ok": True, "message": "Sent."}
+
+        elif action == "rsvp":
+            answer = (payload.get("response") or "accept").lower()
+            resp = requests.post(
+                f"{ORG_BASE}/api/Values/meetings/Action",
+                params={"meetingId": message_id, "action": answer, "targetUserEmail": user_email},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Calendar refused: {resp.text[:200]}")
+            result = {"ok": True, "message": f"RSVP sent ({answer})."}
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+
+        _iris_done_actions[action_id] = now
+        log.info(f"[iris-action] {action} confirmed by {user_email} ({action_id})")
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"iris_confirm '{action}' failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Couldn't complete that: {e}")
 
 
 @app.post("/api/parse-thread")

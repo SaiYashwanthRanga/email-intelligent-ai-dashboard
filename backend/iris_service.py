@@ -27,9 +27,18 @@ Iris can call these tools mid-conversation:
   - get_calendar            -> upcoming meetings, via main.get_meetings so
                                 its caching and stale-fallback are reused
 
-Iris still cannot SEND anything or take any other action — draft_reply
-only returns text for the person to review. That distinction is spelled
-out in the system prompt below on purpose.
+  - propose_action          -> puts an action (mark read / reply / forward /
+                                RSVP / track) in front of the person as a
+                                confirmation button
+
+Iris still performs NOTHING itself. propose_action only records a
+proposal; /api/iris/confirm in main.py is the single place anything is
+actually carried out, and only after an explicit press. That split is the
+safety property — "the assistant sent mail on its own" is impossible by
+construction here, not by the model following instructions. Sends are
+also never auto-retried, since a timeout leaves it genuinely unknown
+whether the mail went, and each proposal carries an actionId the confirm
+route de-duplicates on.
 
 Reuses the same OpenAI client + model already configured in services.py
 rather than standing up a second client, and reuses draft_email_reply /
@@ -39,6 +48,7 @@ as they already exist — none of those were modified.
 
 import json
 import re
+import uuid
 import asyncio
 import html as _html
 from datetime import datetime, timedelta
@@ -162,12 +172,27 @@ If a tool returns an error or empty result, say so plainly. Never invent
 specific senders, subjects, dates, drafts, or tracking statuses that
 didn't come from the snapshot, a tool result, or the conversation itself.
 
+7. propose_action — puts a confirmation button in front of the person
+   for something they asked you to DO rather than tell them: mark an
+   email read, send a reply, forward, RSVP to a meeting, start tracking.
+   You never carry it out. Pressing the button is what performs it, and
+   they can edit a message before it goes. So: prepare the action, then
+   say what you've queued and that it needs their confirmation. Never say
+   "I've sent it" or "done" — it is not done until they press. For a
+   reply or forward, write the complete final message in the body; the
+   person will see exactly what would be sent.
+
+If someone asks you to do something you have no action for (deleting
+mail, moving folders, booking a new meeting), say plainly that you can't
+do that yet rather than proposing something adjacent.
+
 CURRENT CAPABILITIES (be honest if asked): you can chat, answer
 questions grounded in the snapshot, browse and search analysed email,
 read the full text of emails that have been cached, look at the person's
-upcoming calendar, draft (but not send) email replies, and check
-tracking/follow-up status. You cannot send email, change the calendar,
-or reach beyond the mail that has already been analysed.
+upcoming calendar, draft replies, check tracking/follow-up status, and
+prepare actions (mark read, reply, forward, RSVP, track) for them to
+confirm. You never send or change anything on your own, you can't create
+calendar entries, and you can't reach beyond the mail already analysed.
 """.strip()
 
 
@@ -404,6 +429,59 @@ TOOLS = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_action",
+            "description": (
+                "Propose an action for the person to confirm. You NEVER carry "
+                "actions out yourself — this only puts a confirmation button "
+                "in front of them, and nothing happens unless they press it. "
+                "Use it when they ask you to do something rather than tell "
+                "them something: mark mail as read, reply, forward, RSVP to a "
+                "meeting, or start tracking a reply. After calling this, tell "
+                "them plainly what you've queued up and that it needs their "
+                "confirmation. Never claim it is done."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["mark_read", "send_reply", "forward", "rsvp", "track"],
+                        "description": "Which action to put up for confirmation.",
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "The email or meeting this applies to (from search_emails/list_emails).",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One short line describing the action, shown on the confirm button.",
+                    },
+                    "to": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "send_reply/forward: recipient addresses.",
+                    },
+                    "cc": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "send_reply/forward: cc addresses.",
+                    },
+                    "subject": {"type": "string", "description": "send_reply/forward: subject line."},
+                    "body": {
+                        "type": "string",
+                        "description": "send_reply/forward: the full message text, ready to send.",
+                    },
+                    "response": {
+                        "type": "string",
+                        "enum": ["accept", "decline", "tentative"],
+                        "description": "rsvp: which answer to give.",
+                    },
+                },
+                "required": ["action", "summary"],
             },
         },
     },
@@ -748,7 +826,55 @@ def _slim_tracking_item(item: dict) -> dict:
     }
 
 
-async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_name: str) -> str:
+# Human-readable labels for the activity trail shown while Iris works, so
+# a 15-second pause reads as "it's searching and reading" rather than a
+# frozen panel.
+TOOL_LABELS = {
+    "search_emails":         "Searching your inbox",
+    "list_emails":           "Looking through your mail",
+    "read_email":            "Reading the email",
+    "get_calendar":          "Checking your calendar",
+    "check_tracking_status": "Checking follow-ups",
+    "draft_reply":           "Drafting a reply",
+    "propose_action":        "Preparing an action",
+}
+
+
+def build_action_proposal(arguments: dict, user_email: str) -> dict:
+    """
+    Turn the model's proposed action into a structured payload the UI can
+    render as a confirmation card.
+
+    Nothing is executed here, deliberately. Iris can only ever put a button
+    in front of the person; the frontend calls the real endpoint after they
+    press it. That keeps "an AI sent mail on my behalf" impossible by
+    construction rather than by the model following instructions.
+    """
+    a = arguments or {}
+    action = (a.get("action") or "").strip()
+    proposal = {
+        # Identifies this specific proposal end-to-end, so confirming twice
+        # (double click, retry after a timeout) can't perform it twice.
+        "actionId": f"{action}-{uuid.uuid4().hex[:16]}",
+        "action": action,
+        "summary": (a.get("summary") or "").strip() or action.replace("_", " "),
+        "messageId": a.get("message_id") or "",
+        "userEmail": user_email,
+    }
+    if action in ("send_reply", "forward"):
+        proposal.update({
+            "to": [x for x in (a.get("to") or []) if x],
+            "cc": [x for x in (a.get("cc") or []) if x],
+            "subject": a.get("subject") or "",
+            "body": a.get("body") or "",
+        })
+    if action == "rsvp":
+        proposal["response"] = a.get("response") or "accept"
+    return proposal
+
+
+async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_name: str,
+                             sink: list = None) -> str:
     """
     Runs the named tool and returns a JSON string to feed back to the
     model as the tool result. Never raises — any failure becomes a
@@ -825,6 +951,25 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
             result = await get_calendar_window(user_email, int(days_ahead))
             return json.dumps(result, default=str)
 
+        elif name == "propose_action":
+            proposal = build_action_proposal(arguments, user_email)
+            if not proposal["action"]:
+                return json.dumps({"error": "propose_action needs an action."})
+            if proposal["action"] in ("send_reply", "forward") and not proposal.get("body"):
+                return json.dumps({"error": "Write the full message body before proposing to send it."})
+            if sink is not None:
+                sink.append(proposal)
+            return json.dumps({
+                "queued": True,
+                "action": proposal["action"],
+                "note": (
+                    "A confirmation button is now in front of the person. "
+                    "Nothing has happened yet. Tell them what you've prepared "
+                    "and that it will only run once they confirm — never say "
+                    "it is done."
+                ),
+            })
+
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -839,10 +984,15 @@ async def get_iris_reply(
     user_name: str = "User",
     inbox_context: Optional[dict] = None,
     user_email: str = "default",
-) -> str:
+    focus_message_id: Optional[str] = None,
+) -> dict:
     """
-    Returns Iris's reply as plain text. Raises on API failure — the route
-    handler in main.py is responsible for turning that into an HTTP error.
+    Returns {"reply", "steps", "proposals"}. Raises on API failure — the
+    route handler in main.py turns that into an HTTP error.
+
+    `steps` is the trail of tools that ran, so the UI can show what Iris
+    actually did rather than leaving a silent pause. `proposals` are actions
+    awaiting the person's confirmation — Iris never performs them itself.
 
     Runs a standard tool-calling loop: ask the model, and if it wants to
     call one or more tools, run them and feed the results back, up to
@@ -850,11 +1000,32 @@ async def get_iris_reply(
     by then (shouldn't normally happen), one last no-tools call forces a
     direct answer so the person always gets a reply rather than a timeout.
     """
+    proposals = []
+    steps = []
+
     messages = [
         {"role": "system", "content": IRIS_SYSTEM_PROMPT},
         {"role": "system", "content": _build_session_block(user_name, user_email)},
         {"role": "system", "content": _build_context_block(inbox_context)},
     ]
+
+    # Opened from a specific email ("Ask Iris about this") — put it straight
+    # in front of the model so it doesn't have to search for the thing the
+    # person is already looking at.
+    if focus_message_id:
+        focused = read_cached_email(user_email, focus_message_id)
+        if not focused.get("error"):
+            messages.append({
+                "role": "system",
+                "content": (
+                    "THE PERSON IS LOOKING AT THIS EMAIL RIGHT NOW. Assume "
+                    "any question without another subject refers to it, and "
+                    "use this messageId for any action you propose.\n"
+                    f"messageId: {focus_message_id}\n"
+                    + json.dumps(focused, default=str)[:MAX_SNAPSHOT_CHARS]
+                ),
+            })
+            steps.append("Opened the email you're viewing")
     # Only the recent turns. The frontend sends the whole conversation, so a
     # long chat previously grew the request without bound — cost climbing
     # every message until it eventually hit the context limit.
@@ -873,7 +1044,11 @@ async def get_iris_reply(
         msg = response.choices[0].message
 
         if not msg.tool_calls:
-            return (msg.content or "").strip()
+            return {
+                "reply": (msg.content or "").strip(),
+                "steps": steps,
+                "proposals": proposals,
+            }
 
         # Model wants to call one or more tools. Record its tool-call
         # message first (required by the API before any tool results),
@@ -900,7 +1075,10 @@ async def get_iris_reply(
             except (json.JSONDecodeError, TypeError):
                 args = {}
 
-            result_str = await _execute_tool_call(tc.function.name, args, user_email, user_name)
+            label = TOOL_LABELS.get(tc.function.name, tc.function.name)
+            if label not in steps:
+                steps.append(label)
+            result_str = await _execute_tool_call(tc.function.name, args, user_email, user_name, proposals)
 
             messages.append({
                 "role": "tool",
@@ -923,4 +1101,8 @@ async def get_iris_reply(
         temperature=0.6,
         max_tokens=500,
     )
-    return (final.choices[0].message.content or "").strip()
+    return {
+        "reply": (final.choices[0].message.content or "").strip(),
+        "steps": steps,
+        "proposals": proposals,
+    }

@@ -2,12 +2,13 @@ import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
-  User, Paperclip, X, Clock, Download, Users, Loader, Flag, FolderPlus, UserMinus, Plus
+  User, Paperclip, X, Clock, Download, Users, Loader, Flag, FolderPlus, UserMinus, Plus, Sparkles
 } from 'lucide-react';
 import EmailAutocomplete from './EmailAutocomplete';
 import ComposeMailModal from './ComposeMailModal';
 import ToastContainer from './Toast';
 import { isMeetingInvite } from './meetingInvite';
+import { askIrisAbout } from './Iris';
 
 // ─── SHARED EXPORTS (also used by DashboardView) ──────────────────────────
 export const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
@@ -659,6 +660,17 @@ const EmailCard = React.memo(function EmailCard({
               onMouseLeave={e => { if (!isFolderPickerOpen) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}}
             >
               <FolderPlus size={12} /> Add to Folder
+            </button>
+            {/* Opens Iris already looking at this email, so you don't have to
+                describe something you're staring at so it can go find it. */}
+            <button
+              onClick={e => { e.stopPropagation(); askIrisAbout(email); }}
+              title="Ask Iris about this email"
+              style={{ background: 'transparent', border: '1px solid transparent', color: 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'rgba(0,217,255,0.10)'; e.currentTarget.style.borderColor = 'rgba(0,217,255,0.30)'; e.currentTarget.style.color = '#00d9ff'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+            >
+              <Sparkles size={12} /> Ask Iris
             </button>
           </div>
         </div>
