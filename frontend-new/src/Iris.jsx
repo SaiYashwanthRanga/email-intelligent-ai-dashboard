@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { Sparkles, X, Send, Copy, Check, RotateCcw } from "lucide-react";
 
@@ -66,6 +66,13 @@ const fallbackGetEffectiveReceivedAt = (email) => {
 // a 700-email inbox should send the same small snapshot as a 20-email one.
 const MAX_THREADS = 25;
 const MAX_RECENT_EMAILS = 25;
+
+// Drag/position constants for the floating button and its panel.
+const FAB_POS_KEY = "irisFabY";
+const FAB_SIZE = 56;        // matches .iris-fab width/height
+const PANEL_HEIGHT = 620;   // matches .iris-popup height
+const EDGE_GAP = 16;        // keep clear of the viewport edges
+const DRAG_THRESHOLD = 4;   // px of travel before a click counts as a drag
 
 // Starter prompts for an empty conversation. Chosen to show what Iris is
 // actually good at now that it can open and read full email text, rather
@@ -146,6 +153,71 @@ const Iris = ({
   const containerRef = useRef(null);
   const listRef = useRef(null);
   const textareaRef = useRef(null);
+
+  // ── Draggable vertical position ────────────────────────────────────────
+  // The button used to be pinned to the middle of the right edge, where it
+  // sat on top of whatever you were reading. Drag it up or down to park it
+  // somewhere out of the way; the panel follows and the spot is remembered.
+  const [fabY, setFabY] = useState(() => {
+    try {
+      const saved = parseFloat(localStorage.getItem(FAB_POS_KEY));
+      if (Number.isFinite(saved)) return saved;
+    } catch (_) { /* storage blocked — fall through to the default */ }
+    return window.innerHeight / 2;
+  });
+  const dragRef = useRef({ active: false, moved: false, offset: 0 });
+
+  const clampFabY = useCallback((y) => {
+    const half = FAB_SIZE / 2;
+    return Math.min(Math.max(y, half + EDGE_GAP), window.innerHeight - half - EDGE_GAP);
+  }, []);
+
+  // Keep it on screen when the window is resized or the sidebar reflows.
+  useEffect(() => {
+    const onResize = () => setFabY((y) => clampFabY(y));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [clampFabY]);
+
+  const startDrag = useCallback((clientY) => {
+    dragRef.current = { active: true, moved: false, offset: clientY - fabY };
+
+    const move = (cy) => {
+      if (!dragRef.current.active) return;
+      const next = clampFabY(cy - dragRef.current.offset);
+      // A few pixels of travel separates "dragging it somewhere" from the
+      // small wobble of an ordinary click, which must still open the panel.
+      if (Math.abs(cy - dragRef.current.offset - fabY) > DRAG_THRESHOLD) {
+        dragRef.current.moved = true;
+      }
+      setFabY(next);
+    };
+    const end = () => {
+      dragRef.current.active = false;
+      setFabY((y) => {
+        try { localStorage.setItem(FAB_POS_KEY, String(y)); } catch (_) { /* non-critical */ }
+        return y;
+      });
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", end);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", end);
+    };
+    const onMouseMove = (e) => move(e.clientY);
+    const onTouchMove = (e) => { if (e.touches[0]) move(e.touches[0].clientY); };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", end);
+    window.addEventListener("touchmove", onTouchMove, { passive: true });
+    window.addEventListener("touchend", end);
+  }, [fabY, clampFabY]);
+
+  // Panel sits centred on the button, but never hangs off either edge.
+  const panelTop = useMemo(() => {
+    const panelH = Math.min(PANEL_HEIGHT, window.innerHeight - EDGE_GAP * 2);
+    const ideal = fabY - panelH / 2;
+    return Math.min(Math.max(ideal, EDGE_GAP), window.innerHeight - panelH - EDGE_GAP);
+  }, [fabY]);
 
   const getSender = getParticipantDisplay || fallbackGetParticipantDisplay;
   const getReceived = getEffectiveReceivedAt || fallbackGetEffectiveReceivedAt;
@@ -283,7 +355,7 @@ const Iris = ({
 
       {/* ─── POPUP (renders above the FAB, only when open) ─── */}
       {isOpen && (
-        <div className="iris-popup">
+        <div className="iris-popup" style={{ top: `${panelTop}px` }}>
           <div className="iris-header">
             <div className="iris-header-left">
               <div className="iris-header-icon"><Sparkles size={17} /></div>
@@ -386,11 +458,19 @@ const Iris = ({
         </div>
       )}
 
-      {/* ─── FLOATING TOGGLE BUTTON ─── */}
+      {/* ─── FLOATING TOGGLE BUTTON (drag vertically to reposition) ─── */}
       <button
         className="iris-fab"
-        onClick={() => setIsOpen((prev) => !prev)}
-        title={isOpen ? "Close Iris" : "Ask Iris — Inbox Assistant"}
+        style={{ top: `${fabY}px` }}
+        onMouseDown={(e) => { if (e.button === 0) startDrag(e.clientY); }}
+        onTouchStart={(e) => { if (e.touches[0]) startDrag(e.touches[0].clientY); }}
+        onClick={() => {
+          // Suppress the click that ends a drag, so parking the button
+          // doesn't also toggle the panel open or shut.
+          if (dragRef.current.moved) { dragRef.current.moved = false; return; }
+          setIsOpen((prev) => !prev);
+        }}
+        title={isOpen ? "Close Iris" : "Ask Iris — drag to move"}
       >
         {isOpen ? <X size={22} /> : <Sparkles size={22} />}
       </button>
@@ -407,9 +487,12 @@ export default Iris;
 const IRIS_CSS = `
 .iris-fab {
   position: fixed;
+  /* top is set inline from the dragged position; the -50% keeps that value
+     meaning "centre of the button" rather than its top edge. */
   top: 50%;
   right: 24px;
   transform: translateY(-50%);
+  touch-action: none;          /* let a touch drag move it, not scroll the page */
   width: 56px;
   height: 56px;
   border-radius: 50%;
@@ -432,9 +515,12 @@ const IRIS_CSS = `
 
 .iris-popup {
   position: fixed;
-  top: 50%;
+  /* top comes in inline, already clamped to the viewport and centred on the
+     button. No translateY here: the entrance animation's final frame sets
+     transform: translateY(0), which would silently cancel it — that's what
+     left the panel hanging off the bottom of the screen. */
+  top: 16px;
   right: 92px;
-  transform: translateY(-50%);
   width: 430px;
   max-width: calc(100vw - 32px);
   /* Never taller than the viewport allows. dvh accounts for mobile browser
