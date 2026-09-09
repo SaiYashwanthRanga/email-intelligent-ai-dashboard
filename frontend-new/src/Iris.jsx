@@ -109,6 +109,17 @@ const SUGGESTIONS = [
   "Summarise the latest thread from Deepa",
 ];
 
+// Shown instead of the inbox-wide prompts when the chat was opened from a
+// specific email. Opening Iris on an email and being offered "catch me up
+// on today" was the wrong menu entirely — these lead with replying, which
+// is what you actually want from the email you're looking at.
+const FOCUS_SUGGESTIONS = [
+  "Draft a reply to this",
+  "Suggest 3 different ways I could reply",
+  "What are they actually asking me for?",
+  "Summarise this thread",
+];
+
 // ─── SINGLE INTEGRATION SEAM ───────────────────────────────────────────────
 // Calls the real backend. Phase 3: also sends user_email (not just the
 // display name) since the backend's tools — tracking status, email
@@ -396,6 +407,11 @@ const Iris = ({
   const handleNewChat = () => {
     setMessages([{ role: "iris", text: GREETING }]);
     setInput("");
+    // Drop the focused email too, otherwise a "new" chat silently keeps
+    // answering about whatever was open when it started.
+    focusRef.current = null;
+    setFocusSubject(null);
+    setActionState({});
     textareaRef.current?.focus();
   };
 
@@ -574,8 +590,10 @@ const Iris = ({
                 good at rather than leaving people guessing at a blank box. */}
             {messages.length === 1 && !thinking && (
               <div className="iris-suggestions">
-                <div className="iris-suggestions-label">Try asking</div>
-                {SUGGESTIONS.map((s) => (
+                <div className="iris-suggestions-label">
+                  {focusSubject ? "About this email" : "Try asking"}
+                </div>
+                {(focusSubject ? FOCUS_SUGGESTIONS : SUGGESTIONS).map((s) => (
                   <button key={s} className="iris-chip" onClick={() => handleSend(s)}>
                     {s}
                   </button>
