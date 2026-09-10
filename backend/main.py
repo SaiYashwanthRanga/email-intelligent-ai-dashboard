@@ -356,10 +356,65 @@ PREFETCH_BUDGET_PER_SYNC = 120     # spread the initial backfill over syncs
 # interval, so prefetched mail opens instantly, but short enough that a
 # thread gaining a reply corrects itself quickly.
 DETAIL_CACHE_FRESH_SECONDS = 600   # 10 minutes
+
+# ─── ORG SERVER CIRCUIT BREAKER ──────────────────────────────────────────────
+# Once the mail server is unreachable, stop dialling it for a short while and
+# answer from cache immediately.
+#
+# Without this, every read still paid the full timeout before falling back —
+# 60s to open an email whose body was already on disk, 120s per inbox sync.
+# The data was there the whole time; we were just waiting for a server we
+# already knew was down. The breaker turns an outage from "everything is
+# slow" into "everything is instant, just not fresh".
+#
+# Deliberately shallow: two consecutive failures to open, any success closes
+# it at once, and it lapses on its own so the next call is a natural probe
+# for recovery. When the server is healthy this does nothing at all.
+# One failure is enough. Waiting for a second means the person pays the full
+# timeout twice before anything improves, and the cost of being wrong is
+# tiny: 60 seconds of reads answered from cache — real data, just not
+# freshly checked — after which the next call probes the server anyway.
+ORG_FAIL_THRESHOLD = 1      # consecutive failures before we stop trying
+ORG_DOWN_COOLDOWN = 60      # seconds to stay closed off before probing again
+_org_fail_count = 0
+_org_down_until = 0.0
+_org_breaker_lock = threading.Lock()
+
+
+def org_mark_failure(reason: str = ""):
+    """Record a failed org-server call; trip the breaker once they repeat."""
+    global _org_fail_count, _org_down_until
+    with _org_breaker_lock:
+        _org_fail_count += 1
+        if _org_fail_count >= ORG_FAIL_THRESHOLD and time.time() >= _org_down_until:
+            _org_down_until = time.time() + ORG_DOWN_COOLDOWN
+            log.error(
+                f"org server marked unreachable for {ORG_DOWN_COOLDOWN}s after "
+                f"{_org_fail_count} failures ({reason}) — serving cached data immediately"
+            )
+
+
+def org_mark_success():
+    """A call got through: close the breaker straight away."""
+    global _org_fail_count, _org_down_until
+    with _org_breaker_lock:
+        if _org_fail_count or _org_down_until:
+            log.info("org server reachable again — resuming live calls")
+        _org_fail_count = 0
+        _org_down_until = 0.0
+
+
+def org_is_down() -> bool:
+    """True while we should skip the live call and answer from cache."""
+    with _org_breaker_lock:
+        return time.time() < _org_down_until
+
 _prefetch_active: set = set()
 _prefetch_lock = threading.Lock()
 
 def _prefetch_one_detail(message_id: str, user_email: str) -> bool:
+    if org_is_down():
+        return False
     try:
         resp = requests.get(
             f"{ORG_BASE}/api/Values/inbox/onemail",
@@ -440,8 +495,10 @@ async def get_email_details(messageId: str, userEmail: str):
     # round trip to the org server. A message's own body never changes once
     # received, but the thread around it can gain replies — so a cached copy
     # is only trusted inside a short window, after which we go live again.
+    # While the mail server is known to be down, age doesn't matter: a body
+    # from disk now beats the same body after a 60-second timeout.
     age = cached_detail_age_seconds(userEmail, messageId)
-    if age is not None and age < DETAIL_CACHE_FRESH_SECONDS:
+    if age is not None and (age < DETAIL_CACHE_FRESH_SECONDS or org_is_down()):
         cached = get_cached_detail(userEmail, messageId)
         # Only a complete copy may short-circuit the live call. A partial one
         # would render a conversation of empty messages; treating it as a miss
@@ -509,6 +566,7 @@ async def get_email_details(messageId: str, userEmail: str):
                 detail=f"Mail server error: {resp.text[:300]}"
             )
 
+        org_mark_success()
         data = _normalize_onemail(resp.json(), messageId)
 
         thread_count = len(data.get("messages", []))
@@ -528,6 +586,7 @@ async def get_email_details(messageId: str, userEmail: str):
     except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
         # Mail server unreachable/slow — serve the copy we saved when it was
         # last reachable, so reading mail keeps working while it's down.
+        org_mark_failure(type(e).__name__)
         cached = get_cached_detail(userEmail, messageId)
         if cached:
             log.warning(f"email-details: org server unreachable ({type(e).__name__}) — serving cached copy for {messageId[:20]}...")
@@ -576,10 +635,16 @@ def fetch_inbox(email: str, count: int = 500):
         log.error(f"fetch_inbox: {reason} — no cache to fall back to for {clean_email}")
         raise HTTPException(status_code=hard_status, detail=hard_detail)
 
+    # Skip the 120s wait entirely when the server has just failed — the
+    # fallback below is what we'd end up serving anyway.
+    if org_is_down():
+        return _serve_stale("org server known unreachable", 502, "Mail server unreachable.")
+
     try:
         log.debug(f"Fetching org inbox: {clean_url}")
         resp = requests.get(clean_url, timeout=120)
     except requests.exceptions.RequestException as e:
+        org_mark_failure(type(e).__name__)
         return _serve_stale(f"org server unreachable ({e})", 502, f"Mail server unreachable: {e}")
 
     if resp.status_code != 200:
@@ -658,6 +723,7 @@ def fetch_inbox(email: str, count: int = 500):
 
         data.sort(key=_sort_key, reverse=True)
 
+        org_mark_success()
         set_last_fetch_ok_at(datetime.now(timezone.utc).isoformat(), clean_email)
 
         # Pull bodies in the background so opening an email is a local read
