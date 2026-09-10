@@ -25,3 +25,5 @@ Thumbs.db
 # Cache backups — same real mail content as the caches themselves
 backend/*.bak
 *.bak
+# Queued actions awaiting the mail server — per-user runtime state
+backend/outbox_*.json

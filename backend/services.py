@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import uuid
 import asyncio
 import hashlib
 import html
@@ -3478,3 +3479,97 @@ def get_attachment_bytes(attachment):
     file_hash = attachment["hash"]
     file_bytes = base64.b64decode(file_hash)
     return file_name, file_bytes
+
+# ── OUTBOX — actions taken while the mail server was unreachable ────────────
+# Persisted to disk, not memory: the whole point is surviving the window
+# where things are broken, and a backend restart during an outage is exactly
+# when that happens.
+#
+# Two classes of action, deliberately treated differently:
+#   auto  — mark read, RSVP. Replaying these twice is harmless (read twice is
+#           read), so they replay by themselves the moment the server returns.
+#   held  — reply, forward, send. NOT safe to fire unattended: the content
+#           ages, the person may have already answered another way, and a
+#           timeout leaves it genuinely unknown whether it went. These wait
+#           for an explicit press.
+OUTBOX_AUTO_ACTIONS = {"mark_read", "rsvp"}
+OUTBOX_HELD_ACTIONS = {"send_reply", "forward", "send_email"}
+OUTBOX_MAX_ATTEMPTS = 5
+
+
+def _outbox_file_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", (user_email or "default").lower().strip())
+    return f"outbox_{safe}.json"
+
+
+def load_outbox(user_email: str) -> list:
+    path = _outbox_file_for(user_email)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.error(f"[outbox] unreadable for {user_email}: {e}")
+        return []
+
+
+def _save_outbox(user_email: str, items: list):
+    path = _outbox_file_for(user_email)
+    tmp = f"{path}.tmp"
+    with _get_lock(f"outbox:{user_email}"):
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+        os.replace(tmp, path)   # write-then-rename: never leave it half-written
+
+
+def queue_action(user_email: str, action: str, payload: dict) -> dict:
+    """
+    Put an action in the outbox. Returns the stored item.
+
+    The id is what makes replay safe: the server refuses to carry out the
+    same id twice, so a retry after an ambiguous timeout can't repeat it.
+    """
+    items = load_outbox(user_email)
+    item = {
+        "id": f"{action}-{uuid.uuid4().hex[:16]}",
+        "action": action,
+        "payload": payload or {},
+        "queuedAt": datetime.now(timezone.utc).isoformat(),
+        "attempts": 0,
+        "lastError": None,
+        # Held items are surfaced to the person; auto items just replay.
+        "needsConfirm": action in OUTBOX_HELD_ACTIONS,
+    }
+    items.append(item)
+    _save_outbox(user_email, items)
+    log.info(f"[outbox] queued {action} for {user_email} ({item['id']})")
+    return item
+
+
+def remove_from_outbox(user_email: str, item_id: str) -> bool:
+    items = load_outbox(user_email)
+    kept = [i for i in items if i.get("id") != item_id]
+    if len(kept) == len(items):
+        return False
+    _save_outbox(user_email, kept)
+    return True
+
+
+def update_outbox_item(user_email: str, item_id: str, **fields):
+    items = load_outbox(user_email)
+    for i in items:
+        if i.get("id") == item_id:
+            i.update(fields)
+            break
+    _save_outbox(user_email, items)
+
+
+def outbox_summary(user_email: str) -> dict:
+    items = load_outbox(user_email)
+    return {
+        "pending_auto": len([i for i in items if not i.get("needsConfirm")]),
+        "awaiting_send": len([i for i in items if i.get("needsConfirm")]),
+        "items": items,
+    }

@@ -63,6 +63,12 @@ from services import (
     set_last_fetch_ok_at,
     get_cached_detail,
     save_cached_detail,
+    load_outbox,
+    queue_action,
+    remove_from_outbox,
+    update_outbox_item,
+    outbox_summary,
+    OUTBOX_MAX_ATTEMPTS,
     has_cached_detail,
     cached_detail_age_seconds,
     detail_is_complete,
@@ -724,6 +730,9 @@ def fetch_inbox(email: str, count: int = 500):
         data.sort(key=_sort_key, reverse=True)
 
         org_mark_success()
+        # A successful sync is our signal the server is back — replay anything
+        # queued during the outage.
+        schedule_outbox_flush(clean_email)
         set_last_fetch_ok_at(datetime.now(timezone.utc).isoformat(), clean_email)
 
         # Pull bodies in the background so opening an email is a local read
@@ -1079,6 +1088,163 @@ async def generate_reply(payload: ReplyRequest):
     return {"reply": reply_text}
 
 
+# ─── OUTBOX REPLAY ───────────────────────────────────────────────────────────
+# Actions taken while the mail server was unreachable, carried out once it
+# returns. Only the idempotent ones replay by themselves; sends wait for a
+# person, because firing a three-hour-old reply unattended is how someone
+# ends up answering a legal firm twice.
+_outbox_flushing: set = set()
+_outbox_flush_lock = threading.Lock()
+
+
+def _perform_org_action(action: str, payload: dict, user_email: str) -> str:
+    """Carry out one action against the org server. Raises on failure."""
+    if action == "mark_read":
+        resp = requests.post(
+            f"{ORG_BASE}/api/Values/mail/read-status",
+            params={"messageId": payload.get("messageId"),
+                    "targetUserEmail": user_email, "isRead": "true"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"mail server {resp.status_code}: {resp.text[:120]}")
+        update_cache_mark_read(payload.get("messageId"), user_email)
+        return "Marked as read."
+
+    if action == "rsvp":
+        resp = requests.post(
+            f"{ORG_BASE}/api/Values/meetings/Action",
+            params={"meetingId": payload.get("messageId"),
+                    "action": payload.get("response", "accept"),
+                    "targetUserEmail": user_email},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"calendar {resp.status_code}: {resp.text[:120]}")
+        return "RSVP sent."
+
+    raise RuntimeError(f"'{action}' is not replayable automatically")
+
+
+def _flush_outbox(user_email: str):
+    """Replay the auto-safe queue. Held sends are left alone by design."""
+    done = failed = 0
+    try:
+        for item in load_outbox(user_email):
+            if item.get("needsConfirm"):
+                continue                      # a send — needs a person
+            if org_is_down():
+                break                         # server went away again; stop early
+            item_id = item.get("id")
+            try:
+                _perform_org_action(item.get("action"), item.get("payload") or {}, user_email)
+                remove_from_outbox(user_email, item_id)
+                done += 1
+            except Exception as e:
+                failed += 1
+                attempts = int(item.get("attempts", 0)) + 1
+                if attempts >= OUTBOX_MAX_ATTEMPTS:
+                    # Stop retrying forever; keep it visible rather than
+                    # silently dropping something the person asked for.
+                    update_outbox_item(user_email, item_id, attempts=attempts,
+                                       lastError=str(e)[:200], needsConfirm=True)
+                    log.error(f"[outbox] {item.get('action')} gave up after {attempts} tries: {e}")
+                else:
+                    update_outbox_item(user_email, item_id, attempts=attempts, lastError=str(e)[:200])
+        if done or failed:
+            log.info(f"[outbox] replayed {done} action(s) for {user_email}, {failed} still pending")
+    except Exception as e:
+        log.error(f"[outbox] flush failed for {user_email}: {e}")
+    finally:
+        with _outbox_flush_lock:
+            _outbox_flushing.discard(user_email)
+
+
+def schedule_outbox_flush(user_email: str):
+    """Kick off a replay in the background; never more than one per user."""
+    try:
+        if org_is_down():
+            return
+        pending = [i for i in load_outbox(user_email) if not i.get("needsConfirm")]
+        if not pending:
+            return
+        with _outbox_flush_lock:
+            if user_email in _outbox_flushing:
+                return
+            _outbox_flushing.add(user_email)
+        log.info(f"[outbox] mail server is back — replaying {len(pending)} action(s) for {user_email}")
+        threading.Thread(target=_flush_outbox, args=(user_email,), daemon=True).start()
+    except Exception as e:
+        log.warning(f"[outbox] could not schedule flush for {user_email}: {e}")
+
+
+@app.get("/api/outbox")
+async def get_outbox(user_email: str):
+    """What's queued: replaying by itself, and what's waiting on a person."""
+    return outbox_summary(user_email)
+
+
+@app.post("/api/outbox/send")
+async def outbox_send(payload: dict = Body(...)):
+    """
+    Send one held message, on an explicit press.
+
+    Not retried on failure: a timeout leaves it unknown whether the mail
+    went, and retrying is how the same email goes out twice. It stays in the
+    outbox with the error attached so the person decides what to do.
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    item_id = (payload.get("id") or "").strip()
+    if not user_email or not item_id:
+        raise HTTPException(status_code=400, detail="Missing user_email or id.")
+
+    item = next((i for i in load_outbox(user_email) if i.get("id") == item_id), None)
+    if not item:
+        return {"ok": True, "already_gone": True, "message": "Nothing left to send."}
+
+    p = item.get("payload") or {}
+    body = p.get("body") or ""
+    to = [x for x in (p.get("to") or []) if x]
+    if not body or not to:
+        raise HTTPException(status_code=400, detail="That message has no recipient or body.")
+
+    html_body = body if "<" in body else "<p>" + body.replace(chr(10), "<br>") + "</p>"
+    endpoint = "forwardmail" if item.get("action") == "forward" else "reply"
+    parts = [
+        ("MessageItemId", (None, p.get("messageId", ""), "text/plain")),
+        ("ReplyBodyHtml", (None, html_body, "text/plain")),
+        ("IsReplyAll", (None, "false", "text/plain")),
+    ]
+    for t in to:
+        parts.append(("To", (None, t, "text/plain")))
+    for cc in (p.get("cc") or []):
+        parts.append(("Cc", (None, cc, "text/plain")))
+    parts.append(("TargetUserEmail", (None, user_email, "text/plain")))
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client_:
+            resp = await client_.post(f"{ORG_BASE}/api/Values/mail/{endpoint}", files=parts)
+        if resp.status_code != 200:
+            raise RuntimeError(f"{resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        org_mark_failure(type(e).__name__)
+        update_outbox_item(user_email, item_id, lastError=str(e)[:200],
+                           attempts=int(item.get("attempts", 0)) + 1)
+        raise HTTPException(status_code=502, detail=f"Still couldn't send: {e}")
+
+    org_mark_success()
+    remove_from_outbox(user_email, item_id)
+    log.info(f"[outbox] sent held message {item_id} for {user_email}")
+    return {"ok": True, "message": "Sent."}
+
+
+@app.delete("/api/outbox/{item_id}")
+async def outbox_discard(item_id: str, user_email: str):
+    """Throw a queued item away without carrying it out."""
+    removed = remove_from_outbox(user_email, item_id)
+    return {"ok": True, "removed": removed}
+
+
 @app.post("/api/iris/chat")
 async def iris_chat(payload: IrisChatRequest):
     """
@@ -1162,6 +1328,17 @@ async def iris_confirm(payload: dict = Body(...)):
             to = [x for x in (payload.get("to") or []) if x]
             if not body or not to:
                 raise HTTPException(status_code=400, detail="A recipient and a message body are required.")
+            # Server unreachable: park it in the outbox instead of losing the
+            # message. It waits for a press rather than firing on its own —
+            # an hours-old reply going out unattended is its own problem.
+            if org_is_down():
+                queue_action(user_email, action, {
+                    "messageId": message_id, "to": to, "cc": payload.get("cc") or [],
+                    "subject": payload.get("subject") or "", "body": body,
+                })
+                _iris_done_actions[action_id] = now
+                return {"ok": True, "queued": True,
+                        "message": "Outlook is unreachable — saved to your outbox to send when it's back."}
             html_body = body if "<" in body else "<p>" + body.replace("\n", "<br>") + "</p>"
             endpoint = "reply" if action == "send_reply" else "forwardmail"
             parts = [
@@ -1482,14 +1659,31 @@ def mark_mail_as_read(payload: dict = Body(...)):
         if not email or not message_id:
             raise HTTPException(status_code=400, detail="Missing email or messageId")
 
+        # Mail server unreachable: queue it rather than failing. Marking read
+        # twice is still read, so this replays by itself on recovery — the
+        # card can flip to read immediately and stay that way.
+        if org_is_down():
+            queue_action(email, "mark_read", {"messageId": message_id})
+            update_cache_mark_read(message_id, email)
+            return {"success": True, "queued": True,
+                    "message": "Marked as read — will sync when Outlook is back."}
+
         org_api_url = f"{ORG_BASE}/api/Values/mail/read-status"
         params = {"email": email, "messageId": message_id, "isRead": True}
 
-        resp = requests.post(org_api_url, params=params, timeout=20)
+        try:
+            resp = requests.post(org_api_url, params=params, timeout=20)
+        except requests.exceptions.RequestException as e:
+            org_mark_failure(type(e).__name__)
+            queue_action(email, "mark_read", {"messageId": message_id})
+            update_cache_mark_read(message_id, email)
+            return {"success": True, "queued": True,
+                    "message": "Marked as read — will sync when Outlook is back."}
 
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=f"Org API error: {resp.text}")
 
+        org_mark_success()
         update_cache_mark_read(message_id, email)
 
         return {"success": True, "message": "Email marked as read"}

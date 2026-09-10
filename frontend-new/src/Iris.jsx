@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck, CornerDownLeft } from "lucide-react";
+import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck, CornerDownLeft, Inbox } from "lucide-react";
 
 /**
  * Iris — Inbox Assistant (frontend shell)
@@ -171,6 +171,27 @@ export function askIrisAbout(email) {
   }));
 }
 
+export async function fetchOutbox(userEmail) {
+  const res = await fetch(`${API_BASE}/outbox?user_email=${encodeURIComponent(userEmail)}`);
+  if (!res.ok) throw new Error("Couldn't read the outbox");
+  return res.json();
+}
+
+export async function sendOutboxItem(userEmail, id) {
+  const res = await fetch(`${API_BASE}/outbox/send`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_email: userEmail, id }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "Still couldn't send.");
+  return data;
+}
+
+export async function discardOutboxItem(userEmail, id) {
+  await fetch(`${API_BASE}/outbox/${encodeURIComponent(id)}?user_email=${encodeURIComponent(userEmail)}`,
+    { method: "DELETE" });
+}
+
 async function confirmIrisAction(proposal) {
   const res = await fetch(`${API_BASE}/iris/confirm`, {
     method: "POST",
@@ -244,6 +265,44 @@ const Iris = ({
   const focusRef = useRef(null);
   const [focusSubject, setFocusSubject] = useState(null);
   const [actionState, setActionState] = useState({});   // actionId -> "running" | "done" | error text
+  const [outbox, setOutbox] = useState(null);           // { pending_auto, awaiting_send, items }
+  const [showOutbox, setShowOutbox] = useState(false);
+  const [sendingId, setSendingId] = useState(null);
+
+  // Poll the outbox so held messages surface without a reload. Cheap: a
+  // small JSON read, and only while the panel is open.
+  useEffect(() => {
+    const userEmail = localStorage.getItem("userEmail") || "default";
+    let alive = true;
+    const load = () => fetchOutbox(userEmail).then((d) => { if (alive) setOutbox(d); }).catch(() => {});
+    load();
+    const t = setInterval(load, isOpen ? 15000 : 60000);
+    return () => { alive = false; clearInterval(t); };
+  }, [isOpen]);
+
+  const refreshOutbox = () => {
+    const userEmail = localStorage.getItem("userEmail") || "default";
+    fetchOutbox(userEmail).then(setOutbox).catch(() => {});
+  };
+
+  const handleSendQueued = async (item) => {
+    const userEmail = localStorage.getItem("userEmail") || "default";
+    setSendingId(item.id);
+    try {
+      await sendOutboxItem(userEmail, item.id);
+      refreshOutbox();
+    } catch (err) {
+      setActionState((s2) => ({ ...s2, [item.id]: err.message }));
+    } finally {
+      setSendingId(null);
+    }
+  };
+
+  const handleDiscardQueued = async (item) => {
+    const userEmail = localStorage.getItem("userEmail") || "default";
+    await discardOutboxItem(userEmail, item.id);
+    refreshOutbox();
+  };
 
   // "Ask Iris about this email" from anywhere in the app.
   useEffect(() => {
@@ -504,6 +563,15 @@ const Iris = ({
               </div>
             </div>
             <div className="iris-header-actions">
+              {outbox?.awaiting_send > 0 && (
+                <button
+                  className="iris-outbox-pill"
+                  onClick={() => setShowOutbox((v) => !v)}
+                  title="Messages saved while Outlook was unreachable"
+                >
+                  <Inbox size={12} /> {outbox.awaiting_send}
+                </button>
+              )}
               {messages.length > 1 && (
                 <button className="iris-icon-btn" onClick={handleNewChat} title="Start a new chat">
                   <RotateCcw size={14} />
@@ -514,6 +582,41 @@ const Iris = ({
               </button>
             </div>
           </div>
+
+          {showOutbox && outbox?.items?.length > 0 && (
+            <div className="iris-outbox">
+              <div className="iris-outbox-head">
+                Saved while Outlook was unreachable
+              </div>
+              {outbox.items.filter((i) => i.needsConfirm).map((item) => (
+                <div key={item.id} className="iris-outbox-item">
+                  <div className="iris-outbox-to">
+                    To {(item.payload?.to || []).join(", ") || "—"}
+                  </div>
+                  <div className="iris-outbox-body">{item.payload?.body}</div>
+                  {item.lastError && <div className="iris-outbox-err">{item.lastError}</div>}
+                  {actionState[item.id] && <div className="iris-outbox-err">{actionState[item.id]}</div>}
+                  <div className="iris-outbox-actions">
+                    <button
+                      className="iris-action-go"
+                      disabled={sendingId === item.id}
+                      onClick={() => handleSendQueued(item)}
+                    >
+                      {sendingId === item.id ? "Sending…" : "Send now"}
+                    </button>
+                    <button className="iris-outbox-discard" onClick={() => handleDiscardQueued(item)}>
+                      Discard
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {outbox.pending_auto > 0 && (
+                <div className="iris-outbox-auto">
+                  {outbox.pending_auto} other change{outbox.pending_auto === 1 ? "" : "s"} will sync by itself
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="iris-messages" ref={listRef}>
             {messages.map((m, i) => (
@@ -837,6 +940,43 @@ const IRIS_CSS = `
 .iris-brief-row:hover { color: #00d9ff; }
 .iris-brief-dot {
   width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+}
+
+.iris-outbox-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 9px; border-radius: 999px; cursor: pointer;
+  font-size: 0.68rem; font-weight: 800;
+  color: #fbbf24; background: rgba(251,191,36,0.14);
+  border: 1px solid rgba(251,191,36,0.45);
+}
+.iris-outbox {
+  border-bottom: 1px solid var(--border-color);
+  background: rgba(251,191,36,0.05);
+  padding: 10px 14px; max-height: 240px; overflow-y: auto; flex-shrink: 0;
+}
+.iris-outbox-head {
+  font-size: 0.62rem; font-weight: 800; letter-spacing: 0.8px;
+  text-transform: uppercase; color: #fbbf24; margin-bottom: 7px;
+}
+.iris-outbox-item {
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(0,0,0,0.22);
+  border-radius: 10px; padding: 9px 11px; margin-bottom: 7px;
+}
+.iris-outbox-to { font-size: 0.7rem; font-weight: 700; color: var(--text-secondary); }
+.iris-outbox-body {
+  font-size: 0.76rem; color: var(--text-primary); margin-top: 4px;
+  white-space: pre-wrap; max-height: 74px; overflow-y: auto;
+}
+.iris-outbox-err { font-size: 0.68rem; color: #f87171; margin-top: 5px; }
+.iris-outbox-actions { display: flex; align-items: center; gap: 7px; margin-top: 8px; }
+.iris-outbox-discard {
+  background: transparent; border: 1px solid var(--border-color);
+  color: var(--text-secondary); border-radius: 8px;
+  padding: 6px 12px; font-size: 0.74rem; font-weight: 700; cursor: pointer;
+}
+.iris-outbox-auto {
+  font-size: 0.68rem; color: var(--text-secondary); opacity: 0.85; margin-top: 2px;
 }
 
 .iris-msg-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
