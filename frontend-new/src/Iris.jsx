@@ -224,7 +224,12 @@ async function sendToIris(message, history, inboxContext, focusMessageId) {
   });
 
   if (!res.ok) {
-    throw new Error(`Iris chat request failed (${res.status})`);
+    // Surface what the server actually said — it distinguishes "the AI
+    // service is unreachable" from "the dashboard is broken", which are
+    // very different things to go and check.
+    let detail = "";
+    try { detail = (await res.json())?.detail || ""; } catch (_) { /* no body */ }
+    throw new Error(detail || `Iris chat request failed (${res.status})`);
   }
 
   const data = await res.json();
@@ -534,7 +539,7 @@ const Iris = ({
     } catch (err) {
       setMessages((prev) => [
         ...prev,
-        { role: "iris", text: "Something went wrong reaching Iris. Try again in a moment." },
+        { role: "iris", text: err?.message || "Something went wrong reaching Iris. Try again in a moment." },
       ]);
     } finally {
       setThinking(false);

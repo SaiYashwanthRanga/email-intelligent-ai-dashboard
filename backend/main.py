@@ -1273,7 +1273,20 @@ async def iris_chat(payload: IrisChatRequest):
             "proposals": result.get("proposals", []),
         }
     except Exception as e:
-        log.error(f"iris_chat error: {e}")
+        # Name the actual problem. This network drops the AI service fairly
+        # often, and "something went wrong" sends people looking at the
+        # dashboard when nothing about the dashboard is broken.
+        kind = type(e).__name__
+        if "APIConnection" in kind or "APITimeout" in kind:
+            log.error(f"iris_chat: AI service unreachable ({kind})")
+            raise HTTPException(
+                status_code=503,
+                detail="Can't reach the AI service right now — your inbox is fine, this is the connection to the assistant. Try again in a moment.",
+            )
+        if "RateLimit" in kind:
+            log.error("iris_chat: rate limited")
+            raise HTTPException(status_code=429, detail="The AI service is busy right now. Give it a few seconds and try again.")
+        log.error(f"iris_chat error ({kind}): {e}")
         raise HTTPException(status_code=500, detail="Iris couldn't respond right now.")
 
 
