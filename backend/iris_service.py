@@ -49,7 +49,9 @@ as they already exist — none of those were modified.
 import json
 import re
 import uuid
+import time
 import asyncio
+import httpx
 import html as _html
 from datetime import datetime, timedelta
 from typing import Optional
@@ -155,7 +157,19 @@ before saying you can't help — you have three:
    week". search_emails finds a known topic; list_emails surveys. Both
    cover only what has been analysed so far.
 
-5. get_calendar — the person's upcoming meetings. Use for schedule
+   list_emails marks rows already_replied when that conversation has
+   already been answered. NEVER present those as needing a reply —
+   leaving them out is the difference between a useful "what needs me"
+   answer and one full of things handled days ago.
+
+5. search_sent — what the person THEMSELVES has sent recently, with the
+   real text of their messages. Every other tool covers mail they
+   received; this is the other half of the conversation. Use it for
+   "what did I tell X", "did I already answer this", "what did I
+   promise", and before saying anything about whether they have replied
+   to someone.
+
+6. get_calendar — the person's upcoming meetings. Use for schedule
    questions, whether they are free at a given time, or whether a time
    someone is proposing by email clashes with something already booked.
 
@@ -515,6 +529,30 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_sent",
+            "description": (
+                "Search what the PERSON THEMSELVES has sent in the last 7 "
+                "days, with the actual text of their messages. Use it for "
+                "anything about their own side of a conversation — what did "
+                "I tell X, did I already answer this, what did I promise, "
+                "what have I asked for and not heard back on. The inbox "
+                "tools only cover mail received; this is the other half."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Words to look for — a recipient, a topic. Leave empty for everything recent.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "propose_action",
             "description": (
                 "Propose an action for the person to confirm. You NEVER carry "
@@ -761,6 +799,80 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
     return [item for _, _, _, item in pool[:limit]]
 
 
+# ── SENT MAIL ───────────────────────────────────────────────────────────────
+# Iris only ever saw received mail, so it had no idea what the person had
+# already said. That made "what needs my reply first?" quietly wrong — it
+# would list conversations they had answered days ago. Jim had 22 such
+# threads in his cache.
+#
+# Cached briefly because it is a live call to the org server and several
+# tools want it within the same question.
+SENT_CACHE_TTL = 300          # seconds
+_sent_cache: dict = {}        # user -> {"at": ts, "items": [...]}
+
+
+async def get_sent_emails(user_email: str) -> list:
+    """Recent sent mail from the org server, or [] if it can't be reached."""
+    now = time.time()
+    hit = _sent_cache.get(user_email)
+    if hit and now - hit["at"] < SENT_CACHE_TTL:
+        return hit["items"]
+
+    try:
+        from main import ORG_BASE, org_is_down, org_mark_failure, org_mark_success
+        if org_is_down():
+            return hit["items"] if hit else []      # stale beats nothing
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.get(f"{ORG_BASE}/api/Values/sent7days", params={"email": user_email})
+        if resp.status_code != 200:
+            return hit["items"] if hit else []
+        org_mark_success()
+        items = resp.json()
+        items = items if isinstance(items, list) else []
+        _sent_cache[user_email] = {"at": now, "items": items}
+        return items
+    except Exception as e:
+        log.warning(f"[sent] couldn't load sent mail for {user_email}: {e}")
+        return hit["items"] if hit else []
+
+
+async def get_replied_conversations(user_email: str) -> set:
+    """conversationIds the person has already sent into — i.e. answered."""
+    return {
+        s.get("conversationId")
+        for s in await get_sent_emails(user_email)
+        if isinstance(s, dict) and s.get("conversationId")
+    }
+
+
+def search_sent(sent_items: list, query: str, limit: int = 8) -> list:
+    """Word-wise search over sent mail, same matching rules as the inbox."""
+    words = [w for w in re.split(r"\W+", (query or "").lower()) if len(w) > 1]
+    words = [w for w in words if w not in _SEARCH_STOPWORDS]
+    scored = []
+    for s in sent_items or []:
+        if not isinstance(s, dict):
+            continue
+        subject = str(s.get("subject") or "")
+        body = _html_to_text(str(s.get("body") or ""))
+        to = ", ".join(s.get("to") or [])
+        hay = f"{subject} {body} {to}".lower()
+        matched = [w for w in words if w in hay] if words else []
+        if words and not matched:
+            continue
+        scored.append((len(matched), str(s.get("sentAt") or ""), {
+            "subject": subject or "No Subject",
+            "to": s.get("to") or [],
+            "cc": s.get("cc") or [],
+            "sentAt": s.get("sentAt"),
+            "text": body[:1500],
+            "awaiting_reply_from": s.get("notRepliedAddresses") or [],
+            "replied_by": s.get("repliedByAddresses") or [],
+        }))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [x for _, _, x in scored[:limit]]
+
+
 def _parse_received(raw) -> Optional[datetime]:
     """
     Best-effort parse of the assorted date shapes the mail server returns.
@@ -818,6 +930,8 @@ def list_cached_emails(
         eid = entry.get("id") or entry.get("messageId")
         rows.append({
             "messageId": eid,
+            # Needed to tell whether this conversation has been answered.
+            "conversationId": entry.get("conversationId"),
             "from": frm or "Unknown Sender",
             "subject": entry.get("subject") or "No Subject",
             "category": entry.get("category") or "NORMAL",
@@ -1016,15 +1130,37 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
 
         elif name == "list_emails":
             a = arguments or {}
-            return json.dumps(
-                list_cached_emails(
-                    user_email,
-                    category=a.get("category"),
-                    sender=a.get("sender"),
-                    days=a.get("days"),
-                ),
-                default=str,
+            result = list_cached_emails(
+                user_email,
+                category=a.get("category"),
+                sender=a.get("sender"),
+                days=a.get("days"),
             )
+            # Mark what has already been answered. Without this, "what needs
+            # my reply" lists conversations the person replied to days ago.
+            try:
+                replied = await get_replied_conversations(user_email)
+                if replied:
+                    for row in result.get("emails", []):
+                        row["already_replied"] = row.get("conversationId") in replied
+                    result["note"] = (result.get("note", "") +
+                        " Rows marked already_replied have been answered — exclude them "
+                        "from anything about what still needs a reply.")
+            except Exception:
+                pass    # sent mail is an enhancement, never a hard dependency
+            return json.dumps(result, default=str)
+
+        elif name == "search_sent":
+            query = (arguments or {}).get("query", "")
+            items = await get_sent_emails(user_email)
+            if not items:
+                return json.dumps({"error": "Couldn't read your sent mail just now.", "results": []})
+            results = search_sent(items, query)
+            return json.dumps({
+                "results": results,
+                "count": len(results),
+                "scope": "the last 7 days of sent mail",
+            }, default=str)
 
         elif name == "get_calendar":
             days_ahead = (arguments or {}).get("days_ahead") or 7

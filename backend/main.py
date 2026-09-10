@@ -2443,7 +2443,9 @@ async def get_sent_emails(user_email: str):
       - notRepliedAddresses recipients who haven't replied yet
       - hasPendingReplies  any recipient still outstanding
       - hasQuestionMark    subject/body contains a question mark
-    Body is null (not loaded for performance) — display-only fields are sufficient.
+    NOTE: the docstring used to say the body is null "for performance". It
+    isn't — every sent email comes back with its text, which is what lets
+    Iris answer "what did I tell X" from the person's own words.
     """
     if not user_email:
         raise HTTPException(status_code=400, detail="Missing user_email")
