@@ -44,8 +44,41 @@ import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck, CornerDownLeft,
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
 
+// Greeting is built per person and per time of day rather than being one
+// fixed line — see buildGreeting below.
 const GREETING =
   "Hi, I'm Iris. Ask me to summarize a thread, draft a reply, or catch you up on what you missed.";
+
+function firstNameOf(raw) {
+  const name = String(raw || "").trim();
+  if (!name) return "";
+  // "Vidhya Nainan" -> Vidhya ; "jim@hfmg.net" -> Jim
+  const base = name.includes("@") ? name.split("@")[0].replace(/[._-]+/g, " ") : name;
+  const first = base.split(/\s+/)[0] || "";
+  return first ? first.charAt(0).toUpperCase() + first.slice(1) : "";
+}
+
+function buildGreeting() {
+  const who = firstNameOf(localStorage.getItem("loggedInUser") || localStorage.getItem("userEmail"));
+  const h = new Date().getHours();
+  const part = h < 12 ? "Morning" : h < 17 ? "Afternoon" : "Evening";
+  return who
+    ? `${part}, ${who}. Ask me what needs you, to dig into a thread, or to draft a reply.`
+    : GREETING;
+}
+
+// Turn a From header into something worth showing on a button.
+function senderLabel(raw) {
+  const s = String(raw || "").trim();
+  const named = s.match(/^\s*"?([^"<@]+?)"?\s*</);
+  if (named && named[1].trim()) return named[1].trim();
+  const addr = s.match(/[\w.+-]+@[\w.-]+/);
+  if (addr) {
+    const local = addr[0].split("@")[0].replace(/[._-]+/g, " ").trim();
+    return local.split(" ").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  }
+  return s;
+}
 
 // Local fallbacks in case the caller doesn't pass the helper props —
 // mirrors the logic in Dashboard.js so behavior stays consistent even
@@ -105,12 +138,33 @@ function renderRichText(text) {
   });
 }
 
-const SUGGESTIONS = [
-  "Catch me up on what I missed today",
-  "What needs my reply first?",
-  "Who hasn't replied to me yet?",
-  "Summarise the latest thread from Deepa",
-];
+// Built from the inbox in front of the person, not hardcoded. A fixed
+// "Summarise the latest thread from Deepa" was written off one inbox and
+// simply failed on anyone else's — the first thing a new user clicked told
+// them Iris couldn't find anything.
+function buildSuggestions(emails, canTrack) {
+  const list = Array.isArray(emails) ? emails : [];
+  const out = [];
+
+  const urgent = list.filter((e) => ["URGENT", "PRIORITY"].includes((e?.category || "").toUpperCase())).length;
+  if (urgent) out.push("What's urgent right now?");
+  out.push("Catch me up on what I missed today");
+
+  // Whoever actually emails this person most, by name.
+  const counts = {};
+  list.forEach((e) => {
+    const label = senderLabel(e?.from || e?.sender);
+    if (label && !/no.?reply|do.?not.?reply|notification/i.test(label)) {
+      counts[label] = (counts[label] || 0) + 1;
+    }
+  });
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  if (top) out.push(`Summarise the latest thread from ${top[0]}`);
+
+  if (canTrack) out.push("Who hasn't replied to me yet?");
+  out.push("What needs my reply first?");
+  return out.slice(0, 4);
+}
 
 // Shown instead of the inbox-wide prompts when the chat was opened from a
 // specific email. Opening Iris on an email and being offered "catch me up
@@ -243,9 +297,10 @@ const Iris = ({
   triageStats = null,
   getParticipantDisplay,
   getEffectiveReceivedAt,
+  canUseTracking = false,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
-  const [messages, setMessages] = useState([{ role: "iris", text: GREETING }]);
+  const [messages, setMessages] = useState(() => [{ role: "iris", text: buildGreeting() }]);
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState(null);
@@ -393,6 +448,13 @@ const Iris = ({
   const getSender = getParticipantDisplay || fallbackGetParticipantDisplay;
   const getReceived = getEffectiveReceivedAt || fallbackGetEffectiveReceivedAt;
 
+  // Prompts drawn from this person's actual mail, so the first thing they
+  // click can't be about a sender who has never emailed them.
+  const suggestions = useMemo(
+    () => buildSuggestions(emails, Boolean(canUseTracking)),
+    [emails, canUseTracking]
+  );
+
   // Standing brief, derived from the inbox the dashboard already loaded.
   // No API call, so it's on screen the instant the panel opens; each line
   // is a shortcut into the question it raises.
@@ -508,7 +570,7 @@ const Iris = ({
   };
 
   const handleNewChat = () => {
-    setMessages([{ role: "iris", text: GREETING }]);
+    setMessages([{ role: "iris", text: buildGreeting() }]);
     setInput("");
     // Drop the focused email too, otherwise a "new" chat silently keeps
     // answering about whatever was open when it started.
@@ -752,7 +814,7 @@ const Iris = ({
                 <div className="iris-suggestions-label">
                   {focusSubject ? "About this email" : "Try asking"}
                 </div>
-                {(focusSubject ? FOCUS_SUGGESTIONS : SUGGESTIONS).map((s) => (
+                {(focusSubject ? FOCUS_SUGGESTIONS : suggestions).map((s) => (
                   <button key={s} className="iris-chip" onClick={() => handleSend(s)}>
                     {s}
                   </button>

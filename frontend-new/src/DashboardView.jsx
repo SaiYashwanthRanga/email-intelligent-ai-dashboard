@@ -589,6 +589,7 @@ const DashboardView = ({
               )}
               <Iris
                 emails={emails}
+                canUseTracking={canUseTracking}
                 report={report}
                 triageStats={triageStats}
                 getParticipantDisplay={getParticipantDisplay}
