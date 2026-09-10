@@ -65,7 +65,10 @@ const fallbackGetEffectiveReceivedAt = (email) => {
 // Caps keep the payload small/fast/cheap regardless of mailbox size —
 // a 700-email inbox should send the same small snapshot as a 20-email one.
 const MAX_THREADS = 25;
-const MAX_RECENT_EMAILS = 25;
+// Send more than the snapshot can hold; the backend trims to whatever fits
+// its character budget and reports the real coverage to the model. Sending
+// only 25 meant it could never fill the budget even when the inbox was big.
+const MAX_RECENT_EMAILS = 60;
 
 // Drag/position constants for the floating button and its panel.
 const FAB_POS_KEY = "irisFabY";

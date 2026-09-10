@@ -214,6 +214,53 @@ def _build_session_block(user_name: str, user_email: str) -> str:
 # Defensive backstop — the frontend already caps list sizes before
 # sending, but this protects against a runaway payload regardless.
 MAX_SNAPSHOT_CHARS = 12000
+# Summaries dominated the snapshot at ~341 chars each. A gist is enough to
+# recognise an email; the full text is one read_email away.
+SNAPSHOT_SUMMARY_CHARS = 140
+
+
+def _trim_snapshot(inbox_context: dict) -> tuple:
+    """
+    Shrink the snapshot so it fits whole, and so it covers more of the inbox.
+
+    Summaries were 71% of the payload at ~341 chars each, which meant only 25
+    emails fit and the JSON was being cut mid-object. A one-line gist is
+    enough to decide whether an email is the one being asked about — the full
+    summary and body are one read_email away.
+
+    Returns (trimmed_context, shown, total).
+    """
+    ctx = dict(inbox_context or {})
+    emails = list(ctx.get("recent_emails") or [])
+    total = len(emails)
+
+    slim = []
+    for e in emails:
+        if not isinstance(e, dict):
+            continue
+        summary = str(e.get("summary") or "")
+        if len(summary) > SNAPSHOT_SUMMARY_CHARS:
+            summary = summary[:SNAPSHOT_SUMMARY_CHARS].rsplit(" ", 1)[0] + "…"
+        slim.append({
+            "from": e.get("from"),
+            "subject": e.get("subject"),
+            "category": e.get("category"),
+            "summary": summary,
+            "unread": e.get("unread"),
+            "received_at": e.get("received_at"),
+        })
+
+    # Drop whole emails until it fits. Never slice the JSON string itself —
+    # handing the model a half-finished object is worse than showing it
+    # fewer emails, because it can't tell the difference.
+    while slim:
+        ctx["recent_emails"] = slim
+        if len(json.dumps(ctx, separators=(",", ":"), default=str)) <= MAX_SNAPSHOT_CHARS:
+            break
+        slim = slim[:-5] if len(slim) > 5 else slim[:-1]
+
+    ctx["recent_emails"] = slim
+    return ctx, len(slim), total
 
 
 def _build_context_block(inbox_context: Optional[dict]) -> str:
@@ -228,7 +275,7 @@ def _build_context_block(inbox_context: Optional[dict]) -> str:
         # from the conversation itself", which the model read as an
         # instruction not to look anything up — so a perfectly answerable
         # question got "I can't access your inbox right now" while
-        # list_emails and search_emails were sitting there unused.
+        # list_emails and search_emails sat there unused.
         return (
             "INBOX SNAPSHOT: not attached to this message. That does NOT "
             "mean you are cut off from the inbox — use list_emails, "
@@ -237,17 +284,33 @@ def _build_context_block(inbox_context: Optional[dict]) -> str:
         )
 
     try:
-        snapshot_json = json.dumps(inbox_context, indent=2, default=str)
+        trimmed, shown, total = _trim_snapshot(inbox_context)
+        # Compact, not pretty-printed: indentation was ~35% of the payload
+        # and bought nothing — it just meant fewer emails fitting.
+        snapshot_json = json.dumps(trimmed, separators=(",", ":"), default=str)
     except Exception:
         return (
-            "INBOX SNAPSHOT: unavailable (could not be read). Answer only "
-            "from the conversation itself."
+            "INBOX SNAPSHOT: unavailable (could not be read). Use "
+            "list_emails and search_emails to look things up instead."
         )
 
-    if len(snapshot_json) > MAX_SNAPSHOT_CHARS:
-        snapshot_json = snapshot_json[:MAX_SNAPSHOT_CHARS] + "\n... (truncated)"
+    stats = (inbox_context or {}).get("stats") or {}
+    analysed = stats.get("total_emails")
 
-    return f"INBOX SNAPSHOT (JSON):\n{snapshot_json}"
+    # State the coverage plainly. Without this the model treats the snapshot
+    # as the whole inbox and answers "what's urgent" from a fraction of it,
+    # instead of calling list_emails and getting the real answer.
+    coverage = (
+        f"COVERAGE: this snapshot lists {shown} recent email(s)"
+        + (f" out of about {analysed} analysed" if analysed else "")
+        + ". Summaries here are shortened. It is a preview, NOT the whole "
+        "inbox — for anything that needs completeness (counts, 'what is "
+        "urgent', 'everything from X', 'what came in today') call "
+        "list_emails, and use read_email for what an email actually says. "
+        "Never answer a 'how many' question from this list alone."
+    )
+    NEWLINE = chr(10)
+    return coverage + NEWLINE + NEWLINE + "INBOX SNAPSHOT (JSON):" + NEWLINE + snapshot_json
 
 
 async def _chat_with_retry(**kwargs):
