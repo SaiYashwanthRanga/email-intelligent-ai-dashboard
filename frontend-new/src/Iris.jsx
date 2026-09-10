@@ -260,6 +260,55 @@ async function confirmIrisAction(proposal) {
   return data;
 }
 
+// Streams the reply so the panel can show each step as it happens. Falls
+// back to the plain request if streaming isn't available for any reason —
+// a proxy that buffers, an older backend — so the feature can only ever
+// add to what already worked.
+const SSE_LINE_SEP = String.fromCharCode(10);          // newline
+const SSE_EVENT_SEP = SSE_LINE_SEP + SSE_LINE_SEP;     // blank line ends an event
+
+async function streamToIris(message, history, inboxContext, focusMessageId, onStep) {
+  const userName = localStorage.getItem("loggedInUser") || "User";
+  const userEmail = localStorage.getItem("userEmail") || "default";
+
+  const res = await fetch(`${API_BASE}/iris/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message, history, user_name: userName, user_email: userEmail,
+      inbox_context: inboxContext || null,
+      focus_message_id: focusMessageId || null,
+    }),
+  });
+  if (!res.ok || !res.body) throw new Error("stream-unavailable");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let final = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // Events are separated by a blank line; keep any partial tail.
+    const chunks = buffer.split(SSE_EVENT_SEP);
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const line = chunk.split(SSE_LINE_SEP).find((l) => l.startsWith("data: "));
+      if (!line) continue;                       // keepalive comment
+      let ev;
+      try { ev = JSON.parse(line.slice(6)); } catch (_) { continue; }
+      if (ev.type === "step") onStep?.(ev.label);
+      else if (ev.type === "done") final = { text: ev.reply, steps: ev.steps || [], proposals: ev.proposals || [] };
+      else if (ev.type === "error") throw new Error(ev.detail || "Iris couldn't respond right now.");
+    }
+  }
+  if (!final) throw new Error("stream-unavailable");
+  return final;
+}
+
 async function sendToIris(message, history, inboxContext, focusMessageId) {
   const userName = localStorage.getItem("loggedInUser") || "User";
   const userEmail = localStorage.getItem("userEmail") || "default";
@@ -303,6 +352,7 @@ const Iris = ({
   const [messages, setMessages] = useState(() => [{ role: "iris", text: buildGreeting() }]);
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
+  const [liveSteps, setLiveSteps] = useState([]);   // what Iris is doing, as it happens
   const [copiedIndex, setCopiedIndex] = useState(null);
   const [usedIndex, setUsedIndex] = useState(null);   // "Added" feedback on Use-as-reply   // index of message showing "Copied" feedback
 
@@ -589,9 +639,17 @@ const Iris = ({
     setMessages((prev) => [...prev, { role: "user", text }]);
     setInput("");
     setThinking(true);
+    setLiveSteps([]);
 
     try {
-      const reply = await sendToIris(text, priorMessages, inboxContext, focusRef.current);
+      let reply;
+      try {
+        reply = await streamToIris(text, priorMessages, inboxContext, focusRef.current,
+          (label) => setLiveSteps((prev) => (prev.includes(label) ? prev : [...prev, label])));
+      } catch (streamErr) {
+        if (streamErr?.message !== "stream-unavailable") throw streamErr;
+        reply = await sendToIris(text, priorMessages, inboxContext, focusRef.current);
+      }
       setMessages((prev) => [...prev, {
         role: "iris",
         text: reply.text,
@@ -605,6 +663,7 @@ const Iris = ({
       ]);
     } finally {
       setThinking(false);
+      setLiveSteps([]);
     }
   };
 
@@ -783,9 +842,18 @@ const Iris = ({
                     <span className="iris-avatar"><Sparkles size={11} /></span>
                     <span className="iris-msg-name">Iris</span>
                   </div>
+                  {liveSteps.length > 0 && (
+                    <div className="iris-steps">
+                      {liveSteps.slice(0, -1).map((s2, si) => (
+                        <span key={si} className="iris-step"><Check size={9} /> {s2}</span>
+                      ))}
+                    </div>
+                  )}
                   <div className="iris-bubble-iris iris-thinking-line">
                     <span className="iris-typing"><span /><span /><span /></span>
-                    <span className="iris-thinking-text">Reading your inbox…</span>
+                    <span className="iris-thinking-text">
+                      {liveSteps.length ? `${liveSteps[liveSteps.length - 1]}…` : "Working…"}
+                    </span>
                   </div>
                 </div>
               </div>

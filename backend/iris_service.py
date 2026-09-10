@@ -1065,6 +1065,7 @@ async def get_iris_reply(
     inbox_context: Optional[dict] = None,
     user_email: str = "default",
     focus_message_id: Optional[str] = None,
+    on_step=None,
 ) -> dict:
     """
     Returns {"reply", "steps", "proposals"}. Raises on API failure — the
@@ -1106,11 +1107,16 @@ async def get_iris_reply(
                 ),
             })
             steps.append("Opened the email you're viewing")
+            if on_step:
+                await on_step("Opened the email you're viewing")
     # Only the recent turns. The frontend sends the whole conversation, so a
     # long chat previously grew the request without bound — cost climbing
     # every message until it eventually hit the context limit.
     messages.extend(_to_openai_messages(history)[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": message})
+
+    if on_step:
+        await on_step("Thinking")
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = await _chat_with_retry(
@@ -1158,6 +1164,10 @@ async def get_iris_reply(
             label = TOOL_LABELS.get(tc.function.name, tc.function.name)
             if label not in steps:
                 steps.append(label)
+            # Emit before running it, so the panel shows what Iris is doing
+            # while it happens rather than listing it once the wait is over.
+            if on_step:
+                await on_step(label)
             result_str = await _execute_tool_call(tc.function.name, args, user_email, user_name, proposals)
 
             messages.append({

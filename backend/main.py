@@ -1245,6 +1245,75 @@ async def outbox_discard(item_id: str, user_email: str):
     return {"ok": True, "removed": removed}
 
 
+# Blank line terminates one server-sent event.
+SSE_END = chr(10) + chr(10)
+
+
+@app.post("/api/iris/chat/stream")
+async def iris_chat_stream(payload: IrisChatRequest):
+    """
+    Same as /api/iris/chat, streamed as server-sent events so the panel can
+    show what Iris is doing while it happens.
+
+    A question that searches and then reads two emails can take fifteen
+    seconds; without this the panel sits silent for all of it and then
+    dumps everything at once. Each tool announces itself as it starts.
+
+    Falls back cleanly: the non-streaming route is untouched, so a client
+    that can't read a stream still works.
+    """
+    async def events():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def on_step(label: str):
+            await queue.put({"type": "step", "label": label})
+
+        task = asyncio.create_task(get_iris_reply(
+            payload.message, payload.history, payload.user_name,
+            payload.inbox_context, payload.user_email,
+            payload.focus_message_id, on_step,
+        ))
+
+        # Drain progress while the work runs. The short timeout doubles as a
+        # keepalive tick so proxies don't sit on a silent connection.
+        while not task.done() or not queue.empty():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                yield "data: " + json.dumps(event) + SSE_END
+            except asyncio.TimeoutError:
+                yield ": keepalive" + SSE_END
+
+        try:
+            result = task.result()
+            yield "data: " + json.dumps({
+                "type": "done",
+                "reply": result.get("reply", ""),
+                "steps": result.get("steps", []),
+                "proposals": result.get("proposals", []),
+            }) + SSE_END
+        except Exception as e:
+            kind = type(e).__name__
+            if "APIConnection" in kind or "APITimeout" in kind:
+                detail = ("Can't reach the AI service right now — your inbox is fine, "
+                          "this is the connection to the assistant. Try again in a moment.")
+            elif "RateLimit" in kind:
+                detail = "The AI service is busy right now. Give it a few seconds and try again."
+            else:
+                detail = "Iris couldn't respond right now."
+            log.error(f"iris_chat_stream error ({kind}): {e}")
+            yield "data: " + json.dumps({"type": "error", "detail": detail}) + SSE_END
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",   # stop proxies buffering the stream
+        },
+    )
+
+
 @app.post("/api/iris/chat")
 async def iris_chat(payload: IrisChatRequest):
     """
