@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { X, CheckCircle, AlertCircle, Info, Loader } from 'lucide-react';
 
 const ToastItem = ({ id, message, type, count = 1, onClose }) => {
@@ -18,7 +19,14 @@ const ToastItem = ({ id, message, type, count = 1, onClose }) => {
   };
 
   return (
-    <div className={`toast-item toast-${type}`}>
+    <motion.div
+      layout
+      initial={{ opacity: 0, x: 50 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={{ opacity: 0, x: 50 }}
+      transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+      className={`toast-item toast-${type}`}
+    >
       <div className="toast-icon-box">{icons[type] || icons.info}</div>
       <span className="toast-text">{message}</span>
 
@@ -41,16 +49,18 @@ const ToastItem = ({ id, message, type, count = 1, onClose }) => {
       <button onClick={() => onClose(id)} className="toast-close-btn">
         <X size={14} />
       </button>
-    </div>
+    </motion.div>
   );
 };
 
 const ToastContainer = ({ toasts, removeToast }) => {
   return (
     <div className="toast-container-fixed">
-      {toasts.map((toast) => (
-        <ToastItem key={toast.id} {...toast} onClose={removeToast} />
-      ))}
+      <AnimatePresence>
+        {toasts.map((toast) => (
+          <ToastItem key={toast.id} {...toast} onClose={removeToast} />
+        ))}
+      </AnimatePresence>
     </div>
   );
 };

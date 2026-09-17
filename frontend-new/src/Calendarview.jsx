@@ -6,7 +6,9 @@ import {
   X, ArrowLeft, AlertCircle, Loader, User, RefreshCw
 } from "lucide-react";
 import "./Calendar.css";
+import "./App.css";           // shared chrome (.top-bar, .view-btn, .user-profile…)
 import ToastContainer from "./Toast";
+import AppHeader from "./AppHeader";
 
 // ─── Config ───────────────────────────────────────────────
 const API_BASE    = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
@@ -980,6 +982,20 @@ const CalendarView = () => {
 
   // ─── RENDER ───────────────────────────────────────────
   return (
+    <div className="cal-page">
+      <AppHeader
+        active="CALENDAR"
+        actions={
+          <button
+            onClick={() => fetchMeetings(true)}
+            disabled={loading}
+            className="btn-gradient"
+            style={{ width: 'auto', padding: '9px 18px', marginRight: '15px', display: 'flex', alignItems: 'center', gap: '7px', fontSize: '0.84rem', fontWeight: '700', opacity: loading ? 0.65 : 1 }}
+          >
+            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> Refresh
+          </button>
+        }
+      />
     <div className="cal-root" onClick={closePanel}>
       <ToastContainer toasts={toasts} removeToast={removeToast} />
 
@@ -1084,6 +1100,7 @@ const CalendarView = () => {
           rsvpStatus={rsvpStatus}
         />
       )}
+    </div>
     </div>
   );
 };

@@ -7,6 +7,8 @@ backend/cache_*.json
 backend/tracking_*@*.json
 backend/not_tracked_*@*.json
 backend/activity_log.json
+# Rotating app log (LOG_FILE) — runtime output, regenerated on every boot
+backend/logs/
 # Cached email bodies for offline reading — real mail content, never commit
 backend/detail_cache/
 
@@ -27,3 +29,8 @@ backend/*.bak
 *.bak
 # Queued actions awaiting the mail server — per-user runtime state
 backend/outbox_*.json
+# Per-user runtime data from Admin (thread notes, send settings, signatures) —
+# real note/signature content, mirrors tracking_*@*.json above, never commit
+backend/thread_notes_*@*.json
+backend/send_settings_*@*.json
+backend/signatures_*@*.json

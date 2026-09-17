@@ -67,6 +67,8 @@ from services import (
     get_cached_emails_by_id,
     get_cached_detail,
     has_cached_detail,
+    get_thread_note,
+    load_thread_notes,
 )
 
 # Words carried by ordinary questions that would otherwise have to appear in
@@ -205,13 +207,33 @@ didn't come from the snapshot, a tool result, or the conversation itself.
 
 7. propose_action — puts a confirmation button in front of the person
    for something they asked you to DO rather than tell them: mark an
-   email read, send a reply, forward, RSVP to a meeting, start tracking.
-   You never carry it out. Pressing the button is what performs it, and
-   they can edit a message before it goes. So: prepare the action, then
-   say what you've queued and that it needs their confirmation. Never say
-   "I've sent it" or "done" — it is not done until they press. For a
-   reply or forward, write the complete final message in the body; the
-   person will see exactly what would be sent.
+   email read, send a reply, forward, write a new email, RSVP to a
+   meeting, start tracking. You never carry it out. Pressing the button
+   is what performs it, and they can edit the recipients, subject and
+   wording on the card before it goes. So: prepare the action, then say
+   what you've queued and that it needs their confirmation. Never say
+   "I've sent it" or "done" — it is not done until they press.
+
+WRITING EMAIL THAT WILL ACTUALLY BE SENT — for send_reply, forward and
+compose, put the complete final message in the body. Not a sketch, not
+"[insert details]", not a description of what you'd write: the exact
+words that would go out over their name. The person sees precisely this
+text on the card, so anything left unfinished is something they have to
+fix by hand.
+
+- Replying to an email that exists → send_reply with its messageId.
+  Read the email first so you are answering what was actually asked.
+- Passing an email on to someone else → forward with its messageId.
+- A new email that isn't part of any thread ("email Deepa and ask for
+  the Q3 numbers", "send Jim a note about Friday") → compose. It needs
+  a real recipient address and a subject you write yourself.
+
+Recipient addresses must be ones you have actually seen — in the inbox
+snapshot, a tool result, or the conversation. Never assemble an address
+from someone's name and a guess at the domain. If you don't have it,
+look for it with search_emails or search_sent; if it still isn't there,
+ask the person for it rather than proposing a send to an invented
+address. Sign off as the person you're speaking with, never as Iris.
 
 If someone asks you to do something you have no action for (deleting
 mail, moving folders, booking a new meeting), say plainly that you can't
@@ -219,11 +241,14 @@ do that yet rather than proposing something adjacent.
 
 CURRENT CAPABILITIES (be honest if asked): you can chat, answer
 questions grounded in the snapshot, browse and search analysed email,
-read the full text of emails that have been cached, look at the person's
-upcoming calendar, draft replies, check tracking/follow-up status, and
-prepare actions (mark read, reply, forward, RSVP, track) for them to
-confirm. You never send or change anything on your own, you can't create
-calendar entries, and you can't reach beyond the mail already analysed.
+read the full text of emails that have been cached, search what the
+person has sent, look at their upcoming calendar, draft replies, check
+tracking/follow-up status, and prepare actions (mark read, reply,
+forward, compose a new email, RSVP, track) for them to confirm. You can
+write an email on their behalf and it will really be sent — but only
+after they press the button on the card, which they can edit first. You
+never send or change anything on your own, you can't create calendar
+entries, and you can't reach beyond the mail already analysed.
 """.strip()
 
 
@@ -559,8 +584,9 @@ TOOLS = [
                 "actions out yourself — this only puts a confirmation button "
                 "in front of them, and nothing happens unless they press it. "
                 "Use it when they ask you to do something rather than tell "
-                "them something: mark mail as read, reply, forward, RSVP to a "
-                "meeting, or start tracking a reply. After calling this, tell "
+                "them something: mark mail as read, reply to an email, forward "
+                "one, write a brand-new email to someone, RSVP to a meeting, or "
+                "start tracking a reply. After calling this, tell "
                 "them plainly what you've queued up and that it needs their "
                 "confirmation. Never claim it is done."
             ),
@@ -569,12 +595,22 @@ TOOLS = [
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["mark_read", "send_reply", "forward", "rsvp", "track"],
-                        "description": "Which action to put up for confirmation.",
+                        "enum": ["mark_read", "send_reply", "forward", "compose", "rsvp", "track"],
+                        "description": (
+                            "Which action to put up for confirmation. Use "
+                            "'send_reply' to answer an email that exists, "
+                            "'forward' to pass one on, and 'compose' to start a "
+                            "brand-new email that is not part of any thread."
+                        ),
                     },
                     "message_id": {
                         "type": "string",
-                        "description": "The email or meeting this applies to (from search_emails/list_emails).",
+                        "description": (
+                            "The email or meeting this applies to (from "
+                            "search_emails/list_emails). Required for "
+                            "send_reply, forward, mark_read and rsvp. Leave it "
+                            "out for compose — a new email has no thread."
+                        ),
                     },
                     "summary": {
                         "type": "string",
@@ -582,16 +618,31 @@ TOOLS = [
                     },
                     "to": {
                         "type": "array", "items": {"type": "string"},
-                        "description": "send_reply/forward: recipient addresses.",
+                        "description": (
+                            "send_reply/forward/compose: recipient addresses. "
+                            "Must be real addresses you have seen in the inbox, "
+                            "a tool result or the conversation — never guessed "
+                            "or constructed from a name."
+                        ),
                     },
                     "cc": {
                         "type": "array", "items": {"type": "string"},
-                        "description": "send_reply/forward: cc addresses.",
+                        "description": "send_reply/forward/compose: cc addresses.",
                     },
-                    "subject": {"type": "string", "description": "send_reply/forward: subject line."},
+                    "subject": {
+                        "type": "string",
+                        "description": (
+                            "send_reply/forward: subject line. For compose this "
+                            "is required — write a clear, specific one."
+                        ),
+                    },
                     "body": {
                         "type": "string",
-                        "description": "send_reply/forward: the full message text, ready to send.",
+                        "description": (
+                            "send_reply/forward/compose: the full message text, "
+                            "ready to send — greeting, body and sign-off, "
+                            "written as the person would send it themselves."
+                        ),
                     },
                     "response": {
                         "type": "string",
@@ -704,6 +755,19 @@ def read_cached_email(user_email: str, message_id: str) -> dict:
         payload["thread"] = trimmed
         payload["thread_message_count"] = len(messages)
 
+    # The person's own note about this thread, if they left one — keyed the
+    # same way the reading pane and Trackingview.jsx key a thread
+    # (conversationId, falling back to messageId for singletons). Surfaced
+    # here so both the read_email tool and the "person is looking at this
+    # email right now" injection in get_iris_reply pick it up for free.
+    note = get_thread_note(user_email, detail.get("conversationId") or message_id)
+    if note:
+        payload["note_from_user"] = note
+        payload["note_from_user_meaning"] = (
+            "The person's own past note about this thread, written for "
+            "exactly this situation — treat it as accurate first-hand context."
+        )
+
     return payload
 
 
@@ -742,6 +806,7 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
         log.error(f"search_cached_emails: get_cached_emails_by_id failed: {e}")
         return []
 
+    notes = load_thread_notes(user_email)
     scored = []
     seen_ids = set()
 
@@ -774,6 +839,7 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
             for w in matched
         )
         received = entry.get("received_at") or entry.get("received") or ""
+        thread_key = entry.get("conversationId") or eid
 
         scored.append((len(matched), score, str(received), {
             "messageId": eid,
@@ -784,6 +850,7 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
             "received_at": received,
             "unread": entry.get("isRead") is False,
             "has_full_text": has_cached_detail(user_email, eid) if eid else False,
+            "has_note": bool(thread_key and thread_key in notes),
         }))
 
     # Prefer emails matching every word; if none do, fall back to the best
@@ -909,6 +976,7 @@ def list_cached_emails(
         log.error(f"list_cached_emails: cache read failed: {e}")
         return {"error": "Couldn't read the analysed inbox just now."}
 
+    notes = load_thread_notes(user_email)
     cat = (category or "").strip().upper() or None
     who = (sender or "").strip().lower() or None
     cutoff = datetime.now() - timedelta(days=days) if days else None
@@ -928,6 +996,7 @@ def list_cached_emails(
             continue
 
         eid = entry.get("id") or entry.get("messageId")
+        thread_key = entry.get("conversationId") or eid
         rows.append({
             "messageId": eid,
             # Needed to tell whether this conversation has been answered.
@@ -940,6 +1009,7 @@ def list_cached_emails(
             "unread": entry.get("isRead") is False,
             "has_attachments": bool(entry.get("hasAttachments")),
             "has_full_text": has_cached_detail(user_email, eid) if eid else False,
+            "has_note": bool(thread_key and thread_key in notes),
             "_sort": when or datetime.min,
         })
 
@@ -955,7 +1025,9 @@ def list_cached_emails(
         "filters": {"category": cat, "sender": who, "days": days},
         "note": (
             "Scope is the emails analysed so far for this person, newest "
-            "first — not their entire mailbox history."
+            "first — not their entire mailbox history. Rows with has_note "
+            "carry a note the person previously wrote about that thread — "
+            "read_email surfaces it; read those before answering about them."
         ),
     }
 
@@ -1034,6 +1106,13 @@ TOOL_LABELS = {
 }
 
 
+# Deliberately loose — this is a sanity check on a model-supplied address,
+# not RFC 5322 validation. It exists to catch "Deepa" or "deepa@" being
+# passed where an address belongs, since a composed email has no thread to
+# fall back on if the recipient is wrong.
+_LOOKS_LIKE_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 def build_action_proposal(arguments: dict, user_email: str) -> dict:
     """
     Turn the model's proposed action into a structured payload the UI can
@@ -1055,7 +1134,7 @@ def build_action_proposal(arguments: dict, user_email: str) -> dict:
         "messageId": a.get("message_id") or "",
         "userEmail": user_email,
     }
-    if action in ("send_reply", "forward"):
+    if action in ("send_reply", "forward", "compose"):
         proposal.update({
             "to": [x for x in (a.get("to") or []) if x],
             "cc": [x for x in (a.get("cc") or []) if x],
@@ -1120,7 +1199,10 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
                 "hint": (
                     "Entries with has_full_text can be opened with read_email "
                     "using their messageId — do that before answering anything "
-                    "that needs the actual wording."
+                    "that needs the actual wording. Entries with has_note also "
+                    "carry a note the person previously wrote about that "
+                    "thread — read_email surfaces it, so open those too "
+                    "before answering about them."
                 ),
             })
 
@@ -1171,8 +1253,28 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
             proposal = build_action_proposal(arguments, user_email)
             if not proposal["action"]:
                 return json.dumps({"error": "propose_action needs an action."})
-            if proposal["action"] in ("send_reply", "forward") and not proposal.get("body"):
+            if proposal["action"] in ("send_reply", "forward", "compose") and not proposal.get("body"):
                 return json.dumps({"error": "Write the full message body before proposing to send it."})
+            if proposal["action"] == "compose":
+                # A reply inherits its recipient and subject from the thread it
+                # answers; a new email has neither, so both have to be right
+                # here or the person is confirming a message with nowhere to go.
+                if not proposal.get("to"):
+                    return json.dumps({"error": (
+                        "compose needs at least one recipient address. If you "
+                        "don't know it, look it up with search_emails or "
+                        "search_sent, or ask the person — never guess one."
+                    )})
+                bad = [t for t in proposal["to"] + proposal.get("cc", [])
+                       if not _LOOKS_LIKE_EMAIL.match(t)]
+                if bad:
+                    return json.dumps({"error": (
+                        f"These aren't valid email addresses: {', '.join(bad)}. "
+                        "Use a real address from the inbox or ask for it — "
+                        "don't build one out of someone's name."
+                    )})
+                if not proposal.get("subject"):
+                    return json.dumps({"error": "compose needs a subject line."})
             if sink is not None:
                 sink.append(proposal)
             return json.dumps({

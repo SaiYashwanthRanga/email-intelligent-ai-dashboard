@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck, CornerDownLeft, Inbox } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Sparkles, X, Send, Copy, Check, RotateCcw, ShieldCheck, CornerDownLeft, Inbox, Megaphone, Maximize2, Minimize2 } from "lucide-react";
 
 /**
  * Iris — Inbox Assistant (frontend shell)
@@ -103,12 +104,55 @@ const MAX_THREADS = 25;
 // only 25 meant it could never fill the budget even when the inbox was big.
 const MAX_RECENT_EMAILS = 60;
 
+// ─── WHAT'S NEW ─────────────────────────────────────────────────────────────
+// Iris gains capabilities faster than anyone reads a release note, so the
+// panel announces them itself. Bump WHATS_NEW_VERSION whenever the list
+// below changes: everyone sees the new list once, including people who
+// dismissed the previous one, and nobody sees the same list twice.
+const WHATS_NEW_VERSION = "2026-09-compose";
+const WHATS_NEW_KEY = "irisWhatsNewSeen";
+const WHATS_NEW = [
+  {
+    title: "Iris can send email for you",
+    text: "Ask it to reply to something, forward it on, or write a brand-new email to someone. It writes the whole message — and nothing leaves until you press Send.",
+  },
+  {
+    title: "Fix the wording before it goes",
+    text: "Recipients, subject and body are all editable on the confirmation card, so you can adjust a line yourself instead of asking Iris to try again.",
+  },
+];
+
+// Storage can throw outright in a private window or with site data blocked,
+// so both sides are guarded. On failure we treat the notes as already seen —
+// showing them on every single open is worse than not showing them at all.
+function whatsNewUnseen() {
+  try {
+    return localStorage.getItem(WHATS_NEW_KEY) !== WHATS_NEW_VERSION;
+  } catch {
+    return false;
+  }
+}
+
 // Drag/position constants for the floating button and its panel.
 const FAB_POS_KEY = "irisFabY";
 const FAB_SIZE = 56;        // matches .iris-fab width/height
-const PANEL_HEIGHT = 620;   // matches .iris-popup height
+const PANEL_HEIGHT = 720;   // matches .iris-popup height
 const EDGE_GAP = 16;        // keep clear of the viewport edges
 const DRAG_THRESHOLD = 4;   // px of travel before a click counts as a drag
+
+// Expanded mode. Iris now writes whole emails and reads long threads back,
+// and a 430px column made a five-paragraph draft unreadable — so the panel
+// can be widened to something closer to a reading window. The choice is
+// remembered, since it's a preference about screen size, not about a task.
+const PANEL_WIDE_KEY = "irisPanelWide";
+
+function readPanelWide() {
+  try {
+    return localStorage.getItem(PANEL_WIDE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 // Starter prompts for an empty conversation. Chosen to show what Iris is
 // actually good at now that it can open and read full email text, rather
@@ -381,6 +425,30 @@ const Iris = ({
   const [outbox, setOutbox] = useState(null);           // { pending_auto, awaiting_send, items }
   const [showOutbox, setShowOutbox] = useState(false);
   const [sendingId, setSendingId] = useState(null);
+  const [showWhatsNew, setShowWhatsNew] = useState(whatsNewUnseen);
+  const [wide, setWide] = useState(readPanelWide);
+
+  const toggleWide = () => {
+    setWide((v) => {
+      try {
+        localStorage.setItem(PANEL_WIDE_KEY, v ? "0" : "1");
+      } catch {
+        // Preference just won't persist; the toggle still works this session.
+      }
+      return !v;
+    });
+  };
+
+  // Dismissing is what marks this version read, so the notes survive a
+  // panel close or a page reload until they've actually been acknowledged.
+  const dismissWhatsNew = () => {
+    setShowWhatsNew(false);
+    try {
+      localStorage.setItem(WHATS_NEW_KEY, WHATS_NEW_VERSION);
+    } catch {
+      // Nothing worth failing over — worst case they see it again.
+    }
+  };
 
   // Poll the outbox so held messages surface without a reload. Cheap: a
   // small JSON read, and only while the panel is open.
@@ -432,10 +500,29 @@ const Iris = ({
     return () => window.removeEventListener(IRIS_ASK_EVENT, onAsk);
   }, []);
 
+  // Edits made on a confirmation card, keyed by actionId. Held separately
+  // from the proposal itself so the message history stays exactly what Iris
+  // proposed — what gets sent is the proposal with these laid over it.
+  const [actionEdits, setActionEdits] = useState({});
+
+  const editAction = (actionId, field, value) =>
+    setActionEdits((s) => ({ ...s, [actionId]: { ...(s[actionId] || {}), [field]: value } }));
+
   const handleConfirm = async (proposal) => {
+    const edits = actionEdits[proposal.actionId] || {};
+    // Recipients are typed as a comma-separated line; split them back out
+    // and drop the blanks a trailing comma leaves behind.
+    const asList = (v) => v.split(",").map((x) => x.trim()).filter(Boolean);
+    const merged = {
+      ...proposal,
+      ...(edits.to !== undefined ? { to: asList(edits.to) } : {}),
+      ...(edits.cc !== undefined ? { cc: asList(edits.cc) } : {}),
+      ...(edits.subject !== undefined ? { subject: edits.subject } : {}),
+      ...(edits.body !== undefined ? { body: edits.body } : {}),
+    };
     setActionState((s) => ({ ...s, [proposal.actionId]: "running" }));
     try {
-      const res = await confirmIrisAction(proposal);
+      const res = await confirmIrisAction(merged);
       setActionState((s) => ({ ...s, [proposal.actionId]: "done" }));
       setMessages((prev) => [...prev, { role: "iris", text: res.message || "Done." }]);
     } catch (err) {
@@ -489,11 +576,16 @@ const Iris = ({
   }, [fabY, clampFabY]);
 
   // Panel sits centred on the button, but never hangs off either edge.
-  const panelTop = useMemo(() => {
-    const panelH = Math.min(PANEL_HEIGHT, window.innerHeight - EDGE_GAP * 2);
+  // Expanded it just fills the available height, so there is nothing to
+  // centre — but this still has to agree with the CSS or the clamp below
+  // pushes the panel off-screen.
+  const [panelTop, panelHeight] = useMemo(() => {
+    const avail = window.innerHeight - EDGE_GAP * 2;
+    const panelH = wide ? avail : Math.min(PANEL_HEIGHT, avail);
     const ideal = fabY - panelH / 2;
-    return Math.min(Math.max(ideal, EDGE_GAP), window.innerHeight - panelH - EDGE_GAP);
-  }, [fabY]);
+    const top = Math.min(Math.max(ideal, EDGE_GAP), window.innerHeight - panelH - EDGE_GAP);
+    return [top, panelH];
+  }, [fabY, wide]);
 
   const getSender = getParticipantDisplay || fallbackGetParticipantDisplay;
   const getReceived = getEffectiveReceivedAt || fallbackGetEffectiveReceivedAt;
@@ -678,9 +770,29 @@ const Iris = ({
     <div ref={containerRef}>
       <style>{IRIS_CSS}</style>
 
-      {/* ─── POPUP (renders above the FAB, only when open) ─── */}
+      {/* The tail that makes the panel read as this button's speech bubble
+          rather than a floating dialog. Tracks the button, which can be
+          dragged, but stays within the panel's edges so it never floats free
+          of the bubble it belongs to. */}
       {isOpen && (
-        <div className="iris-popup" style={{ top: `${panelTop}px` }}>
+        <span
+          className="iris-popup-tail"
+          style={{ top: `${Math.min(Math.max(fabY, panelTop + 24), panelTop + panelHeight - 24)}px` }}
+        />
+      )}
+
+      {/* ─── POPUP (renders above the FAB, only when open) ─── */}
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            key="iris-popup"
+            className={`iris-popup ${wide ? "iris-popup-wide" : ""}`}
+            style={{ top: `${panelTop}px` }}
+            initial={{ opacity: 0, scale: 0.92, x: 10 }}
+            animate={{ opacity: 1, scale: 1, x: 0 }}
+            exit={{ opacity: 0, scale: 0.92, x: 10 }}
+            transition={{ duration: 0.26, ease: [0.2, 0, 0, 1] }}
+          >
           <div className="iris-header">
             <div className="iris-header-left">
               <div className="iris-header-icon"><Sparkles size={17} /></div>
@@ -706,11 +818,57 @@ const Iris = ({
                   <RotateCcw size={14} />
                 </button>
               )}
+              {/* Stays in the header after dismissal so the notes remain
+                  findable rather than being gone for good on one click. */}
+              <button
+                className={`iris-icon-btn ${showWhatsNew ? "iris-icon-btn-on" : ""}`}
+                onClick={() => (showWhatsNew ? dismissWhatsNew() : setShowWhatsNew(true))}
+                title="What's new"
+              >
+                <Megaphone size={14} />
+              </button>
+              <button
+                className="iris-icon-btn"
+                onClick={toggleWide}
+                title={wide ? "Shrink the panel" : "Expand for easier reading"}
+              >
+                {wide ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+              </button>
               <button className="iris-icon-btn" onClick={() => setIsOpen(false)} title="Close">
                 <X size={15} />
               </button>
             </div>
           </div>
+
+          {/* Sits above the conversation rather than inside it, so it reads
+              as a notice about Iris and never gets mistaken for something
+              Iris said — and so it looks the same on a fresh chat as on one
+              already in progress. */}
+          {showWhatsNew && (
+            <div className="iris-whatsnew">
+              <div className="iris-whatsnew-head">
+                <span className="iris-whatsnew-label">
+                  <Sparkles size={12} /> New in Iris
+                </span>
+                <button
+                  className="iris-whatsnew-close"
+                  onClick={dismissWhatsNew}
+                  title="Dismiss"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+              {WHATS_NEW.map((n) => (
+                <div key={n.title} className="iris-whatsnew-item">
+                  <div className="iris-whatsnew-title">{n.title}</div>
+                  <div className="iris-whatsnew-text">{n.text}</div>
+                </div>
+              ))}
+              <button className="iris-whatsnew-got" onClick={dismissWhatsNew}>
+                Got it
+              </button>
+            </div>
+          )}
 
           {showOutbox && outbox?.items?.length > 0 && (
             <div className="iris-outbox">
@@ -722,6 +880,11 @@ const Iris = ({
                   <div className="iris-outbox-to">
                     To {(item.payload?.to || []).join(", ") || "—"}
                   </div>
+                  {/* A composed email carries its own subject; a reply inherits
+                      the thread's, so there is nothing useful to show there. */}
+                  {item.action === "compose" && item.payload?.subject && (
+                    <div className="iris-outbox-to">Re: {item.payload.subject}</div>
+                  )}
                   <div className="iris-outbox-body">{item.payload?.body}</div>
                   {item.lastError && <div className="iris-outbox-err">{item.lastError}</div>}
                   {actionState[item.id] && <div className="iris-outbox-err">{actionState[item.id]}</div>}
@@ -748,15 +911,23 @@ const Iris = ({
           )}
 
           <div className="iris-messages" ref={listRef}>
+            {/* initial={false}: reopening Iris remounts this whole list, so
+                without it every past message would replay its entrance
+                animation on every open — only a genuinely new message
+                (appended after the initial render) should animate in. */}
+            <AnimatePresence initial={false}>
             {messages.map((m, i) => (
-              <div
+              <motion.div
                 key={i}
+                initial={{ opacity: 0, y: 12 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.22, ease: [0.2, 0, 0, 1] }}
                 className={`iris-bubble-row ${m.role === "user" ? "iris-row-user" : "iris-row-iris"}`}
               >
                 {m.role === "user" ? (
                   <div className="iris-bubble-user">{m.text}</div>
                 ) : (
-                  <div className="iris-bubble-iris-wrap">
+                  <div className={`iris-bubble-iris-wrap ${m.proposals?.length ? "iris-wrap-wide" : ""}`}>
                     <div className="iris-msg-head">
                       <span className="iris-avatar"><Sparkles size={11} /></span>
                       <span className="iris-msg-name">Iris</span>
@@ -774,21 +945,68 @@ const Iris = ({
 
                     {/* Actions wait here for an explicit press. Iris never
                         performs them itself — this button is the only path. */}
+                    <AnimatePresence>
                     {m.proposals?.map((p) => {
                       const state = actionState[p.actionId];
-                      const isSend = p.action === "send_reply" || p.action === "forward";
+                      const isSend = p.action === "send_reply" || p.action === "forward" || p.action === "compose";
+                      const edits = actionEdits[p.actionId] || {};
+                      // Fall back to what Iris proposed until the field is touched.
+                      const val = (f, dflt) => (edits[f] !== undefined ? edits[f] : dflt);
+                      const locked = state === "running" || state === "done";
                       return (
-                        <div key={p.actionId} className={`iris-action-card ${isSend ? "iris-action-send" : ""}`}>
+                        <motion.div
+                          key={p.actionId}
+                          className={`iris-action-card ${isSend ? "iris-action-send" : ""}`}
+                          initial={{ opacity: 0, scale: 0.9 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          transition={{ type: "spring", stiffness: 400, damping: 28 }}
+                        >
                           <div className="iris-action-title">
                             <ShieldCheck size={13} /> Needs your confirmation
                           </div>
                           <div className="iris-action-summary">{p.summary}</div>
                           {isSend && (
+                            /* Editable on purpose: this is the last point before
+                               the message actually leaves, so a wrong recipient
+                               or an awkward line should be fixable here rather
+                               than by asking Iris to try again. */
                             <div className="iris-action-detail">
-                              <div><span className="iris-action-label">To</span> {(p.to || []).join(", ") || "—"}</div>
-                              {p.cc?.length > 0 && <div><span className="iris-action-label">Cc</span> {p.cc.join(", ")}</div>}
-                              {p.subject && <div><span className="iris-action-label">Subject</span> {p.subject}</div>}
-                              <div className="iris-action-body">{p.body}</div>
+                              <label className="iris-action-field">
+                                <span className="iris-action-label">To</span>
+                                <input
+                                  className="iris-action-input"
+                                  value={val("to", (p.to || []).join(", "))}
+                                  onChange={(e) => editAction(p.actionId, "to", e.target.value)}
+                                  disabled={locked}
+                                  placeholder="name@hfmg.net"
+                                />
+                              </label>
+                              <label className="iris-action-field">
+                                <span className="iris-action-label">Cc</span>
+                                <input
+                                  className="iris-action-input"
+                                  value={val("cc", (p.cc || []).join(", "))}
+                                  onChange={(e) => editAction(p.actionId, "cc", e.target.value)}
+                                  disabled={locked}
+                                  placeholder="optional"
+                                />
+                              </label>
+                              <label className="iris-action-field">
+                                <span className="iris-action-label">Subject</span>
+                                <input
+                                  className="iris-action-input"
+                                  value={val("subject", p.subject || "")}
+                                  onChange={(e) => editAction(p.actionId, "subject", e.target.value)}
+                                  disabled={locked}
+                                />
+                              </label>
+                              <textarea
+                                className="iris-action-body"
+                                value={val("body", p.body || "")}
+                                onChange={(e) => editAction(p.actionId, "body", e.target.value)}
+                                disabled={locked}
+                                rows={7}
+                              />
                             </div>
                           )}
                           {state === "done" ? (
@@ -802,14 +1020,18 @@ const Iris = ({
                               >
                                 {state === "running" ? "Working…" : (isSend ? "Send it" : "Confirm")}
                               </button>
+                              {isSend && !state && (
+                                <span className="iris-action-hint">Edit anything above before sending</span>
+                              )}
                               {state && state !== "running" && (
                                 <span className="iris-action-error">{state}</span>
                               )}
                             </div>
                           )}
-                        </div>
+                        </motion.div>
                       );
                     })}
+                    </AnimatePresence>
                     <div className="iris-msg-actions">
                       <button
                         className="iris-copy-btn"
@@ -832,8 +1054,9 @@ const Iris = ({
                     </div>
                   </div>
                 )}
-              </div>
+              </motion.div>
             ))}
+            </AnimatePresence>
 
             {thinking && (
               <div className="iris-bubble-row iris-row-iris">
@@ -910,8 +1133,9 @@ const Iris = ({
               <Send size={16} />
             </button>
           </div>
-        </div>
-      )}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ─── FLOATING TOGGLE BUTTON (drag vertically to reposition) ─── */}
       <button
@@ -976,25 +1200,76 @@ const IRIS_CSS = `
      left the panel hanging off the bottom of the screen. */
   top: 16px;
   right: 92px;
-  width: 430px;
-  max-width: calc(100vw - 32px);
+  /* Roomy enough to read a drafted email without the lines going ragged.
+     vw-relative so it shrinks on a laptop rather than overflowing. */
+  width: min(calc(100vw - 116px), 520px);
   /* Never taller than the viewport allows. dvh accounts for mobile browser
      chrome; the vh line is the fallback for browsers without dvh. */
-  height: min(620px, calc(100vh - 48px));
-  height: min(620px, calc(100dvh - 48px));
-  max-height: calc(100vh - 48px);
-  max-height: calc(100dvh - 48px);
+  height: min(720px, calc(100vh - 32px));
+  height: min(720px, calc(100dvh - 32px));
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
   background: rgba(16, 18, 24, 0.92);
   backdrop-filter: blur(40px) saturate(160%);
   -webkit-backdrop-filter: blur(40px) saturate(160%);
   border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 16px;
+  border-radius: 20px;
   box-shadow: 0 24px 60px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,217,255,0.06);
   display: flex;
   flex-direction: column;
   overflow: hidden;
   z-index: 2600;
-  animation: fadeSlideUp 0.28s cubic-bezier(0.2, 0, 0, 1) both;
+  /* Grows out of the button rather than sliding up from nowhere, so it
+     reads as that button's bubble — matched by the Framer Motion
+     initial/animate/exit values on this element (see the JSX above),
+     which replaced this rule's old CSS-only entrance so the panel can
+     finally animate back OUT on close too. */
+  transform-origin: 100% 50%;
+  transition: width 0.22s cubic-bezier(0.2, 0, 0, 1),
+              height 0.22s cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Expanded: a reading window rather than a chat column. Wide enough that a
+   drafted email wraps at a sane measure instead of one or two words a line. */
+.iris-popup-wide {
+  width: min(calc(100vw - 116px), 900px);
+  height: calc(100vh - 32px);
+  height: calc(100dvh - 32px);
+}
+
+/* The bubble's tail, in the 12px gap between panel and button. Fixed rather
+   than a child of the panel: the panel clips to its own rounded corners, and
+   anything hanging outside that would just be shaved off. */
+/* Drawn as a border triangle filling exactly the 12px gap, rather than a
+   rotated square tucked under the panel. Both are semi-transparent, so an
+   overlap would composite into a visibly darker wedge; this way they only
+   ever meet edge to edge. Sitting above the panel also hides the 1px border
+   seam where the two join. */
+.iris-popup-tail {
+  position: fixed;
+  right: 80px;
+  width: 0; height: 0;
+  border-top: 9px solid transparent;
+  border-bottom: 9px solid transparent;
+  /* Same translucent fill AND the same backdrop-filter as the panel, so the
+     two composite identically and the tail reads as part of the bubble.
+     A plain solid colour can't match: the panel's apparent shade is whatever
+     its blur makes of the page behind it, which changes as the page scrolls. */
+  border-left: 12px solid rgba(16, 18, 24, 0.92);
+  backdrop-filter: blur(40px) saturate(160%);
+  -webkit-backdrop-filter: blur(40px) saturate(160%);
+  transform: translateY(-50%);
+  z-index: 2601;
+  pointer-events: none;
+  animation: irisTailIn 0.26s cubic-bezier(0.2, 0, 0, 1) both;
+}
+@keyframes irisTailIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@media (max-width: 640px) {
+  /* The panel spans the screen at this size — there's no gap to sit in. */
+  .iris-popup-tail { display: none; }
 }
 
 .iris-header {
@@ -1087,6 +1362,53 @@ const IRIS_CSS = `
   color: #fbbf24; background: rgba(251,191,36,0.14);
   border: 1px solid rgba(251,191,36,0.45);
 }
+/* Release notes, in the panel's own cyan rather than the outbox amber —
+   this is news, not something needing attention. Same banner geometry as
+   the outbox so the two never fight when both are open. */
+.iris-whatsnew {
+  border-bottom: 1px solid var(--border-color);
+  background: rgba(0, 217, 255, 0.06);
+  padding: 10px 14px; max-height: 260px; overflow-y: auto; flex-shrink: 0;
+}
+.iris-whatsnew-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.iris-whatsnew-label {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 0.62rem; font-weight: 800; letter-spacing: 0.8px;
+  text-transform: uppercase; color: var(--neon-cyan);
+}
+.iris-whatsnew-close {
+  display: flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 6px;
+  border: none; background: transparent;
+  color: var(--text-secondary); cursor: pointer;
+}
+.iris-whatsnew-close:hover { background: rgba(255,255,255,0.08); color: var(--text-primary); }
+.iris-whatsnew-item { margin-bottom: 8px; }
+.iris-whatsnew-title {
+  font-size: 0.76rem; font-weight: 800; color: var(--text-primary);
+  margin-bottom: 2px;
+}
+.iris-whatsnew-text {
+  font-size: 0.72rem; line-height: 1.5; color: var(--text-secondary);
+}
+.iris-whatsnew-got {
+  border: 1px solid rgba(0, 217, 255, 0.45);
+  background: rgba(0, 217, 255, 0.10);
+  color: var(--neon-cyan);
+  border-radius: 8px; padding: 4px 12px; margin-top: 2px;
+  font-size: 0.7rem; font-weight: 800; cursor: pointer;
+}
+.iris-whatsnew-got:hover { background: rgba(0, 217, 255, 0.18); }
+/* The header toggle reads as pressed while the notes are showing. */
+.iris-icon-btn-on {
+  color: var(--neon-cyan);
+  background: rgba(0, 217, 255, 0.12);
+  border-color: rgba(0, 217, 255, 0.35);
+}
+
 .iris-outbox {
   border-bottom: 1px solid var(--border-color);
   background: rgba(251,191,36,0.05);
@@ -1165,17 +1487,38 @@ const IRIS_CSS = `
   margin-top: 8px; font-size: 0.76rem; color: var(--text-secondary);
   display: flex; flex-direction: column; gap: 3px;
 }
+/* Each header row is a label + the field that can be edited before sending. */
+.iris-action-field { display: flex; align-items: center; gap: 6px; }
 .iris-action-label {
   display: inline-block; min-width: 52px;
   font-weight: 800; font-size: 0.62rem; letter-spacing: 0.6px;
   text-transform: uppercase; opacity: 0.75;
 }
+.iris-action-input {
+  flex: 1; min-width: 0;
+  background: rgba(0,0,0,0.28);
+  border: 1px solid transparent; border-radius: 6px;
+  padding: 4px 7px; font: inherit; font-size: 0.74rem;
+  color: var(--text-primary);
+}
+/* Editable, but not shouting about it — the border appears on interaction so
+   the card still reads as a summary at a glance. */
+.iris-action-input:hover:not(:disabled) { border-color: rgba(255,255,255,0.14); }
+.iris-action-input:focus { outline: none; border-color: var(--neon-cyan); }
+.iris-action-input:disabled, .iris-action-body:disabled {
+  opacity: 0.7; cursor: default;
+}
 .iris-action-body {
   margin-top: 6px; padding: 8px 10px;
   background: rgba(0,0,0,0.28); border-radius: 8px;
+  border: 1px solid transparent;
   white-space: pre-wrap; color: var(--text-primary);
-  max-height: 190px; overflow-y: auto;
+  font: inherit; font-size: 0.76rem; line-height: 1.5;
+  max-height: 190px; overflow-y: auto; resize: vertical;
 }
+.iris-action-body:hover:not(:disabled) { border-color: rgba(255,255,255,0.14); }
+.iris-action-body:focus { outline: none; border-color: var(--neon-cyan); }
+.iris-action-hint { font-size: 0.66rem; color: var(--text-secondary); opacity: 0.75; }
 .iris-action-buttons { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
 .iris-action-go {
   border: none; border-radius: 8px; padding: 7px 15px;
@@ -1241,8 +1584,8 @@ const IRIS_CSS = `
 }
 
 .iris-messages {
-  flex: 1; overflow-y: auto; padding: 16px 14px;
-  display: flex; flex-direction: column; gap: 9px;
+  flex: 1; overflow-y: auto; padding: 18px 16px;
+  display: flex; flex-direction: column; gap: 12px;
   /* Without min-height:0 a flex item won't shrink below its content height,
      so a long conversation grew the column past the panel and pushed the
      input row off the bottom of the screen. This is what keeps the message
@@ -1254,11 +1597,13 @@ const IRIS_CSS = `
 .iris-row-iris { justify-content: flex-start; }
 
 .iris-bubble-iris, .iris-bubble-user {
-  max-width: 84%;
-  padding: 9px 12px;
-  border-radius: 12px;
-  font-size: 0.85rem;
-  line-height: 1.45;
+  max-width: 88%;
+  padding: 11px 14px;
+  border-radius: 14px;
+  /* Iris answers in paragraphs now, not one-liners — 0.85rem at 1.45 was
+     dense enough that people skimmed past the answer they asked for. */
+  font-size: 0.9rem;
+  line-height: 1.58;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -1279,10 +1624,38 @@ const IRIS_CSS = `
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  max-width: 84%;
+  max-width: 88%;
   gap: 4px;
 }
 .iris-bubble-iris-wrap .iris-bubble-iris { max-width: 100%; }
+
+/* A message carrying a draft gets the full column. Nested inside the normal
+   88% wrap, an 84% card left the email wrapping at five or six words a line,
+   which is unreadable for the one piece of text here that most needs reading
+   carefully — it's about to be sent over someone's name. */
+/* flex-grow, not just a bigger max-width: the wrap is a flex item sized to
+   its content, so without this the card stays as narrow as its longest line
+   no matter how much room the panel has. */
+.iris-wrap-wide { flex: 1 1 auto; max-width: 100%; }
+/* border-box matters here: this app has no global box-sizing reset, so a
+   content-box card at width:100% overflows its column by its own padding
+   and border and runs under the panel's edge. */
+.iris-wrap-wide .iris-action-card {
+  max-width: 100%; width: 100%; box-sizing: border-box;
+}
+.iris-action-input, .iris-action-body { box-sizing: border-box; }
+
+/* Expanding the panel is for reading, so cap the line length rather than
+   letting text run the full 900px — past roughly 70 characters the eye
+   loses its place coming back to the start of the next line. */
+.iris-popup-wide .iris-bubble-iris,
+.iris-popup-wide .iris-bubble-user,
+.iris-popup-wide .iris-bubble-iris-wrap { max-width: min(88%, 70ch); }
+.iris-popup-wide .iris-wrap-wide,
+.iris-popup-wide .iris-wrap-wide .iris-action-card { max-width: min(100%, 80ch); }
+/* Expanded, there's height to spare — show the whole draft rather than
+   making someone scroll a textarea to check the last line before sending. */
+.iris-popup-wide .iris-action-body { max-height: 420px; }
 
 .iris-copy-btn {
   display: flex;
@@ -1325,8 +1698,8 @@ const IRIS_CSS = `
 .iris-textarea {
   flex: 1; resize: none; border: 1px solid var(--border-color);
   outline: none; background: rgba(255, 255, 255, 0.06); color: var(--text-primary);
-  font-size: 0.85rem; font-family: inherit; line-height: 1.4;
-  padding: 8px 11px; border-radius: 10px; max-height: 100px;
+  font-size: 0.9rem; font-family: inherit; line-height: 1.45;
+  padding: 10px 13px; border-radius: 12px; max-height: 140px;
 }
 .iris-textarea:focus { border-color: var(--neon-cyan); }
 .iris-send-btn {

@@ -1,4 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import AnimatedModal from './AnimatedModal';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
@@ -1842,16 +1844,24 @@ function InboxView({
                   <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', fontWeight: '600' }}>
                     {selectedCards.size > 0 ? `${selectedCards.size} selected` : 'Select all'}
                   </span>
+                  <AnimatePresence>
                   {selectedCards.size > 0 && (
-                    <>
+                    <motion.div
+                      style={{ display: 'flex', alignItems: 'center', gap: '10px' }}
+                      initial={{ opacity: 0, scale: 0.9 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.9 }}
+                      transition={{ duration: 0.16 }}
+                    >
                       <div style={{ width: '1px', height: '18px', background: 'var(--border-color)' }} />
                       <button onClick={async () => { const toMark = displayEmails.filter(e => selectedCards.has(e.id || e.messageId) && !e.isRead); await Promise.all(toMark.map(e => markAsRead(e))); clearSelection(); }}
                         style={{ background: 'linear-gradient(135deg, #00d9ff, #8b5cf6)', color: 'white', border: 'none', borderRadius: '7px', padding: '6px 14px', fontSize: '0.82rem', fontWeight: '700', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', boxShadow: '0 4px 12px rgba(0,217,255,0.35)' }}>
                         ✉ Mark {selectedCards.size} as Read
                       </button>
                       <button onClick={clearSelection} style={{ background: 'transparent', border: '1px solid var(--border-color)', borderRadius: '7px', padding: '6px 12px', fontSize: '0.82rem', fontWeight: '600', cursor: 'pointer', color: 'var(--text-secondary)' }}>Clear</button>
-                    </>
+                    </motion.div>
                   )}
+                  </AnimatePresence>
                 </div>
 
                 {/* BACKGROUND ANALYSIS BANNER */}
@@ -1961,13 +1971,13 @@ function InboxView({
       )}
 
       {/* "VIEW MEMBERS" MODAL — team folders + VIP/LEGAL/PRIORITY category tabs */}
+      <AnimatePresence>
       {membersModal && (
-        <div className="modal-overlay" onClick={() => setMembersModal(null)}>
-          <div
-            className="modal-content members-modal"
-            onClick={(e) => e.stopPropagation()}
-            style={{ width: '480px', maxWidth: '90%', height: 'auto', maxHeight: '70vh' }}
-          >
+        <AnimatedModal
+          onOverlayClick={() => setMembersModal(null)}
+          contentClassName="modal-content members-modal"
+          contentStyle={{ width: '480px', maxWidth: '90%', height: 'auto', maxHeight: '70vh' }}
+        >
             <div className="modal-header">
               <h3><Users size={18} /> {membersModal.emoji} {membersModal.title} ({membersModal.members.length})</h3>
               <button className="btn-close" onClick={() => setMembersModal(null)}><X size={20} /></button>
@@ -2040,18 +2050,18 @@ function InboxView({
                 ))
               )}
             </div>
-          </div>
-        </div>
+        </AnimatedModal>
       )}
+      </AnimatePresence>
 
       {/* ADD/REMOVE CONFIRMATION — Y/N before any group-members API call commits */}
+      <AnimatePresence>
       {memberActionPending && (
-        <div className="modal-overlay" style={{ zIndex: 4000 }} onClick={() => !memberActionSubmitting && cancelMemberAction()}>
-          <div
-            className="modal-content"
-            onClick={(e) => e.stopPropagation()}
-            style={{ width: '380px', maxWidth: '90%', padding: '20px' }}
-          >
+        <AnimatedModal
+          overlayStyle={{ zIndex: 4000 }}
+          onOverlayClick={() => !memberActionSubmitting && cancelMemberAction()}
+          contentStyle={{ width: '380px', maxWidth: '90%', padding: '20px' }}
+        >
             <div style={{ fontSize: '0.95rem', fontWeight: '700', color: 'var(--text-primary)', marginBottom: '8px' }}>
               {memberActionPending.type === 'add' ? 'Add to folder?' : 'Remove from folder?'}
             </div>
@@ -2090,9 +2100,9 @@ function InboxView({
                 {memberActionSubmitting ? <><Loader size={12} className="animate-spin" /> Working...</> : 'Yes'}
               </button>
             </div>
-          </div>
-        </div>
+        </AnimatedModal>
       )}
+      </AnimatePresence>
 
       <ToastContainer toasts={toasts} removeToast={removeToast} />
     </div>

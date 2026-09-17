@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import EmailAutocomplete from "./EmailAutocomplete";
+import RichTextToolbar from "./RichTextToolbar";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
 
@@ -13,11 +14,48 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
   const [attachments, setAttachments] = useState([]);
   const [showCc, setShowCc] = useState(false);
   const [quotedBody, setQuotedBody] = useState("");
+  const [undoWindowSeconds, setUndoWindowSeconds] = useState(0);
+  const [pendingSend, setPendingSend] = useState(null); // { secondsLeft, intervalId, snapshot }
+  const [bodyTextLength, setBodyTextLength] = useState(0);
+  const bodyRef = useRef(null);
+
+  // ── Signatures (Admin > Signatures) ──────────────────────────────────────
+  // Reminder sends go out via reminders@hfmg.net (EWS impersonation), not
+  // the person's own name, so they never get a personal signature.
+  const [signatures, setSignatures] = useState([]);
+  const [defaultNewSignatureId, setDefaultNewSignatureId] = useState(null);
+  const [selectedSignatureId, setSelectedSignatureId] = useState(null);
+  const [signaturePickerOpen, setSignaturePickerOpen] = useState(false);
+
+  useEffect(() => {
+    const userEmail = localStorage.getItem("userEmail") || "";
+    if (!userEmail) return;
+    fetch(`${API_BASE}/send-settings?user_email=${encodeURIComponent(userEmail)}`)
+      .then(r => r.json())
+      .then(data => setUndoWindowSeconds(data.undoWindowSeconds || 0))
+      .catch(() => {});
+
+    if (useReminderSender) return;
+    fetch(`${API_BASE}/signatures?user_email=${encodeURIComponent(userEmail)}`)
+      .then(r => r.json())
+      .then(data => {
+        setSignatures(data.signatures || []);
+        setDefaultNewSignatureId(data.defaultNewId || null);
+        setSelectedSignatureId(data.defaultNewId || null);
+      })
+      .catch(() => {});
+  }, [useReminderSender]);
 
   const resetCompose = () => {
     setTo(prefillTo || ""); setCc(""); setSubject(prefillSubject || ""); setBody("");
     setQuotedBody(prefillQuotedBody || "");
-    setError(null); setAttachments([]); setShowCc(false);
+    setError(null); setAttachments([]); setShowCc(false); setBodyTextLength(0);
+    // contentEditable doesn't re-render from React state — has to be cleared imperatively.
+    if (bodyRef.current) bodyRef.current.innerHTML = "";
+    // Each new message starts from the "new messages" default again — a
+    // per-message switch from the picker never carries over to the next one.
+    setSelectedSignatureId(defaultNewSignatureId);
+    setSignaturePickerOpen(false);
   };
 
   // Open/close — full reset
@@ -39,30 +77,36 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
 
   if (!isOpen) return null;
 
-  const sendEmail = async () => {
+  // Takes a frozen snapshot of the compose fields rather than reading
+  // component state directly — if the undo window is still counting down
+  // when the modal gets closed and reopened for a different email, the
+  // queued send must still go out with what was ACTUALLY on screen when
+  // Send was clicked, never with whatever the modal now contains.
+  const performSend = async (snap) => {
     setSending(true);
     setError(null);
     try {
       const formData = new FormData();
-      to.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("to", em); });
-      cc.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("cc", em); });
-      formData.append("subject", subject);
-      // Combine user's reply body + quoted original below
-      const resolvedQuote = (quotedBody && quotedBody !== "loading") ? quotedBody : "";
+      snap.to.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("to", em); });
+      snap.cc.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("cc", em); });
+      formData.append("subject", snap.subject);
+      // Combine user's reply body + signature + quoted original below
+      const signatureSection = snap.signatureBody ? `<br/><br/>${snap.signatureBody}` : "";
+      const resolvedQuote = (snap.quotedBody && snap.quotedBody !== "loading") ? snap.quotedBody : "";
       const quotedSection = resolvedQuote
         ? `<br/><br/><hr style="border:none;border-top:1px solid #ccc;margin:16px 0"/>` +
           `<p style="color:#555;font-size:0.85em;margin:0 0 8px 0"><strong>--- Original Message ---</strong></p>` +
           `<div style="color:#333;font-size:0.9em">${resolvedQuote}</div>`
         : "";
-      formData.append("bodyHtml", body.replace(/\n/g, "<br/>") + quotedSection);
+      formData.append("bodyHtml", snap.body + signatureSection + quotedSection);
       // Only set fromEmail for regular sends — reminder endpoint uses
       // reminders@hfmg.net via EWS impersonation, no fromEmail needed
-      if (!useReminderSender) {
+      if (!snap.useReminderSender) {
         formData.append("fromEmail", localStorage.getItem("userEmail") || "");
       }
-      attachments.forEach(file => formData.append("attachments", file));
+      snap.attachments.forEach(file => formData.append("attachments", file));
 
-      const endpoint = useReminderSender ? "send-reminder" : "send-email";
+      const endpoint = snap.useReminderSender ? "send-reminder" : "send-email";
       const response = await fetch(`${API_BASE}/${endpoint}`, {
         method: "POST",
         body: formData
@@ -71,7 +115,7 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
       if (!response.ok) throw new Error(JSON.stringify(data));
       resetCompose();
       onClose();
-      if (typeof onSent === "function") onSent({ ok: true, subject });
+      if (typeof onSent === "function") onSent({ ok: true, subject: snap.subject });
     } catch (err) {
       const message = err.message || "Failed to send email";
       setError(message);
@@ -79,6 +123,29 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
     } finally {
       setSending(false);
     }
+  };
+
+  const handleSendClick = () => {
+    const signatureBody = signatures.find(s => s.id === selectedSignatureId)?.body || "";
+    const snapshot = { to, cc, subject, body, quotedBody, attachments, useReminderSender, signatureBody };
+    if (!undoWindowSeconds) { performSend(snapshot); return; }
+    const intervalId = setInterval(() => {
+      setPendingSend(prev => {
+        if (!prev) { clearInterval(intervalId); return prev; }
+        if (prev.secondsLeft <= 1) {
+          clearInterval(intervalId);
+          performSend(prev.snapshot);
+          return null;
+        }
+        return { ...prev, secondsLeft: prev.secondsLeft - 1 };
+      });
+    }, 1000);
+    setPendingSend({ secondsLeft: undoWindowSeconds, intervalId, snapshot });
+  };
+
+  const cancelPendingSend = () => {
+    if (pendingSend?.intervalId) clearInterval(pendingSend.intervalId);
+    setPendingSend(null);
   };
 
   return (
@@ -94,7 +161,7 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
               <div style={s.headerSub}>Compose &amp; Send</div>
             </div>
           </div>
-          <button onClick={() => { resetCompose(); onClose(); }} style={s.closeBtn}>✕</button>
+          <button onClick={() => { if (pendingSend) return; resetCompose(); onClose(); }} style={s.closeBtn}>✕</button>
         </div>
 
         {/* FIELDS */}
@@ -136,14 +203,19 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
         </div>
 
         {/* BODY */}
+        <style>{`.compose-body-editable:empty:before { content: attr(data-placeholder); color: var(--text-secondary); opacity: 0.6; pointer-events: none; }`}</style>
         <div style={s.bodyWrapper}>
-          <textarea
-            value={body}
-            onChange={e => setBody(e.target.value)}
-            placeholder="Write your message here..."
+          <RichTextToolbar targetRef={bodyRef} />
+          <div
+            ref={bodyRef}
+            className="compose-body-editable"
+            contentEditable
+            suppressContentEditableWarning
+            data-placeholder="Write your message here..."
+            onInput={e => { setBody(e.currentTarget.innerHTML); setBodyTextLength(e.currentTarget.innerText.length); }}
             style={s.textarea}
           />
-          <span style={s.charCount}>{body.length} chars</span>
+          <span style={s.charCount}>{bodyTextLength} chars</span>
         </div>
 
         {/* QUOTED ORIGINAL EMAIL */}
@@ -203,24 +275,59 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
 
         {/* FOOTER */}
         <div style={s.footer}>
-          <div style={{ display: 'flex', gap: '10px' }}>
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', position: 'relative' }}>
             <input type="file" multiple onChange={handleAttachmentSelect} style={{ display: "none" }} id="attach-input" />
             <label htmlFor="attach-input" style={s.attachBtn}>
               📎 Attach
               {attachments.length > 0 && <span style={s.attachBadge}>{attachments.length}</span>}
             </label>
+
+            {signatures.length > 0 && (
+              <>
+                <button type="button" onClick={() => setSignaturePickerOpen(o => !o)} style={s.attachBtn} title="Signature">
+                  ✍ {signatures.find(sig => sig.id === selectedSignatureId)?.name || 'None'}
+                </button>
+                {signaturePickerOpen && (
+                  <div style={s.signaturePicker}>
+                    <button
+                      type="button"
+                      onClick={() => { setSelectedSignatureId(null); setSignaturePickerOpen(false); }}
+                      style={s.signaturePickerItem}
+                    >
+                      None
+                    </button>
+                    {signatures.map(sig => (
+                      <button
+                        type="button"
+                        key={sig.id}
+                        onClick={() => { setSelectedSignatureId(sig.id); setSignaturePickerOpen(false); }}
+                        style={s.signaturePickerItem}
+                      >
+                        {sig.name}{sig.isDefault ? ' (default)' : ''}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
           </div>
           <div style={{ display: 'flex', gap: '10px' }}>
-            <button onClick={() => { resetCompose(); onClose(); }} disabled={sending} style={s.cancelBtn}>
+            <button onClick={() => { resetCompose(); onClose(); }} disabled={sending || !!pendingSend} style={s.cancelBtn}>
               Discard
             </button>
-            <button
-              onClick={sendEmail}
-              disabled={sending || !to || !subject}
-              style={{ ...s.sendBtn, opacity: (sending || !to || !subject) ? 0.5 : 1, cursor: (sending || !to || !subject) ? 'not-allowed' : 'pointer' }}
-            >
-              {sending ? '⏳ Sending...' : '➤ Send'}
-            </button>
+            {pendingSend ? (
+              <button onClick={cancelPendingSend} style={{ ...s.sendBtn, background: '#9ca3af', boxShadow: 'none' }}>
+                Sending in {pendingSend.secondsLeft}s · Undo
+              </button>
+            ) : (
+              <button
+                onClick={handleSendClick}
+                disabled={sending || !to || !subject}
+                style={{ ...s.sendBtn, opacity: (sending || !to || !subject) ? 0.5 : 1, cursor: (sending || !to || !subject) ? 'not-allowed' : 'pointer' }}
+              >
+                {sending ? '⏳ Sending...' : '➤ Send'}
+              </button>
+            )}
           </div>
         </div>
 
@@ -299,7 +406,7 @@ const s = {
     background: "var(--bg-main)", color: "var(--text-primary)",
     fontSize: "0.95rem", lineHeight: "1.75",
     padding: "20px 24px", fontFamily: "inherit", height: "100%",
-    boxSizing: "border-box"
+    boxSizing: "border-box", overflowY: "auto"
   },
   charCount: {
     position: "absolute", bottom: "8px", right: "14px",
@@ -351,6 +458,19 @@ const s = {
     background: "#2563eb", color: "white",
     fontSize: "0.65rem", fontWeight: "800",
     borderRadius: "999px", padding: "1px 6px", lineHeight: "1.4"
+  },
+  signaturePicker: {
+    position: "absolute", bottom: "calc(100% + 8px)", left: 0,
+    background: "var(--bg-card)", border: "1px solid var(--border-color)",
+    borderRadius: "8px", padding: "6px", minWidth: "170px",
+    boxShadow: "0 12px 28px rgba(0,0,0,0.35)", zIndex: 10,
+    display: "flex", flexDirection: "column", gap: "2px",
+  },
+  signaturePickerItem: {
+    display: "block", width: "100%", textAlign: "left",
+    padding: "7px 10px", borderRadius: "6px", border: "none",
+    background: "transparent", color: "var(--text-primary)",
+    fontSize: "0.82rem", cursor: "pointer",
   },
   cancelBtn: {
     padding: "8px 16px", borderRadius: "8px",

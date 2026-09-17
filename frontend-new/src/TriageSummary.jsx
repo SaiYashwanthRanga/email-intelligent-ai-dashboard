@@ -29,7 +29,7 @@ const FILE_ICONS = {
 const emojiStyleMain = { fontSize: "1.4rem", marginRight: "6px", verticalAlign: "middle" };
 const emojiStyleSub = { fontSize: "1.2rem", marginRight: "5px", verticalAlign: "middle" };
 
-const TriageSummary = ({ stats, emails, report, threadCount, onAttachmentClick, onThreadsClick, onEmailsClick, onInvitesClick }) => {
+const TriageSummary = ({ stats, emails, report, threadCount, onAttachmentClick, onThreadsClick, onEmailsClick, onInvitesClick, waitingOnCount = 0, waitingOnNames = [], onWaitingClick }) => {
   if (!stats) return null;
 
   const {
@@ -152,6 +152,18 @@ const TriageSummary = ({ stats, emails, report, threadCount, onAttachmentClick, 
           <span>
             <span style={emojiStyleSub}>👥</span> CC <strong><CountUp end={cc} /></strong>
           </span>
+          {waitingOnCount > 0 && (
+            <>
+              <span className="triage-sub-sep">|</span>
+              <span
+                onClick={onWaitingClick}
+                title={`Waiting on: ${waitingOnNames.join(', ')}`}
+                style={onWaitingClick ? { cursor: 'pointer' } : {}}
+              >
+                <span style={emojiStyleSub}>⏳</span> WAITING <strong><CountUp end={waitingOnCount} /></strong>
+              </span>
+            </>
+          )}
         </div>
       </div>
     </div>

@@ -2082,3 +2082,32 @@ body.light-mode .brief-modal {
 body.light-mode .brief-header {
   background: rgba(255, 255, 255, 0.5) !important;
 }
+/* ── Shared app header above the calendar ───────────────────────────────────
+   .cal-root is a full-viewport flex ROW (sidebar + main). The shared header
+   has to sit above that row, so the page becomes a column wrapper and the
+   calendar gives up its own 100dvh to fill what is left. .top-bar carries
+   negative side margins to bleed past .main-content's padding, which does not
+   exist here — they are zeroed so the bar does not hang off both edges. */
+.cal-page {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  width: 100vw;
+  overflow: hidden;
+  background-color: #020617;
+}
+
+.cal-page > .top-bar {
+  flex: 0 0 auto;
+  margin-left: 0;
+  margin-right: 0;
+  margin-bottom: 0;
+  padding: 0 24px;
+}
+
+.cal-page > .cal-root {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  width: 100%;
+}

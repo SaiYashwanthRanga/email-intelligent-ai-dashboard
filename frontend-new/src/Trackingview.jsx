@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { ArrowLeft, Eye, X, Download, Paperclip, Loader, Zap } from 'lucide-react';
+import { AnimatePresence } from 'framer-motion';
+import AnimatedModal from './AnimatedModal';
+import { Eye, X, Download, Paperclip, Loader, Zap, Radar, Inbox, ClipboardCheck, Bot,
+         Filter, CheckCircle2, AlertTriangle } from 'lucide-react';
+import AppHeader from './AppHeader';
 import ToastContainer from './Toast';
 import ComposeMailModal from './ComposeMailModal';
 import { HtmlEmailRenderer } from './InboxView';
@@ -24,17 +27,25 @@ function getMilestones(info, sentAt, businessDays) {
   //   Scheduled → scheduler will fire this automatically on next run
   //   After Day 1 → Day-3 is waiting for Day-1 to be confirmed first
   //   N/A       → external recipients never get auto-reminders
+  // Someone who already replied (or was handled offline) is never getting a
+  // reminder, so "Scheduled" on their row was a standing promise to chase a
+  // person who had answered days ago. Sent reminders still show their date —
+  // that's history, and it happened.
+  const settled = !!info.replied || !!info.dismissed;
+
   const r1Sub = () => {
     if (info.reminder1_sent) return fmtDate(info.reminder1_sentAt);
+    if (settled)             return 'Not needed';
     if (isExternal)          return 'N/A';
     if (businessDays >= 1)   return 'Scheduled';
     return 'Waiting';
   };
   const r2Sub = () => {
-    if (info.reminder2_sent)                    return fmtDate(info.reminder2_sentAt);
-    if (isExternal)                             return 'N/A';
+    if (info.reminder2_sent)                      return fmtDate(info.reminder2_sentAt);
+    if (settled)                                  return 'Not needed';
+    if (isExternal)                               return 'N/A';
     if (info.reminder1_sent && businessDays >= 3) return 'Scheduled';
-    if (!info.reminder1_sent)                   return 'After Day 1';
+    if (!info.reminder1_sent)                     return 'After Day 1';
     return 'Waiting';
   };
 
@@ -234,7 +245,9 @@ function TrackingCard({ item, onFollowUp, onDismiss, defaultCollapsed, onViewEma
   const recipients = item.recipients   || {};
   const recList    = Object.entries(recipients);
 
-  const allDone = recList.every(([, i]) => i.replied || i.dismissed);
+  // every() on an empty list is true, so an item that somehow has no
+  // recipients would otherwise claim "✓ All replied" over a 0/0 bar.
+  const allDone = recList.length > 0 && recList.every(([, i]) => i.replied || i.dismissed);
   const pending = recList.filter(([, i]) => !i.replied && !i.dismissed).length;
   const overdue = !allDone && bdays >= 5;
 
@@ -371,24 +384,31 @@ function TrackingCard({ item, onFollowUp, onDismiss, defaultCollapsed, onViewEma
 // ── MAIN PAGE ─────────────────────────────────────────────────────────────────
 
 export default function TrackingView() {
-  const navigate  = useNavigate();
   const userEmail = localStorage.getItem('userEmail') || '';
 
   const [trackingData,    setTrackingData]    = useState(null);
   const [loading,         setLoading]         = useState(true);
   const [syncing,         setSyncing]         = useState(false);
-  const [syncPhase,       setSyncPhase]       = useState(null);
-  const [syncStep,        setSyncStep]        = useState(0);
+  // The scan's own progress record, straight from /tracking/sync-status.
+  const [syncProgress,    setSyncProgress]    = useState(null);
 
   // Hoisted so both the Sent tab cards and the modal footer can access it
   const trackedIds = new Set((trackingData?.tracked || []).map(t => t.messageId));
-  const SYNC_PHASES = [
-    { icon: '📬', msg: 'Fetching your sent emails...',          color: '#00d9ff' },
-    { icon: '🤖', msg: 'AI is reading each email...',           color: '#a855f7' },
-    { icon: '🔍', msg: 'Evaluating who needs a follow-up...',  color: '#f59e0b' },
-    { icon: '✨', msg: 'Filtering out low-priority emails...',  color: '#10b981' },
-    { icon: '⚡', msg: 'Almost there...',                        color: '#00d9ff' },
-  ];
+  // These used to be five canned messages on a five-second timer, unconnected
+  // to the scan — so a slow scan showed "Almost there..." for a minute while a
+  // fast one flashed phases it had already finished. The backend now reports
+  // where it actually is; this only maps that to an icon and a colour.
+  const SYNC_PHASE_META = {
+    queued:          { Icon: Loader,        color: '#00d9ff' },
+    starting:        { Icon: Loader,        color: '#00d9ff' },
+    fetching_sent:   { Icon: Inbox,         color: '#00d9ff' },
+    sorting:         { Icon: Filter,        color: '#f59e0b' },
+    reading_threads: { Icon: Bot,           color: '#a855f7' },
+    done:            { Icon: CheckCircle2,  color: '#22c55e' },
+    error:           { Icon: AlertTriangle, color: '#ef4444' },
+  };
+  // Ordered for the step dots; 'queued'/'starting' collapse into the first.
+  const SYNC_PHASE_ORDER = ['fetching_sent', 'sorting', 'reading_threads', 'done'];
 
   const [followUpCompose, setFollowUpCompose] = useState(null);
   const [emailModal,      setEmailModal]      = useState(null);
@@ -396,14 +416,9 @@ export default function TrackingView() {
   const [activeTab,       setActiveTab]       = useState('sent');
   const [skippedData,     setSkippedData]     = useState([]);
   const [skippedLoading,  setSkippedLoading]  = useState(false);
-  const [pendingData,          setPendingData]          = useState([]);
-  const [pendingLoading,       setPendingLoading]       = useState(false);
   const [trackingApprovals,    setTrackingApprovals]    = useState([]);
   const [approvalsLoading,     setApprovalsLoading]     = useState(false);
   const [approvalActioning,    setApprovalActioning]    = useState({});
-  const [editedBodies,    setEditedBodies]    = useState({});
-  const [actioning,       setActioning]       = useState({});
-  const [expandedBodies,  setExpandedBodies]  = useState(new Set());
   const [restoring,       setRestoring]       = useState({});
   const [sentEmails,      setSentEmails]      = useState([]);
   const [sentLoading,     setSentLoading]     = useState(false);
@@ -416,16 +431,22 @@ export default function TrackingView() {
   const [analyzingThread, setAnalyzingThread] = useState({});   // messageId → bool
   const [toasts,          setToasts]          = useState([]);
 
-  // Smart toast — deduplicates, bumps count, caps at 3 visible
+  // Smart toast — deduplicates, bumps count, caps at 3 visible.
+  // Ids come from a counter, not Date.now(): two toasts raised in the same
+  // millisecond got identical ids, which collides React keys and makes
+  // removeToast dismiss both at once.
+  const toastSeq = useRef(0);
+  const nextToastId = () => (toastSeq.current += 1);
+
   const addToast = (message, type = 'info') => {
     setToasts(prev => {
       const existing = prev.find(t => t.message === message && t.type === type);
       if (existing) {
         return prev.map(t =>
-          t.id === existing.id ? { ...t, id: Date.now(), count: (t.count || 1) + 1 } : t
+          t.id === existing.id ? { ...t, id: nextToastId(), count: (t.count || 1) + 1 } : t
         );
       }
-      const newToast = { id: Date.now(), message, type, count: 1 };
+      const newToast = { id: nextToastId(), message, type, count: 1 };
       const trimmed = prev.length >= 3 ? prev.slice(-2) : prev;
       return [...trimmed, newToast];
     });
@@ -442,12 +463,6 @@ export default function TrackingView() {
       syncIntervalsRef.current = [];
     };
   }, []);
-
-  const toggleBody = (id) => setExpandedBodies(prev => {
-    const next = new Set(prev);
-    next.has(id) ? next.delete(id) : next.add(id);
-    return next;
-  });
 
   const restoreToTracking = async (messageId) => {
     setRestoring(r => ({ ...r, [messageId]: true }));
@@ -499,106 +514,105 @@ export default function TrackingView() {
     // Helper — drops the call silently if the component unmounted mid-sync
     const safeSet = (fn) => { if (mountedRef.current) fn(); };
 
-    safeSet(() => { setSyncing(true); setSyncStep(0); setSyncPhase(SYNC_PHASES[0]); });
+    safeSet(() => {
+      setSyncing(true);
+      setSyncProgress({
+        state: 'running', phase: 'queued', label: 'Starting sync',
+        detail: '', done: 0, total: 0, queued: 0, skipped: 0,
+      });
+    });
 
-    // ── Phase animation — cycles every 5s ──────────────────────────────
-    let step = 0;
-    const phaseInterval = setInterval(() => {
-      step = Math.min(step + 1, SYNC_PHASES.length - 1);
-      safeSet(() => { setSyncStep(step); setSyncPhase(SYNC_PHASES[step]); });
-    }, 5000);
-
-    // ── Progressive poll — fetches tracking + skipped every 3s so cards
-    //    appear one by one as the backend AI processes each email.
-    //    The backend now saves to disk after every individual decision,
-    //    so each poll returns the latest state incrementally. ──────────
-    const pollInterval = setInterval(async () => {
-      if (!mountedRef.current) return;
+    const refreshLists = async () => {
       try {
         await fetchTrackingInner();
         await fetchPending();
-        // Always poll skipped during sync — user sees AI decisions live
         await fetchSkipped();
-      } catch (_) {}
-    }, 3000);
-
-    // Register both intervals so the unmount cleanup can cancel them
-    syncIntervalsRef.current = [phaseInterval, pollInterval];
+      } catch (_) { /* transient — the next poll retries */ }
+    };
 
     try {
-      // Fire sync — backend returns immediately, runs AI in background
+      // Backend returns immediately and runs the scan as a background task.
       await fetch(`${API_BASE}/tracking/sync`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_email: userEmail }),
       });
 
-      // Wait for background task to complete — poll detects completion
-      // by watching lastUpdated stabilise (no new changes for 2 polls).
-      // We cap at 90s to avoid hanging forever on large inboxes.
-      await new Promise((resolve) => {
-        let lastUpdated = null;
-        let stableCount = 0;
-        const MAX_WAIT = 90;   // seconds
-        const POLL_MS  = 3000; // must match pollInterval above
-        let elapsed    = 0;
+      // Follow the scan's own progress record. Completion used to be guessed
+      // by watching /tracking's lastUpdated go quiet for six seconds, which a
+      // thread-reading scan trips over constantly — a single conversation can
+      // take longer than that, so the page declared victory mid-scan.
+      const finalState = await new Promise((resolve) => {
+        const POLL_MS    = 1000;
+        const STALL_MS   = 90000;   // no movement at all → assume it died
+        let   lastStamp  = null;
+        let   stalledFor = 0;
+        let   tick       = 0;
 
-        const completionCheck = setInterval(async () => {
-          // Component unmounted — stop waiting immediately
-          if (!mountedRef.current) { clearInterval(completionCheck); resolve(); return; }
-          elapsed += POLL_MS / 1000;
+        const poll = setInterval(async () => {
+          if (!mountedRef.current) { clearInterval(poll); resolve(null); return; }
           try {
-            const res  = await fetch(`${API_BASE}/tracking?user_email=${encodeURIComponent(userEmail)}`);
+            const res = await fetch(
+              `${API_BASE}/tracking/sync-status?user_email=${encodeURIComponent(userEmail)}`
+            );
             if (res.ok) {
-              const data = await res.json();
-              if (data.lastUpdated === lastUpdated) {
-                stableCount++;
-              } else {
-                lastUpdated = data.lastUpdated;
-                stableCount = 0;
+              const p = await res.json();
+              safeSet(() => setSyncProgress(p));
+
+              // Let cards land while the scan is still going.
+              if (++tick % 3 === 0) await refreshLists();
+
+              if (p.state === 'done' || p.state === 'error') {
+                clearInterval(poll);
+                resolve(p);
+                return;
               }
-              // Stable for 2 consecutive polls (6s) → background task done
-              if (stableCount >= 2 || elapsed >= MAX_WAIT) {
-                clearInterval(completionCheck);
-                resolve();
-              }
+              stalledFor = p.updatedAt === lastStamp ? stalledFor + POLL_MS : 0;
+              lastStamp  = p.updatedAt;
+            } else {
+              stalledFor += POLL_MS;
             }
           } catch (_) {
-            if (elapsed >= MAX_WAIT) { clearInterval(completionCheck); resolve(); }
+            stalledFor += POLL_MS;
           }
+          if (stalledFor >= STALL_MS) { clearInterval(poll); resolve(null); }
         }, POLL_MS);
 
-        // Track completionCheck so unmount can cancel it too
-        syncIntervalsRef.current = [...syncIntervalsRef.current, completionCheck];
+        syncIntervalsRef.current = [...syncIntervalsRef.current, poll];
       });
 
-      clearInterval(phaseInterval);
-      clearInterval(pollInterval);
       syncIntervalsRef.current = [];
-
       if (!mountedRef.current) return;
 
-      // Final refresh — guaranteed fresh state
-      safeSet(() => {
-        setSyncStep(SYNC_PHASES.length);
-        setSyncPhase({ icon: '✅', msg: 'Sync complete! Updating your list...', color: '#22c55e' });
-      });
-      addToast('✅ Tracking sync complete!', 'success');
-      await fetchTrackingInner();
-      await fetchPending();
-      await fetchSkipped();
+      await refreshLists();
 
-      setTimeout(() => { safeSet(() => { setSyncPhase(null); setSyncing(false); }); }, 1500);
+      if (finalState && finalState.state === 'error') {
+        addToast(`Sync failed: ${finalState.detail || 'unknown error'}`, 'error');
+      } else if (finalState) {
+        const found = finalState.queued || 0;
+        addToast(
+          found > 0
+            ? `Sync complete — ${found} email${found === 1 ? '' : 's'} need review`
+            : 'Sync complete — nothing new to follow up',
+          'success'
+        );
+      } else {
+        // Stalled or unmounted: say so rather than claiming success.
+        addToast('Sync is taking longer than expected — still running in the background.', 'info');
+      }
+
+      setTimeout(() => { safeSet(() => { setSyncProgress(null); setSyncing(false); }); }, 1800);
 
     } catch (e) {
-      clearInterval(phaseInterval);
-      clearInterval(pollInterval);
       syncIntervalsRef.current = [];
       if (!mountedRef.current) return;
       console.error('syncNow error:', e);
-      safeSet(() => setSyncPhase({ icon: '⚠️', msg: 'Sync failed. Please try again.', color: '#ef4444' }));
+      safeSet(() => setSyncProgress({
+        state: 'error', phase: 'error', label: 'Sync failed',
+        detail: 'Could not reach the server.', done: 0, total: 0, queued: 0, skipped: 0,
+      }));
       addToast('Sync failed. Please try again.', 'error');
-      setTimeout(() => { safeSet(() => { setSyncPhase(null); setSyncing(false); }); }, 2500);
+      setTimeout(() => { safeSet(() => { setSyncProgress(null); setSyncing(false); }); }, 2500);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userEmail, syncing, activeTab]);
@@ -662,30 +676,20 @@ export default function TrackingView() {
     finally { setSkippedLoading(false); }
   }, [userEmail]);
 
+  // Only AI tracking decisions now. The reminder-draft queue this also used to
+  // fetch was retired when Day-1/Day-3 reminders moved to auto-send — nothing
+  // has written pending_reminders since, so it could only ever return [].
   const fetchPending = useCallback(async () => {
     if (!userEmail) return;
-    setPendingLoading(true);
     setApprovalsLoading(true);
     try {
-      // Fetch reminder drafts and tracking approvals in parallel
-      const [remindersRes, approvalsRes] = await Promise.all([
-        fetch(`${API_BASE}/tracking/pending?user_email=${encodeURIComponent(userEmail)}`),
-        fetch(`${API_BASE}/tracking/pending-tracking?user_email=${encodeURIComponent(userEmail)}`),
-      ]);
-      if (remindersRes.ok) {
-        const data  = await remindersRes.json();
-        const items = data.pending || [];
-        setPendingData(items);
-        const bodies = {};
-        items.forEach(r => { bodies[r.id] = r.draftBody; });
-        setEditedBodies(bodies);
-      }
-      if (approvalsRes.ok) {
-        const data = await approvalsRes.json();
+      const res = await fetch(`${API_BASE}/tracking/pending-tracking?user_email=${encodeURIComponent(userEmail)}`);
+      if (res.ok) {
+        const data = await res.json();
         setTrackingApprovals(data.approvals || []);
       }
     } catch (e) { console.error('fetchPending error:', e); }
-    finally { setPendingLoading(false); setApprovalsLoading(false); }
+    finally { setApprovalsLoading(false); }
   }, [userEmail]);
 
   useEffect(() => {
@@ -861,49 +865,6 @@ export default function TrackingView() {
     finally { setApprovalActioning(a => ({ ...a, [approvalId]: null })); }
   };
 
-  const approvePending = async (reminderId) => {
-    setActioning(a => ({ ...a, [reminderId]: 'approving' }));
-    addToast('Sending reminder...', 'loading');
-    try {
-      const reminderObj = pendingData.find(r => r.id === reminderId) || {};
-      const fd = new FormData();
-      fd.append('user_email', userEmail);
-      fd.append('reminder_id', reminderId);
-      fd.append('body', editedBodies[reminderId] ?? reminderObj.draftBody ?? '');
-      const res = await fetch(`${API_BASE}/tracking/pending/approve`, { method: 'POST', body: fd });
-      if (res.ok) {
-        setPendingData(p => p.filter(r => r.id !== reminderId));
-        addToast('✉️ Reminder sent!', 'success');
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        addToast(`Failed to send reminder: ${errData.detail || res.statusText}`, 'error');
-      }
-    } catch (e) {
-      console.error('approvePending error:', e);
-      addToast('Network error — reminder not sent.', 'error');
-    }
-    finally { setActioning(a => ({ ...a, [reminderId]: null })); }
-  };
-
-  const dismissPending = async (reminderId) => {
-    setActioning(a => ({ ...a, [reminderId]: 'dismissing' }));
-    try {
-      const fd = new FormData();
-      fd.append('user_email', userEmail);
-      fd.append('reminder_id', reminderId);
-      const res = await fetch(`${API_BASE}/tracking/pending/dismiss`, { method: 'POST', body: fd });
-      if (res.ok) {
-        setPendingData(p => p.filter(r => r.id !== reminderId));
-        addToast('Reminder dismissed.', 'info');
-      } else {
-        addToast('Failed to dismiss reminder.', 'error');
-      }
-    } catch (e) {
-      console.error('dismissPending error:', e);
-      addToast('Network error — could not dismiss.', 'error');
-    }
-    finally { setActioning(a => ({ ...a, [reminderId]: null })); }
-  };
 
   const dismissRecipient = async (messageId, recipientEmail) => {
     try {
@@ -944,29 +905,24 @@ export default function TrackingView() {
   const allItems = (() => {
     if (!trackingData) return [];
 
-    // Build a set of every messageId already bucketed by get_tracking_summary
-    const bucketedIds = new Set([
-      ...(trackingData.awaiting       || []),
-      ...(trackingData.reminders_sent || []),
-      ...(trackingData.resolved       || []),
-    ].map(i => i.messageId));
-
-    // Items in tracked[] not yet bucketed (e.g. just added via add_manual_tracking
-    // before the next background sync has run get_tracking_summary).
-    // Show them immediately so the user sees their email right after clicking Track.
-    const unbucketed = (trackingData.tracked || [])
-      .filter(i => !bucketedIds.has(i.messageId) && !isFollowUp(i));
-
-    const active = [
-      ...[...(trackingData.awaiting || []), ...(trackingData.reminders_sent || [])].filter(i => !isFollowUp(i)),
-      ...unbucketed,
-    ];
+    // No "unbucketed" pass any more. It existed to catch tracked emails the
+    // backend hadn't bucketed yet, but get_tracking_summary buckets every
+    // tracked item on every call, so it never matched anything real — and
+    // once `tracked` started arriving it would have matched the resolved
+    // items trimmed off by the backend's 20-item cap and rendered them as
+    // active, with no recipients, reading "✓ All replied · 0/0".
+    const active = [...(trackingData.awaiting || []), ...(trackingData.reminders_sent || [])]
+      .filter(i => !isFollowUp(i));
     const resolved = (trackingData.resolved || []).filter(i => !isFollowUp(i));
     return [
       ...active.sort(sortByDateDesc),
       ...resolved.sort(sortByDateDesc),
     ];
   })();
+
+  // What the Needs Review tab actually holds: AI tracking decisions awaiting
+  // your approval.
+  const needsReviewTotal = trackingApprovals.length;
 
   const resolvedIds  = new Set((trackingData?.resolved || []).map(i => i.messageId));
   const pendingTotal = allItems.filter(i => !resolvedIds.has(i.messageId) &&
@@ -1008,84 +964,71 @@ export default function TrackingView() {
       <main className="main-content">
 
         {/* ── TOP BAR — matches dashboard exactly ────────────────────── */}
-        <header className="top-bar">
-          <div className="top-left">
-            {/* Same HFMG logo as dashboard */}
-            <div className="brand" style={{ marginRight: '8px' }}>
-              <img
-                src="https://cdn.prod.website-files.com/65943a67d00c014c2d920492/65943bb45991d7c7423aada3_logo.webp"
-                alt="Horizon Family Medical Group"
-                style={{ height: '36px', width: 'auto', objectFit: 'contain', filter: 'brightness(1.05)', display: 'block' }}
-              />
-            </div>
-
-            {/* Back button — same style as menu-btn */}
+        <AppHeader
+          active="TRACKING"
+          canUseTracking
+          titleIcon={<Radar size={17} style={{ color: '#00d9ff' }} />}
+          title={
+            <>
+              Follow-Up Tracker
+              {pendingTotal > 0 && (
+                <span style={{
+                  background: 'rgba(239,68,68,0.15)', color: '#f87171',
+                  border: '1px solid rgba(239,68,68,0.3)',
+                  borderRadius: '999px', padding: '2px 8px',
+                  fontSize: '0.65rem', fontWeight: '800',
+                }}>
+                  {pendingTotal} pending
+                </span>
+              )}
+            </>
+          }
+          subtitle={
+            <>
+              {allItems.length} tracked email{allItems.length !== 1 ? 's' : ''}
+              {trackingData?.lastUpdated && (
+                <> · Updated {new Date(trackingData.lastUpdated).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}</>
+              )}
+            </>
+          }
+          actions={
             <button
-              onClick={() => navigate('/')}
-              className="menu-btn"
-              style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.82rem', fontWeight: '600' }}
+              onClick={syncNow}
+              disabled={syncing}
+              className="btn-gradient"
+              style={{
+                width: 'auto', padding: '9px 20px', marginRight: '15px',
+                display: 'flex', alignItems: 'center', gap: '7px',
+                fontSize: '0.84rem', fontWeight: '700',
+                opacity: syncing ? 0.65 : 1,
+                cursor: syncing ? 'not-allowed' : 'pointer',
+              }}
             >
-              <ArrowLeft size={15} /> Dashboard
+              {syncing
+                ? <><Loader size={15} className="animate-spin" /> Syncing…</>
+                : <><Zap size={15} /> Sync Now</>
+              }
             </button>
-
-            {/* Page title block */}
-            <div>
-              <div style={{ fontSize: '1rem', fontWeight: '800', letterSpacing: '-0.3px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                📡 Email Follow-Up Tracker
-                {pendingTotal > 0 && (
-                  <span style={{
-                    background: 'rgba(239,68,68,0.15)', color: '#f87171',
-                    border: '1px solid rgba(239,68,68,0.3)',
-                    borderRadius: '999px', padding: '2px 8px',
-                    fontSize: '0.65rem', fontWeight: '800',
-                  }}>
-                    {pendingTotal} pending
-                  </span>
-                )}
-              </div>
-              <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                {allItems.length} tracked email{allItems.length !== 1 ? 's' : ''}
-                {trackingData?.lastUpdated && (
-                  <> · Updated {new Date(trackingData.lastUpdated).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}</>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Sync button — same gradient style as action buttons in dashboard */}
-          <button
-            onClick={syncNow}
-            disabled={syncing}
-            className="btn-gradient"
-            style={{
-              width: 'auto', padding: '9px 20px',
-              display: 'flex', alignItems: 'center', gap: '7px',
-              fontSize: '0.84rem', fontWeight: '700',
-              opacity: syncing ? 0.65 : 1,
-              cursor: syncing ? 'not-allowed' : 'pointer',
-            }}
-          >
-            {syncing
-              ? <><span style={{ animation: 'pulse 1.2s ease-in-out infinite', display: 'inline-block' }}>{syncPhase?.icon || '🔄'}</span> AI Analysing...</>
-              : <><Zap size={15} /> Sync Now</>
-            }
-          </button>
-        </header>
+          }
+        />
 
         {/* ── TAB BAR — matches inbox tabs-container ──────────────────── */}
         <div className="tabs-container" style={{ marginBottom: '4px' }}>
           {[
-            { id: 'sent',     emoji: '📤', label: 'Sent Items',          count: sentEmails.length > 0 ? sentEmails.length : null },
-            { id: 'pending',  emoji: '⏳', label: 'Needs Review',         count: trackingApprovals.length > 0 ? trackingApprovals.length : null },
-            { id: 'tracking', emoji: '📡', label: 'Active Tracking',      count: pendingTotal > 0 ? pendingTotal : null },
-            { id: 'skipped',  emoji: '🤖', label: 'AI Skipped',           count: skippedData.length > 0 ? skippedData.length : null },
+            { id: 'sent',     Icon: Inbox,          label: 'Sent Items',      count: sentEmails.length > 0 ? sentEmails.length : null },
+            // Both lists render inside this tab, so the badge has to count
+            // both. Counting only the approvals meant a tab holding three
+            // reminder drafts and no approvals showed no badge at all.
+            { id: 'pending',  Icon: ClipboardCheck, label: 'Needs Review',    count: needsReviewTotal > 0 ? needsReviewTotal : null },
+            { id: 'tracking', Icon: Radar,          label: 'Active Tracking', count: pendingTotal > 0 ? pendingTotal : null },
+            { id: 'skipped',  Icon: Bot,            label: 'AI Skipped',      count: skippedData.length > 0 ? skippedData.length : null },
           ].map(tab => (
             <button
               key={tab.id}
               className={`tab-btn ${activeTab === tab.id ? 'active' : ''}`}
               onClick={() => setActiveTab(tab.id)}
             >
-              {tab.emoji} {tab.label}
+              <tab.Icon size={15} style={{ verticalAlign: '-2px', marginRight: '6px' }} />{tab.label}
               {tab.count != null && (
                 <span className={`count-badge ${activeTab === tab.id ? 'active' : ''}`}
                   style={tab.id === 'tracking' && pendingTotal > 0 ? { background: '#ef4444', color: 'white', border: 'none' } : {}}>
@@ -1126,67 +1069,106 @@ export default function TrackingView() {
         </div>
 
         {/* ── SYNC PROGRESS BANNER — compact strip, cards visible below ── */}
-        {syncing && syncPhase && (
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '14px',
-            padding: '14px 20px', marginBottom: '20px', borderRadius: '12px',
-            background: `${syncPhase.color}0d`,
-            border: `1px solid ${syncPhase.color}30`,
-            animation: 'fadeSlideUp 0.3s cubic-bezier(0.2,0,0,1) both',
-          }}>
-            {/* Pulsing icon */}
-            <div style={{
-              width: '40px', height: '40px', borderRadius: '10px', flexShrink: 0,
-              background: `${syncPhase.color}15`, border: `1px solid ${syncPhase.color}30`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: '1.2rem', animation: 'trackPulse 1.2s ease-in-out infinite',
-            }}>
-              {syncPhase.icon}
-            </div>
+        {syncing && syncProgress && (() => {
+          const meta  = SYNC_PHASE_META[syncProgress.phase] || SYNC_PHASE_META.starting;
+          const Icon  = meta.Icon;
+          const color = meta.color;
+          const total = syncProgress.total || 0;
+          const done  = syncProgress.done  || 0;
 
-            {/* Message + progress bar */}
-            <div style={{ flex: 1, minWidth: 0 }}>
+          // Real fraction once there are threads to count; before that the bar
+          // reflects which phase we are in, so it never sits still lying.
+          const phaseIdx = SYNC_PHASE_ORDER.indexOf(syncProgress.phase);
+          const pct = syncProgress.state === 'done'
+            ? 100
+            : total > 0
+              ? Math.round((done / total) * 100)
+              : Math.max(6, ((phaseIdx < 0 ? 0 : phaseIdx) / SYNC_PHASE_ORDER.length) * 100);
+
+          return (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: '14px',
+              padding: '14px 20px', marginBottom: '20px', borderRadius: '12px',
+              background: `${color}0d`,
+              border: `1px solid ${color}30`,
+              animation: 'fadeSlideUp 0.3s cubic-bezier(0.2,0,0,1) both',
+            }}>
               <div style={{
-                fontSize: '0.86rem', fontWeight: '700',
-                color: syncPhase.color, marginBottom: '7px',
-                transition: 'color 0.4s',
+                width: '40px', height: '40px', borderRadius: '10px', flexShrink: 0,
+                background: `${color}15`, border: `1px solid ${color}30`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                color,
+                animation: syncProgress.state === 'running' ? 'trackPulse 1.2s ease-in-out infinite' : 'none',
               }}>
-                {syncPhase.msg}
+                <Icon size={19} className={syncProgress.phase === 'queued' ? 'animate-spin' : ''} />
               </div>
-              {/* Progress bar */}
-              <div style={{ height: '3px', background: 'rgba(255,255,255,0.07)', borderRadius: '2px', overflow: 'hidden' }}>
+
+              <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{
-                  height: '100%', borderRadius: '2px',
-                  background: `linear-gradient(90deg, ${syncPhase.color}66, ${syncPhase.color})`,
-                  width: `${Math.min(((syncStep + 1) / (SYNC_PHASES.length + 1)) * 100, 100)}%`,
-                  transition: 'width 0.9s cubic-bezier(0.4,0,0.2,1), background 0.4s',
-                  boxShadow: `0 0 8px ${syncPhase.color}55`,
-                }} />
+                  display: 'flex', alignItems: 'baseline', gap: '10px',
+                  marginBottom: '7px', flexWrap: 'wrap',
+                }}>
+                  <span style={{ fontSize: '0.86rem', fontWeight: '700', color, transition: 'color 0.4s' }}>
+                    {syncProgress.label || 'Working…'}
+                  </span>
+                  {total > 0 && (
+                    <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>
+                      {done} / {total}
+                    </span>
+                  )}
+                  {syncProgress.detail && (
+                    <span style={{
+                      fontSize: '0.72rem', color: 'var(--text-muted)',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      minWidth: 0, flex: 1,
+                    }}>
+                      {syncProgress.detail}
+                    </span>
+                  )}
+                </div>
+
+                <div style={{ height: '3px', background: 'rgba(255,255,255,0.07)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%', borderRadius: '2px',
+                    background: `linear-gradient(90deg, ${color}66, ${color})`,
+                    width: `${Math.min(pct, 100)}%`,
+                    transition: 'width 0.6s cubic-bezier(0.4,0,0.2,1), background 0.4s',
+                    boxShadow: `0 0 8px ${color}55`,
+                  }} />
+                </div>
+              </div>
+
+              {/* Running tally — what the scan has actually decided so far */}
+              <div style={{ display: 'flex', gap: '14px', flexShrink: 0, alignItems: 'center' }}>
+                {[
+                  { n: syncProgress.queued  || 0, label: 'to review', c: '#f59e0b' },
+                  { n: syncProgress.skipped || 0, label: 'skipped',   c: 'var(--text-muted)' },
+                ].map(stat => (
+                  <div key={stat.label} style={{ textAlign: 'center', minWidth: '52px' }}>
+                    <div style={{ fontSize: '1.05rem', fontWeight: '800', color: stat.c, fontVariantNumeric: 'tabular-nums' }}>
+                      {stat.n}
+                    </div>
+                    <div style={{ fontSize: '0.6rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.7px' }}>
+                      {stat.label}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexShrink: 0 }}>
+                {SYNC_PHASE_ORDER.map((ph, i) => (
+                  <div key={ph} title={ph.replace(/_/g, ' ')} style={{
+                    width: ph === syncProgress.phase ? '16px' : '6px',
+                    height: '6px', borderRadius: '3px',
+                    background: i <= phaseIdx ? color : 'rgba(255,255,255,0.12)',
+                    transition: 'all 0.4s cubic-bezier(0.4,0,0.2,1)',
+                    boxShadow: ph === syncProgress.phase ? `0 0 6px ${color}88` : 'none',
+                  }} />
+                ))}
               </div>
             </div>
-
-            {/* Step dots */}
-            <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexShrink: 0 }}>
-              {SYNC_PHASES.map((p, i) => (
-                <div key={i} style={{
-                  width: i === syncStep ? '16px' : '6px',
-                  height: '6px', borderRadius: '3px',
-                  background: i <= syncStep ? syncPhase.color : 'rgba(255,255,255,0.12)',
-                  transition: 'all 0.4s cubic-bezier(0.4,0,0.2,1)',
-                  boxShadow: i === syncStep ? `0 0 6px ${syncPhase.color}88` : 'none',
-                }} />
-              ))}
-            </div>
-
-            {/* Hint */}
-            <div style={{
-              fontSize: '0.68rem', color: 'var(--text-muted)',
-              flexShrink: 0, maxWidth: '160px', lineHeight: '1.5', textAlign: 'right',
-            }}>
-              Cards appear as AI decides each email
-            </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* ── TAB CONTENT — always visible, updates live during sync ─── */}
         {true && (
@@ -1253,22 +1235,16 @@ export default function TrackingView() {
 
           {/* ── PENDING REVIEW TAB ─────────────────────────────────────── */}
           {activeTab === 'pending' && (() => {
-            // Sort both lists newest-first (Outlook style).
-            // Approvals use sentAt (from Exchange) — reminders use createdAt.
+            // Newest-first (Outlook style), on the date the email was sent.
             const sortedApprovals = [...trackingApprovals].sort((a, b) => {
               try { return new Date(b.sentAt || b.createdAt || 0) - new Date(a.sentAt || a.createdAt || 0); }
               catch { return 0; }
             });
-            const sortedPendingData = [...pendingData].sort((a, b) => {
-              try { return new Date(b.createdAt || 0) - new Date(a.createdAt || 0); }
-              catch { return 0; }
-            });
-            const totalPending = sortedApprovals.length + sortedPendingData.length;
-            const isLoading    = pendingLoading || approvalsLoading;
+            const isLoading = approvalsLoading;
 
             if (isLoading) return <LoadingState icon="⏳" />;
 
-            if (totalPending === 0) return (
+            if (sortedApprovals.length === 0) return (
               <EmptyState
                 icon="✅"
                 title="All clear"
@@ -1278,8 +1254,7 @@ export default function TrackingView() {
 
             return (
               <div>
-
-                {/* ══ SECTION 1: AI TRACKING DECISIONS ═══════════════════════ */}
+                {/* ══ AI TRACKING DECISIONS ═════════════════════════════════ */}
                 {sortedApprovals.length > 0 && (
                   <div style={{ marginBottom: '32px' }}>
                     {/* Section header */}
@@ -1361,17 +1336,40 @@ export default function TrackingView() {
                               </button>
                             </div>
 
-                            {/* AI reason */}
+                            {/* AI reason — plus what the thread pass actually read,
+                                so approving is a check of the AI's work rather
+                                than a guess about where it got its verdict. */}
                             <div style={{
-                              display: 'flex', alignItems: 'flex-start', gap: '8px',
                               padding: '10px 14px', marginBottom: '14px',
                               background: 'rgba(0,217,255,0.05)', border: '1px solid rgba(0,217,255,0.15)',
                               borderRadius: '10px',
                             }}>
-                              <span style={{ fontSize: '0.72rem', fontWeight: '800', color: '#00d9ff', flexShrink: 0, marginTop: '1px' }}>🤖 AI:</span>
-                              <span style={{ fontSize: '0.84rem', color: 'var(--text-secondary)', lineHeight: '1.55', fontStyle: 'italic' }}>
-                                {approval.ai_reason || 'No reason provided'}
-                              </span>
+                              <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
+                                <span style={{ fontSize: '0.72rem', fontWeight: '800', color: '#00d9ff', flexShrink: 0, marginTop: '1px' }}>🤖 AI:</span>
+                                <span style={{ fontSize: '0.84rem', color: 'var(--text-secondary)', lineHeight: '1.55', fontStyle: 'italic' }}>
+                                  {approval.ai_reason || 'No reason provided'}
+                                </span>
+                              </div>
+                              {(approval.thread_state || approval.thread_size > 0) && (
+                                <div style={{
+                                  display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px',
+                                  marginTop: '8px', paddingTop: '8px',
+                                  borderTop: '1px solid rgba(0,217,255,0.12)',
+                                }}>
+                                  {approval.thread_state && (
+                                    <span style={{ fontSize: '0.78rem', fontWeight: '700', color: '#00d9ff' }}>
+                                      {approval.thread_state}
+                                    </span>
+                                  )}
+                                  {approval.thread_size > 0 && (
+                                    <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', opacity: 0.75 }}>
+                                      {approval.thread_size === 1
+                                        ? 'judged on this message alone'
+                                        : `read all ${approval.thread_size} messages in this thread`}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                             </div>
 
                             {/* Recipients to track */}
@@ -1446,181 +1444,6 @@ export default function TrackingView() {
                                 }}
                               >
                                 {isApproving ? <><Loader size={14} className="animate-spin" /> Adding...</> : <>📡 Start Tracking</>}
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* ══ SECTION 2: REMINDER DRAFTS ══════════════════════════════ */}
-                {sortedPendingData.length > 0 && (
-                  <div>
-                    {/* Section header */}
-                    <div style={{
-                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                      marginBottom: '14px', flexWrap: 'wrap', gap: '10px',
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                        <div style={{
-                          fontSize: '0.7rem', fontWeight: '800', letterSpacing: '1px',
-                          color: '#f59e0b', textTransform: 'uppercase',
-                        }}>
-                          ✉️ Reminder Drafts
-                        </div>
-                        <span style={{
-                          fontSize: '0.65rem', fontWeight: '800',
-                          background: 'rgba(245,158,11,0.12)', color: '#f59e0b',
-                          border: '1px solid rgba(245,158,11,0.25)',
-                          borderRadius: '999px', padding: '2px 8px',
-                        }}>
-                          {sortedPendingData.length} awaiting send
-                        </span>
-                      </div>
-                      <div style={{
-                        fontSize: '0.72rem', color: '#f59e0b',
-                        background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.18)',
-                        borderRadius: '7px', padding: '5px 12px',
-                      }}>
-                        ⚡ Day-1 &amp; Day-3 reminders now send automatically
-                      </div>
-                    </div>
-
-                    {sortedPendingData.map((reminder, i) => {
-                      const isActioning  = !!actioning[reminder.id];
-                      const isApproving  = actioning[reminder.id] === 'approving';
-                      const isDismissing = actioning[reminder.id] === 'dismissing';
-                      const dayColor     = reminder.day === 1 ? '#f59e0b' : '#ef4444';
-                      const dayLabel     = reminder.day === 1 ? 'Day 1 Follow-Up' : `Day ${reminder.day} Follow-Up`;
-                      const dateStr      = (() => { try { return new Date(reminder.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return ''; } })();
-
-                      return (
-                        <div
-                          key={reminder.id}
-                          className="email-card"
-                          style={{
-                            display: 'block', padding: 0, marginBottom: '14px',
-                            borderLeft: `3px solid ${dayColor}`,
-                            contain: 'none',
-                            animation: `fadeSlideUp 0.3s cubic-bezier(0.2,0,0,1) ${i * 0.06}s both`,
-                            opacity: isActioning ? 0.6 : 1,
-                            transition: 'opacity 0.2s',
-                          }}
-                        >
-                          <div style={{ padding: '18px 22px' }}>
-                            {/* Card header */}
-                            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '14px', gap: '12px' }}>
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-                                  <span style={{
-                                    fontSize: '0.66rem', fontWeight: '800', letterSpacing: '0.8px',
-                                    color: dayColor, background: `${dayColor}15`,
-                                    border: `1px solid ${dayColor}30`, borderRadius: '5px', padding: '2px 8px',
-                                  }}>
-                                    {dayLabel}
-                                  </span>
-                                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>{dateStr}</span>
-                                </div>
-                                <div style={{
-                                  fontSize: '0.96rem', fontWeight: '700', color: 'var(--text-primary)',
-                                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                                }}>
-                                  {reminder.subject}
-                                </div>
-                              </div>
-                            </div>
-
-                            {/* Recipient */}
-                            <div style={{
-                              display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '14px',
-                              padding: '10px 14px',
-                              background: 'rgba(59,130,246,0.06)', border: '1px solid rgba(59,130,246,0.15)',
-                              borderRadius: '10px',
-                            }}>
-                              <div style={{
-                                width: '32px', height: '32px', borderRadius: '50%',
-                                background: 'linear-gradient(135deg,#3b82f6,#8b5cf6)',
-                                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                color: 'white', fontSize: '0.78rem', fontWeight: '800', flexShrink: 0,
-                              }}>
-                                {(reminder.recipientName || '?')[0].toUpperCase()}
-                              </div>
-                              <div style={{ flex: 1 }}>
-                                <div style={{ fontSize: '0.86rem', fontWeight: '700', color: 'var(--text-primary)' }}>{reminder.recipientName}</div>
-                                <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>{reminder.recipientEmail}</div>
-                              </div>
-                              <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', fontWeight: '600' }}>
-                                📧 {reminder.draftSubject}
-                              </div>
-                            </div>
-
-                            {/* Original email */}
-                            {reminder.originalBody && (
-                              <div style={{ marginBottom: '14px' }}>
-                                <button
-                                  onClick={() => toggleBody(`pending_${reminder.id}`)}
-                                  className="btn-copy"
-                                  style={{ width: '100%', textAlign: 'left', display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px' }}
-                                >
-                                  <span>{expandedBodies.has(`pending_${reminder.id}`) ? '▲' : '▼'}</span>
-                                  📧 {expandedBodies.has(`pending_${reminder.id}`) ? 'Hide' : 'Read'} original email
-                                </button>
-                                {expandedBodies.has(`pending_${reminder.id}`) && (
-                                  <div style={{ marginTop: '8px', borderRadius: '10px', border: '1px solid var(--border-color)', overflow: 'hidden', maxHeight: '380px', overflowY: 'auto' }}>
-                                    <HtmlEmailRenderer body={reminder.originalBody} darkMode={false} />
-                                  </div>
-                                )}
-                              </div>
-                            )}
-
-                            {/* Editable draft */}
-                            <div style={{ marginBottom: '16px' }}>
-                              <div style={{
-                                fontSize: '0.66rem', fontWeight: '800', letterSpacing: '0.8px',
-                                color: 'var(--text-secondary)', textTransform: 'uppercase', marginBottom: '8px',
-                              }}>
-                                📝 Email Draft — edit before sending
-                              </div>
-                              <textarea
-                                value={editedBodies[reminder.id] ?? reminder.draftBody}
-                                onChange={e => setEditedBodies(prev => ({ ...prev, [reminder.id]: e.target.value }))}
-                                disabled={isActioning}
-                                rows={6}
-                                className="reply-textarea"
-                                style={{ width: '100%', boxSizing: 'border-box' }}
-                              />
-                            </div>
-
-                            {/* Actions */}
-                            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
-                              <button
-                                onClick={() => dismissPending(reminder.id)}
-                                disabled={isActioning}
-                                className="btn-close"
-                                style={{
-                                  width: 'auto', padding: '9px 18px', borderRadius: '8px',
-                                  fontWeight: '700', fontSize: '0.84rem',
-                                  opacity: isActioning ? 0.5 : 1,
-                                  cursor: isActioning ? 'not-allowed' : 'pointer',
-                                }}
-                              >
-                                {isDismissing ? '⏳ Dismissing...' : '✕ Dismiss'}
-                              </button>
-                              <button
-                                onClick={() => approvePending(reminder.id)}
-                                disabled={isActioning}
-                                className="btn-gradient"
-                                style={{
-                                  width: 'auto', padding: '9px 22px',
-                                  display: 'flex', alignItems: 'center', gap: '6px',
-                                  fontSize: '0.84rem', fontWeight: '700',
-                                  opacity: isActioning ? 0.5 : 1,
-                                  cursor: isActioning ? 'not-allowed' : 'pointer',
-                                }}
-                              >
-                                {isApproving ? <><Loader size={14} className="animate-spin" /> Sending...</> : <>✈️ Approve &amp; Send</>}
                               </button>
                             </div>
                           </div>
@@ -2076,16 +1899,12 @@ export default function TrackingView() {
            position:fixed is relative to the viewport, not the scrollable
            overflow-y:auto container. Rendering inside main-content caused
            the modal to appear at the top of the page when scrolled down. ── */}
+      <AnimatePresence>
       {emailModal && (
-          <div
-            className="modal-overlay"
-            onClick={() => { setEmailModal(null); setModalFetchErr(null); }}
+          <AnimatedModal
+            onOverlayClick={() => { setEmailModal(null); setModalFetchErr(null); }}
+            contentStyle={{ width: '960px', maxWidth: '94vw' }}
           >
-            <div
-              className="modal-content"
-              style={{ width: '960px', maxWidth: '94vw' }}
-              onClick={e => e.stopPropagation()}
-            >
               {/* Modal header */}
               <div className="modal-header">
                 <div style={{ flex: 1, minWidth: 0 }}>
@@ -2414,9 +2233,9 @@ export default function TrackingView() {
                   </div>
                 );
               })()}
-            </div>
-          </div>
+          </AnimatedModal>
         )}
+      </AnimatePresence>
 
         {followUpCompose && (
           <ComposeMailModal

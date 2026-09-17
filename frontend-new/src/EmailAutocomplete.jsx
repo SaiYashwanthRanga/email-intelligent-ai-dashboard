@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import { X, Loader } from "lucide-react";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
@@ -238,9 +239,14 @@ const EmailAutocomplete = forwardRef(({ value, onChange, placeholder = "Search c
       </div>
 
       {/* DROPDOWN */}
+      <AnimatePresence>
       {showDropdown && (
-        <div
+        <motion.div
           ref={dropdownRef}
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -4 }}
+          transition={{ duration: 0.15 }}
           style={{
             position: "absolute", top: "100%", left: 0, right: 0,
             marginTop: "4px", zIndex: 3000,
@@ -253,7 +259,10 @@ const EmailAutocomplete = forwardRef(({ value, onChange, placeholder = "Search c
             background: "rgba(16, 18, 24, 0.96)",
             backdropFilter: "blur(40px) saturate(160%)",
             WebkitBackdropFilter: "blur(40px) saturate(160%)",
-            transform: "translateZ(0)",   // GPU compositing so backdrop-filter renders correctly
+            // No manual translateZ(0) here — Motion already drives `transform`
+            // for the y animation above, which provides the same GPU
+            // compositing layer backdrop-filter needs; a static transform in
+            // this style object would just be overwritten by Motion's.
             border: "1px solid var(--border-color)",
             borderRadius: "10px",
             boxShadow: "0 12px 40px rgba(0,0,0,0.3)",
@@ -303,8 +312,9 @@ const EmailAutocomplete = forwardRef(({ value, onChange, placeholder = "Search c
               </div>
             </div>
           ))}
-        </div>
+        </motion.div>
       )}
+      </AnimatePresence>
     </div>
   );
 });

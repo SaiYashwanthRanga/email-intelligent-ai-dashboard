@@ -26,12 +26,71 @@ from iris_service import get_iris_reply
 import logging
 
 # ── App logger ──
+#
+# Two destinations, two levels. The console is what you watch during a deploy,
+# so it stays at ERROR: nothing prints unless something is actually wrong. The
+# log FILE keeps INFO, because the background scheduler is otherwise invisible
+# — every line proving it ran ("cycle start", "Needs Review", "reminder sent")
+# is INFO, and on a server nobody is watching the console anyway. Quietening
+# the terminal should not mean going blind; it means the record moves to disk.
+#
+#   LOG_LEVEL=INFO        chatty console again (local development)
+#   LOG_FILE=off          no file, console only
+#   LOG_FILE_LEVEL=DEBUG  more detail on disk
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
     level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("hfmg")
+
+_LOG_FMT = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+_CONSOLE_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()
+_FILE_LEVEL    = os.getenv("LOG_FILE_LEVEL", "INFO").upper()
+_LOG_FILE      = os.getenv("LOG_FILE", "logs/dashboard.log").strip()
+
+# Handlers hang off this logger directly and propagation is off, so the root
+# handler installed by basicConfig never gets a second copy of the same line.
+log.handlers.clear()
+log.propagate = False
+
+_console = logging.StreamHandler()
+# A Windows console defaults to cp1252, which turns every em dash in these log
+# lines into a replacement character. The log file is already UTF-8; this makes
+# the terminal agree with it.
+try:
+    _console.stream.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+_console.setLevel(_CONSOLE_LEVEL)
+_console.setFormatter(_LOG_FMT)
+log.addHandler(_console)
+
+_file_level_num = logging.ERROR
+if _LOG_FILE.lower() not in ("off", "none", ""):
+    try:
+        os.makedirs(os.path.dirname(_LOG_FILE) or ".", exist_ok=True)
+        _fh = RotatingFileHandler(
+            _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        _fh.setLevel(_FILE_LEVEL)
+        _fh.setFormatter(_LOG_FMT)
+        log.addHandler(_fh)
+        _file_level_num = _fh.level
+    except Exception as _log_err:
+        # A read-only or missing directory must not stop the app from booting.
+        # Say so on the console, which is at ERROR and therefore will show it.
+        logging.getLogger().error(
+            f"Could not open log file {_LOG_FILE!r}: {_log_err} — console only"
+        )
+
+# The logger's own level gates records BEFORE any handler sees them, so it has
+# to sit at the more verbose of the two or the file silently loses lines.
+log.setLevel(min(_console.level, _file_level_num))
 
 # ── Silence uvicorn access log (kills the per-request flood) ──
 logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
@@ -80,9 +139,14 @@ from services import (
     get_tracking_digest,
     dismiss_tracking_recipient,
     is_tracking_allowed,
+    get_tracking_allowed_users,
     load_tracking,
     sync_replies_from_ews,
     analyze_sent_thread_reply,
+    get_tracking_progress,
+    begin_tracking_progress,
+    fetch_thread_messages,
+    norm_thread_message,
     get_group_members_dict,
     add_group_member,
     remove_group_member,
@@ -90,6 +154,18 @@ from services import (
     is_activity_allowed,
     record_activity_ping,
     get_activity_summary,
+    # ── Thread notes ──
+    get_thread_note,
+    save_thread_note,
+    # ── Send settings ──
+    load_send_settings,
+    save_send_settings,
+    # ── Signatures ──
+    load_signature_settings,
+    create_signature,
+    update_signature,
+    delete_signature,
+    set_default_signatures,
 )
 
 # 1. LOAD CONFIGURATION
@@ -133,19 +209,62 @@ ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177")
 
 
 # ─── TRACKING SCHEDULER ───
-# Runs every 2 hours for each user who has used the portal.
+# Users seen on the tracking endpoints this process. Kept only so a newly
+# granted account starts on its next request instead of waiting for a cycle —
+# the schedule itself comes from the access list, see _scheduler_targets.
 _active_tracking_users: set = set()
 
+TRACKING_CYCLE_SECONDS = 5 * 60
+# Short grace period so the first sweep doesn't fight app startup for the
+# event loop. It is not a "wait until someone opens the page" delay — the
+# first full sync runs this many seconds after boot, unprompted.
+TRACKING_STARTUP_DELAY = int(os.getenv("TRACKING_STARTUP_DELAY", "10"))
+
+
+def _scheduler_targets() -> list:
+    """
+    Who the background scheduler runs for this cycle.
+
+    Read from tracking_access.json every cycle, not from an in-memory set of
+    whoever opened the page. That set starts empty on every restart, so
+    reminders stopped firing entirely until each user happened to visit the
+    tracking tab — approve a follow-up, close the tab, restart the server, and
+    the Day-1 and Day-3 mails were never sent. Re-reading the file each cycle
+    also means granting or revoking access takes effect without a restart.
+    """
+    try:
+        targets = get_tracking_allowed_users()
+    except Exception as e:
+        log.error(f"[tracking loop] could not read the access list: {e}")
+        targets = set()
+    targets |= {u.lower().strip() for u in _active_tracking_users if u}
+    return sorted(targets)
+
+
 async def _tracking_scheduler_loop():
-    """Background loop: runs tracking scheduler every 5 minutes for all active users."""
-    await asyncio.sleep(30)
+    """
+    Background loop: sweeps every enabled user on a fixed cycle, starting
+    shortly after boot.
+
+    The first sweep is a full sync — it pulls each user's sent mail, reads the
+    bodies and runs the AI over anything new — so the Needs Review queue is
+    being built before anyone opens the Tracking tab.
+    """
+    await asyncio.sleep(TRACKING_STARTUP_DELAY)
+    first = True
     while True:
-        for user_email in list(_active_tracking_users):
+        targets = _scheduler_targets()
+        log.info(
+            f"[tracking loop] {'STARTUP sync' if first else 'cycle'} — "
+            f"{len(targets)} user(s): {', '.join(targets) or 'none'}"
+        )
+        first = False
+        for user_email in targets:
             try:
                 await run_tracking_scheduler(user_email)
             except Exception as e:
                 log.error(f"[tracking loop] error for {user_email}: {e}")
-        await asyncio.sleep(5 * 60)
+        await asyncio.sleep(TRACKING_CYCLE_SECONDS)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -1209,17 +1328,34 @@ async def outbox_send(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="That message has no recipient or body.")
 
     html_body = body if "<" in body else "<p>" + body.replace(chr(10), "<br>") + "</p>"
-    endpoint = "forwardmail" if item.get("action") == "forward" else "reply"
-    parts = [
-        ("MessageItemId", (None, p.get("messageId", ""), "text/plain")),
-        ("ReplyBodyHtml", (None, html_body, "text/plain")),
-        ("IsReplyAll", (None, "false", "text/plain")),
-    ]
-    for t in to:
-        parts.append(("To", (None, t, "text/plain")))
-    for cc in (p.get("cc") or []):
-        parts.append(("Cc", (None, cc, "text/plain")))
-    parts.append(("TargetUserEmail", (None, user_email, "text/plain")))
+    action = item.get("action")
+
+    # A composed email has no thread behind it, so it uses the plain send
+    # endpoint and a different set of field names from reply/forward.
+    if action == "compose":
+        endpoint = "send"
+        parts = [
+            ("Subject", (None, p.get("subject") or "", "text/plain")),
+            ("BodyHtml", (None, html_body, "text/plain")),
+        ]
+        for t in to:
+            parts.append(("To", (None, t, "text/plain")))
+        for cc in (p.get("cc") or []):
+            parts.append(("Cc", (None, cc, "text/plain")))
+        parts.append(("FromEmail", (None, user_email, "text/plain")))
+        parts.append(("Attachments", ("", b"", "application/octet-stream")))
+    else:
+        endpoint = "forwardmail" if action == "forward" else "reply"
+        parts = [
+            ("MessageItemId", (None, p.get("messageId", ""), "text/plain")),
+            ("ReplyBodyHtml", (None, html_body, "text/plain")),
+            ("IsReplyAll", (None, "false", "text/plain")),
+        ]
+        for t in to:
+            parts.append(("To", (None, t, "text/plain")))
+        for cc in (p.get("cc") or []):
+            parts.append(("Cc", (None, cc, "text/plain")))
+        parts.append(("TargetUserEmail", (None, user_email, "text/plain")))
 
     try:
         async with httpx.AsyncClient(timeout=120) as client_:
@@ -1405,6 +1541,47 @@ async def iris_confirm(payload: dict = Body(...)):
             update_cache_mark_read(message_id, user_email)
             result = {"ok": True, "message": "Marked as read."}
 
+        elif action == "compose":
+            # A brand-new email, not tied to any thread — so it goes to the
+            # plain send endpoint rather than reply/forward, which both need
+            # a MessageItemId to hang off.
+            body = payload.get("body") or ""
+            to = [x for x in (payload.get("to") or []) if x]
+            subject = (payload.get("subject") or "").strip()
+            if not body or not to:
+                raise HTTPException(status_code=400, detail="A recipient and a message body are required.")
+            if not subject:
+                raise HTTPException(status_code=400, detail="A new email needs a subject line.")
+            if org_is_down():
+                queue_action(user_email, "compose", {
+                    "to": to, "cc": payload.get("cc") or [],
+                    "subject": subject, "body": body,
+                })
+                _iris_done_actions[action_id] = now
+                return {"ok": True, "queued": True,
+                        "message": "Outlook is unreachable — saved to your outbox to send when it's back."}
+            html_body = body if "<" in body else "<p>" + body.replace(chr(10), "<br>") + "</p>"
+            parts = [
+                ("Subject", (None, subject, "text/plain")),
+                ("BodyHtml", (None, html_body, "text/plain")),
+            ]
+            for t in to:
+                parts.append(("To", (None, t, "text/plain")))
+            for c in (payload.get("cc") or []):
+                parts.append(("Cc", (None, c, "text/plain")))
+            if user_email:
+                parts.append(("FromEmail", (None, user_email, "text/plain")))
+            # The org endpoint expects the multipart Attachments key present
+            # even when there is nothing attached — same as /api/send-email.
+            parts.append(("Attachments", ("", b"", "application/octet-stream")))
+            # No retry — see the docstring. An ambiguous timeout on a fresh
+            # email is exactly how the same message goes out twice.
+            async with httpx.AsyncClient(timeout=120) as client_:
+                resp = await client_.post(f"{ORG_BASE}/api/Values/mail/send", files=parts)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Send failed: {resp.text[:200]}")
+            result = {"ok": True, "message": "Sent."}
+
         elif action in ("send_reply", "forward"):
             body = payload.get("body") or ""
             to = [x for x in (payload.get("to") or []) if x]
@@ -1464,6 +1641,49 @@ async def iris_confirm(payload: dict = Body(...)):
     except Exception as e:
         log.error(f"iris_confirm '{action}' failed: {e}")
         raise HTTPException(status_code=500, detail=f"Couldn't complete that: {e}")
+
+
+@app.get("/api/health")
+async def health():
+    """
+    Liveness plus the handful of facts that decide whether a deploy is sane:
+    is the AI key present, where is mail being sent, and is unattended
+    reminder delivery armed. Checking those by reading the code on a live box
+    is how the wrong ORG_BASE stays unnoticed until someone gets a real email.
+
+    Deliberately exposes no secrets — only whether the key is configured.
+    """
+    from services import (
+        ORG_BASE as SVC_ORG_BASE, REMINDERS_ENABLED, MAX_REMINDERS_PER_CYCLE,
+        ACTIVE_MODEL, api_key, AI_LAST_ERROR,
+    )
+    targets = _scheduler_targets()
+    return {
+        "status": "ok",
+        "time":   datetime.now(timezone.utc).isoformat(),
+        "ai": {
+            "key_configured": bool(api_key),
+            "model":          ACTIVE_MODEL,
+            # Last failure from the tracking classifier. A populated value here
+            # is why Needs Review is empty or why emails are being deferred —
+            # far faster to read than inferring it from the queue.
+            "last_error":     AI_LAST_ERROR.get("error"),
+            "last_error_at":  AI_LAST_ERROR.get("at"),
+        },
+        "org_base": {
+            "api":       ORG_BASE,
+            "scheduler": SVC_ORG_BASE,
+            # These are read from different modules; if they ever disagree the
+            # API and the scheduler are talking to different mail servers.
+            "agree":     ORG_BASE.rstrip("/") == SVC_ORG_BASE.rstrip("/"),
+        },
+        "tracking": {
+            "reminders_enabled":   REMINDERS_ENABLED,
+            "max_per_cycle":       MAX_REMINDERS_PER_CYCLE,
+            "cycle_seconds":       TRACKING_CYCLE_SECONDS,
+            "scheduled_users":     len(targets),
+        },
+    }
 
 
 @app.post("/api/parse-thread")
@@ -2376,59 +2596,13 @@ async def dismiss_tracking(payload: dict = Body(...)):
     return {"success": True}
 
 
-@app.get("/api/tracking/pending")
-async def get_pending_reminders(user_email: str):
-    """Returns all pending reminders awaiting review for this user."""
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    tracking = load_tracking(user_email)
-    pending  = tracking.get("pending_reminders", [])
-    return {"pending": pending, "total": len(pending)}
-
-
-@app.post("/api/tracking/pending/approve")
-async def approve_reminder(
-    user_email:  str  = Form(...),
-    reminder_id: str  = Form(...),
-    body:        str  = Form(""),   # empty = use the AI draft body stored in the reminder
-):
-    """
-    Approve and send a pending reminder (body may have been edited by user).
-    Per-user — each user only approves reminders from their own queue.
-    """
-    if not user_email or not reminder_id:
-        raise HTTPException(status_code=400, detail="Missing fields")
-    try:
-        from services import approve_pending_reminder
-        result = await approve_pending_reminder(user_email, reminder_id, body)
-        if not result.get("ok"):
-            raise HTTPException(status_code=500, detail=result.get("error", "Send failed"))
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        log.error(f"[approve_reminder] CRASH: {e}\n{tb}")
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
-
-
-@app.post("/api/tracking/pending/dismiss")
-async def dismiss_reminder(
-    user_email:  str = Form(...),
-    reminder_id: str = Form(...),
-):
-    """
-    Dismiss a pending reminder without sending it.
-    Per-user — only affects the requesting user's queue.
-    """
-    if not user_email or not reminder_id:
-        raise HTTPException(status_code=400, detail="Missing fields")
-    from services import dismiss_pending_reminder
-    result = dismiss_pending_reminder(user_email, reminder_id)
-    if not result.get("ok"):
-        raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
-    return result
+# The pending_reminders queue was retired when Day-1/Day-3 reminders moved to
+# auto-send from the scheduler. Nothing has written that key since, so
+# GET /api/tracking/pending could only ever return [], and its approve route
+# called a stub that returned ok=True without sending anything — an endpoint
+# that reports a reminder as sent when none was is worse than no endpoint.
+# Removed rather than left as a trap. Reminder sending now lives solely in
+# run_tracking_scheduler Pass 4 (services.py).
 
 
 @app.get("/api/sent-emails")
@@ -2548,6 +2722,111 @@ async def get_tracking_skipped(user_email: str):
     from services import load_not_tracked_log
     entries = load_not_tracked_log(user_email)
     return {"skipped": entries, "total": len(entries)}
+
+
+@app.get("/api/thread-notes")
+async def get_thread_note_route(user_email: str, message_id: str = "", conversation_id: str = ""):
+    """
+    Returns the person's own context note for one thread, if any.
+    Keyed by conversation_id when present, else message_id.
+    """
+    thread_key = (conversation_id or message_id or "").strip()
+    if not user_email or not thread_key:
+        raise HTTPException(status_code=400, detail="Missing user_email or message_id/conversation_id")
+    return {"note": get_thread_note(user_email, thread_key)}
+
+
+@app.post("/api/thread-notes")
+async def save_thread_note_route(payload: dict = Body(...)):
+    """
+    Save (or clear, when note is blank) the person's context note for one
+    thread. Body: { user_email, message_id, conversation_id?, note }
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    thread_key = (payload.get("conversation_id") or payload.get("message_id") or "").strip()
+    note       = payload.get("note") or ""
+
+    if not user_email or not thread_key:
+        raise HTTPException(status_code=400, detail="Missing user_email or message_id/conversation_id")
+
+    updated_at = save_thread_note(user_email, thread_key, note)
+    return {"success": True, "updatedAt": updated_at}
+
+
+@app.get("/api/send-settings")
+async def get_send_settings_route(user_email: str):
+    """Per-user compose/send preferences — currently just the undo-send window."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return load_send_settings(user_email)
+
+
+@app.post("/api/send-settings")
+async def save_send_settings_route(payload: dict = Body(...)):
+    """Body: { user_email, undoWindowSeconds }"""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    seconds = save_send_settings(user_email, payload.get("undoWindowSeconds"))
+    return {"success": True, "undoWindowSeconds": seconds}
+
+
+@app.get("/api/signatures")
+async def get_signatures_route(user_email: str):
+    """Returns { signatures: [{id,name,body}], defaultNewId, defaultReplyId }."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return load_signature_settings(user_email)
+
+
+@app.post("/api/signatures")
+async def create_signature_route(payload: dict = Body(...)):
+    """Body: { user_email, name }"""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    sig = create_signature(user_email, payload.get("name"))
+    return {"success": True, "signature": sig}
+
+
+@app.post("/api/signatures/{sig_id}")
+async def update_signature_route(sig_id: str, payload: dict = Body(...)):
+    """Body: { user_email, name?, body? }"""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    updates = {k: v for k, v in payload.items() if k in ("name", "body")}
+    sig = update_signature(user_email, sig_id, updates)
+    if not sig:
+        raise HTTPException(status_code=404, detail="Signature not found")
+    return {"success": True, "signature": sig}
+
+
+@app.delete("/api/signatures/{sig_id}")
+async def delete_signature_route(sig_id: str, user_email: str):
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    if not delete_signature(user_email, sig_id):
+        raise HTTPException(status_code=404, detail="Signature not found")
+    return {"success": True}
+
+
+@app.post("/api/signature-defaults")
+async def set_signature_defaults_route(payload: dict = Body(...)):
+    """
+    Body: { user_email, defaultNewId?, defaultReplyId? } — either field may
+    be omitted (leaves that slot untouched) or null (clears it).
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    kwargs = {}
+    if "defaultNewId" in payload:
+        kwargs["default_new_id"] = payload["defaultNewId"]
+    if "defaultReplyId" in payload:
+        kwargs["default_reply_id"] = payload["defaultReplyId"]
+    settings = set_default_signatures(user_email, **kwargs)
+    return {"success": True, **settings}
 
 
 @app.get("/api/tracking/digest")
@@ -2911,54 +3190,9 @@ async def analyze_sent_thread(payload: dict = Body(...)):
     if not user_email or not message_id:
         raise HTTPException(status_code=400, detail="Missing user_email or messageId")
 
-    org_url = f"{ORG_BASE}/api/Values/inbox/onemail"
-    params  = {"messageId": message_id, "targetUserEmail": user_email}
-
-    def _norm(msg: dict) -> dict:
-        """
-        Normalize a .NET MailDto from PascalCase to camelCase.
-        Handles both C# default serialization (PascalCase) and
-        previously-normalized (camelCase) objects transparently.
-        """
-        if not isinstance(msg, dict):
-            return {}
-        return {
-            "from":          msg.get("from")        or msg.get("From")        or "",
-            "to":            msg.get("to")          or msg.get("To")          or [],
-            "cc":            msg.get("cc")          or msg.get("Cc")          or [],
-            "subject":       msg.get("subject")     or msg.get("Subject")     or "",
-            "body":          msg.get("body")        or msg.get("Body")        or "",
-            "received":      msg.get("received")    or msg.get("Received")    or
-                             msg.get("received_at") or msg.get("date")        or "",
-            "messageId":     msg.get("messageId")   or msg.get("MessageId")   or "",
-            "conversationId":msg.get("conversationId") or msg.get("ConversationId") or "",
-            "attachments":   msg.get("attachments") or msg.get("Attachments") or [],
-        }
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(org_url, params=params)
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Mail server error: {resp.text[:200]}"
-            )
-        data = resp.json()
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Mail server timeout")
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach mail server")
-
-    # ── Extract + normalise all thread messages ───────────────────────────────
-    if isinstance(data, list):
-        raw_messages = data
-    elif isinstance(data, dict):
-        # Legacy shape: dict with optional messages[] inside
-        raw_messages = data.get("messages") or data.get("Messages") or [data]
-    else:
-        raw_messages = []
-
-    thread_messages = [_norm(m) for m in raw_messages if isinstance(m, dict)]
+    # Same fetch the tracking scheduler uses, so this button and the background
+    # pass are always looking at the same conversation, ordered the same way.
+    thread_messages = await fetch_thread_messages(user_email, message_id, timeout=60)
 
     # ── Fallback: empty list means EWS conversationId search returned nothing ─
     # Re-fetch via email-details (which also hits onemail but already has its
@@ -2978,9 +3212,9 @@ async def analyze_sent_thread(payload: dict = Body(...)):
                 fb_data = fb.json()
                 # email-details always returns a normalized dict with optional messages[]
                 if isinstance(fb_data.get("messages"), list) and fb_data["messages"]:
-                    thread_messages = [_norm(m) for m in fb_data["messages"]]
+                    thread_messages = [norm_thread_message(m) for m in fb_data["messages"]]
                 else:
-                    thread_messages = [_norm(fb_data)]
+                    thread_messages = [norm_thread_message(fb_data)]
         except Exception as fb_err:
             log.error(f"[analyze-sent-thread] fallback fetch failed: {fb_err}")
 
@@ -3093,8 +3327,24 @@ async def sync_tracking(payload: dict = Body(...)):
     if not is_tracking_allowed(user_email):
         raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
     _active_tracking_users.add(user_email)
+    begin_tracking_progress(user_email)
     asyncio.create_task(run_tracking_scheduler(user_email))
     return {"success": True, "message": "Tracking sync started"}
+
+
+@app.get("/api/tracking/sync-status")
+async def tracking_sync_status(user_email: str):
+    """
+    Where the current scan has got to, for the Tracking page's progress panel.
+
+    Cheap and poll-friendly: an in-memory read, no disk and no mail server. The
+    page polls this roughly once a second while a sync is running.
+    """
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    if not is_tracking_allowed(user_email):
+        raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
+    return get_tracking_progress(user_email)
 
 # ─────────────────────────────────────────────────────────────────────────────
 

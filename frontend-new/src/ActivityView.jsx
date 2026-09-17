@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { ArrowLeft, Laptop, RefreshCw } from 'lucide-react';
+import { Laptop, RefreshCw, Users } from 'lucide-react';
+import AppHeader from './AppHeader';
 import './App.css';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
@@ -158,7 +158,6 @@ function UserCard({ user }) {
 }
 
 export default function ActivityView() {
-  const navigate = useNavigate();
   const userEmail = localStorage.getItem('userEmail') || '';
 
   const [authorized, setAuthorized] = useState(null); // null = checking
@@ -192,30 +191,23 @@ export default function ActivityView() {
   return (
     <div className="app-container">
       <main className="main-content">
-        <header className="top-bar">
-          <div className="top-left">
-            <div className="brand" style={{ marginRight: '8px' }}>
-              <img
-                src="https://cdn.prod.website-files.com/65943a67d00c014c2d920492/65943bb45991d7c7423aada3_logo.webp"
-                alt="Horizon Family Medical Group"
-                style={{ height: '36px', width: 'auto', objectFit: 'contain', filter: 'brightness(1.05)', display: 'block' }}
-              />
-            </div>
-            <button onClick={() => navigate('/')} className="menu-btn" style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.82rem', fontWeight: '600' }}>
-              <ArrowLeft size={15} /> Dashboard
+        <AppHeader
+          active="ACTIVITY"
+          canUseActivity
+          titleIcon={<Users size={17} style={{ color: '#00d9ff' }} />}
+          title="Team Activity"
+          subtitle={
+            <>
+              Active hours are approximate (based on periodic pings while a tab is open, not idle) and
+              “device” is a best-effort browser label — see hover on each chip for detail.
+            </>
+          }
+          actions={
+            <button onClick={load} disabled={loading} className="btn-gradient" style={{ width: 'auto', padding: '9px 18px', marginRight: '15px', display: 'flex', alignItems: 'center', gap: '7px', fontSize: '0.84rem', fontWeight: '700', opacity: loading ? 0.65 : 1 }}>
+              <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> Refresh
             </button>
-            <div>
-              <div style={{ fontSize: '1rem', fontWeight: '800', letterSpacing: '-0.3px' }}>👥 Team Activity</div>
-              <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                Active hours are approximate (based on periodic pings while a tab is open, not idle) and
-                “device” is a best-effort browser label — see hover on each chip for detail.
-              </div>
-            </div>
-          </div>
-          <button onClick={load} disabled={loading} className="btn-gradient" style={{ width: 'auto', padding: '9px 18px', display: 'flex', alignItems: 'center', gap: '7px', fontSize: '0.84rem', fontWeight: '700', opacity: loading ? 0.65 : 1 }}>
-            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> Refresh
-          </button>
-        </header>
+          }
+        />
 
         {/* Filter row — one row, above the content, per dataviz interaction spec */}
         <div style={{ display: 'flex', gap: '8px', margin: '4px 0 16px' }}>

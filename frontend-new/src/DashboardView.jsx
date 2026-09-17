@@ -1,4 +1,7 @@
+import AppHeader from './AppHeader';
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import AnimatedModal from './AnimatedModal';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
@@ -17,6 +20,18 @@ import InboxView, {
   replyToMail, forwardMail, markReadBackend, extractEmail,
   CATEGORY_META, HtmlEmailRenderer, FlagDropdown
 } from './InboxView';
+import RichTextToolbar from './RichTextToolbar';
+
+// A contentEditable reply box left "empty" by the browser can still hold a
+// stray <br> or empty tags, so `.trim()` on its HTML is not a reliable
+// emptiness check the way it was for a plain textarea's value.
+const isBlankHtml = (html) => !html || html.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim().length === 0;
+
+// Reply state is sometimes set from plain text (AI Auto-Draft, Iris's
+// "use as reply" event) and sometimes from real HTML (typing in the
+// contentEditable box itself, via onInput). Only the former needs its bare
+// newlines turned into <br> before it's safe to assign as innerHTML.
+const toEditableHtml = (text) => (/<[a-z][\s\S]*>/i.test(text || '') ? text : (text || '').replace(/\n/g, '<br>'));
 
 // ─── SKELETON SHIMMER ─────────────────────────────────────────────────────
 const skeletonStyle = {
@@ -187,6 +202,7 @@ const DashboardView = ({
   emails, report, loading, mainView, setMainView, activeTab, setActiveTab,
   username, greetingInfo, theme, toggleTheme, toasts, removeToast,
   isProfileOpen, setIsProfileOpen,
+  addToast,
   lastSyncTime, usingCachedInbox, cacheAsOf, inboxReady, inboxError, inboxErrorKind, isSoftSyncing, autoSyncEnabled, setAutoSyncEnabled,
   isFetchingFullInbox = false,
   selectedEmail, setSelectedEmail, fileModalData, setFileModalData,
@@ -201,6 +217,8 @@ const DashboardView = ({
   triageStats,
   canUseTracking = false,
   canUseActivity = false,
+  waitingOnCount = 0,
+  waitingOnNames = [],
   autoDigest = null,
   digestLoading = false,
   // Flag / correction props
@@ -223,6 +241,88 @@ const DashboardView = ({
   useEffect(() => {
     if (detailPaneRef.current) detailPaneRef.current.scrollTop = 0;
   }, [selectedEmail?.id ?? selectedEmail?.messageId]);
+
+  // ── Per-thread context note — the person's own record of "what happened"
+  // on this thread, read back by Iris next time it comes up. Keyed by
+  // conversationId when available, falling back to messageId, same rule
+  // Trackingview.jsx uses for its own thread key.
+  const [threadNote, setThreadNote] = useState('');
+  const [threadNoteSavedValue, setThreadNoteSavedValue] = useState('');
+  const [threadNoteSaving, setThreadNoteSaving] = useState(false);
+
+  useEffect(() => {
+    setThreadNote('');
+    setThreadNoteSavedValue('');
+    const messageId = selectedEmail?.id || selectedEmail?.messageId || '';
+    const conversationId = selectedEmail?.conversationId || '';
+    const userEmail = localStorage.getItem('userEmail') || '';
+    if (!userEmail || (!messageId && !conversationId)) return;
+    let cancelled = false;
+    fetch(`${API_BASE}/thread-notes?user_email=${encodeURIComponent(userEmail)}&message_id=${encodeURIComponent(messageId)}&conversation_id=${encodeURIComponent(conversationId)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled) return;
+        setThreadNote(data.note || '');
+        setThreadNoteSavedValue(data.note || '');
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedEmail?.id ?? selectedEmail?.messageId, selectedEmail?.conversationId]);
+
+  const saveThreadNote = async () => {
+    const messageId = selectedEmail?.id || selectedEmail?.messageId || '';
+    const conversationId = selectedEmail?.conversationId || '';
+    const userEmail = localStorage.getItem('userEmail') || '';
+    if (!userEmail || (!messageId && !conversationId)) return;
+    setThreadNoteSaving(true);
+    try {
+      const res = await fetch(`${API_BASE}/thread-notes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_email: userEmail, message_id: messageId, conversation_id: conversationId, note: threadNote }),
+      });
+      if (res.ok) {
+        setThreadNoteSavedValue(threadNote);
+        addToast(threadNote.trim() ? 'Note saved' : 'Note cleared', 'success');
+      } else {
+        addToast('Could not save note.', 'error');
+      }
+    } catch (e) {
+      console.error('saveThreadNote error:', e);
+      addToast('Network error — could not save note.', 'error');
+    } finally {
+      setThreadNoteSaving(false);
+    }
+  };
+
+  // ── Today's meetings — small icon on the right of the header, shown on
+  // both Insights and Inbox (this component renders both), separate from
+  // the main nav's Calendar button which still just navigates to /calendar.
+  // Fetched once per dashboard visit from the same endpoint Calendarview.jsx
+  // uses, scoped to just today.
+  const [todaysMeetings, setTodaysMeetings] = useState([]);
+  const [meetingsLoading, setMeetingsLoading] = useState(true);
+  const [meetingsDropdownOpen, setMeetingsDropdownOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const userEmail = localStorage.getItem('userEmail') || '';
+    if (!userEmail) { setMeetingsLoading(false); return undefined; }
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    fetch(`${API_BASE}/meetings?email=${encodeURIComponent(userEmail)}&startDate=${today}&endDate=${today}`)
+      .then(r => (r.ok ? r.json() : []))
+      .then(data => { if (!cancelled) setTodaysMeetings(Array.isArray(data) ? data : []); })
+      .catch(() => { if (!cancelled) setTodaysMeetings([]); })
+      .finally(() => { if (!cancelled) setMeetingsLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const formatMeetingTime = (iso) => {
+    if (!iso) return '';
+    return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
 
   const handleFileDownload = useCallback(async (file, messageId) => {
     const key             = getFileKey(file, messageId);
@@ -289,33 +389,97 @@ const DashboardView = ({
 
   useEffect(() => { setThreadExpanded(false); setInlineQuoteExpanded({}); }, [parsedThread]);
 
-  const sendModalReply = useCallback(async () => {
-    if (!selectedEmail) return;
-    const isForward = modalReplyMode === "forward";
+  // ── Send-undo window (Admin > Sending) ───────────────────────────────────
+  // Delays the actual reply/forward send by the configured number of
+  // seconds with an Undo option. performReplySend takes a frozen snapshot
+  // of the reply fields rather than reading component state directly — if
+  // the person switches to a different email while a send is pending, the
+  // queued send must still go out with what was on screen when Send was
+  // clicked, never with whatever the pane now shows.
+  const [undoWindowSeconds, setUndoWindowSeconds] = useState(0);
+  const [pendingReplySend, setPendingReplySend] = useState(null); // { secondsLeft, intervalId }
+
+  // Two separate reply editors (Insights inline compose, and the main
+  // reading pane) share the same replyDraft state but are two distinct DOM
+  // nodes — each needs its own ref and its own sync-from-state effect.
+  const insightsReplyBodyRef = useRef(null);
+  const readingPaneReplyBodyRef = useRef(null);
+
+  useEffect(() => {
+    const asHtml = toEditableHtml(replyDraft);
+    if (insightsReplyBodyRef.current && insightsReplyBodyRef.current.innerHTML !== asHtml) {
+      insightsReplyBodyRef.current.innerHTML = asHtml;
+    }
+    if (readingPaneReplyBodyRef.current && readingPaneReplyBodyRef.current.innerHTML !== asHtml) {
+      readingPaneReplyBodyRef.current.innerHTML = asHtml;
+    }
+  }, [replyDraft]);
+
+  useEffect(() => {
+    const userEmail = localStorage.getItem('userEmail') || '';
+    if (!userEmail) return;
+    fetch(`${API_BASE}/send-settings?user_email=${encodeURIComponent(userEmail)}`)
+      .then(r => r.json())
+      .then(data => setUndoWindowSeconds(data.undoWindowSeconds || 0))
+      .catch(() => {});
+  }, []);
+
+  // ── Signature for replies/forwards (Admin > Signatures) ─────────────────
+  // Separate default slot from Compose's — Outlook-style — since a reply
+  // often wants a shorter signature than a fresh message. Declared before
+  // performReplySend/sendModalReply below, which reference it.
+  const [replySignatures, setReplySignatures] = useState([]);
+  const [defaultReplySignatureId, setDefaultReplySignatureId] = useState(null);
+  const [selectedReplySignatureId, setSelectedReplySignatureId] = useState(null);
+  const [replySignaturePickerOpen, setReplySignaturePickerOpen] = useState(false);
+
+  useEffect(() => {
+    const userEmail = localStorage.getItem('userEmail') || '';
+    if (!userEmail) return;
+    fetch(`${API_BASE}/signatures?user_email=${encodeURIComponent(userEmail)}`)
+      .then(r => r.json())
+      .then(data => {
+        setReplySignatures(data.signatures || []);
+        setDefaultReplySignatureId(data.defaultReplyId || null);
+        setSelectedReplySignatureId(data.defaultReplyId || null);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Back to the default signature each time a fresh reply starts.
+  useEffect(() => {
+    setSelectedReplySignatureId(defaultReplySignatureId);
+    setReplySignaturePickerOpen(false);
+  }, [selectedEmail?.id ?? selectedEmail?.messageId, defaultReplySignatureId]);
+
+  const performReplySend = useCallback(async (snap) => {
+    if (!snap.selectedEmail) return;
+    const isForward = snap.modalReplyMode === "forward";
     // Forward only needs a recipient — no note required. Reply/Reply All still need drafted text.
-    if (isForward ? !modalReplyTo.trim() : !replyDraft.trim()) return;
+    if (isForward ? !snap.modalReplyTo.trim() : isBlankHtml(snap.replyDraft)) return;
 
     setModalReplySending(true);
-    const emailId = selectedEmail.id || selectedEmail.messageId;
+    const emailId = snap.selectedEmail.id || snap.selectedEmail.messageId;
     try {
-      const messageItemId = selectedEmail.messageId || selectedEmail.id;
+      const messageItemId = snap.selectedEmail.messageId || snap.selectedEmail.id;
       if (!messageItemId) throw new Error("Missing messageItemId");
-      const to = modalReplyTo.split(",").map(e => e.trim()).filter(Boolean);
-      const cc = modalReplyCc.split(",").map(e => e.trim()).filter(Boolean);
-      const bodyHtml = replyDraft.trim() ? `<p>${replyDraft.replace(/\n/g, "<br/>")}</p>` : "";
+      const to = snap.modalReplyTo.split(",").map(e => e.trim()).filter(Boolean);
+      const cc = snap.modalReplyCc.split(",").map(e => e.trim()).filter(Boolean);
+      const signatureSection = snap.signatureBody ? `<br/><br/>${snap.signatureBody}` : "";
+      const bodyHtml = (isBlankHtml(snap.replyDraft) ? "" : snap.replyDraft) + signatureSection;
 
       if (isForward) {
-        await forwardMail({ messageItemId, forwardBodyHtml: bodyHtml, to, cc, attachments: modalReplyAttachments });
+        await forwardMail({ messageItemId, forwardBodyHtml: bodyHtml, to, cc, attachments: snap.modalReplyAttachments });
       } else {
         await replyToMail({
           messageItemId,
           replyBodyHtml: bodyHtml,
           to, cc,
-          attachments: modalReplyAttachments,
-          isReplyAll: modalReplyMode === "replyAll"
+          attachments: snap.modalReplyAttachments,
+          isReplyAll: snap.modalReplyMode === "replyAll"
         });
       }
-      await markReadBackend(selectedEmail);
+      await markReadBackend(snap.selectedEmail);
       markAsReplied(emailId, true);
       markAsReadById(emailId);
       setReplyDraft("");
@@ -327,7 +491,36 @@ const DashboardView = ({
     } finally {
       setModalReplySending(false);
     }
-  }, [selectedEmail, replyDraft, modalReplyMode, modalReplyTo, modalReplyCc, modalReplyAttachments, markAsReplied, markAsReadById, setReplyDraft, setSelectedEmail]);
+  }, [markAsReplied, markAsReadById, setReplyDraft, setSelectedEmail]);
+
+  const currentReplySignatureBody = () => replySignatures.find(s => s.id === selectedReplySignatureId)?.body || "";
+
+  const sendModalReply = useCallback(() => performReplySend({
+    selectedEmail, replyDraft, modalReplyMode, modalReplyTo, modalReplyCc, modalReplyAttachments,
+    signatureBody: currentReplySignatureBody(),
+  }), [performReplySend, selectedEmail, replyDraft, modalReplyMode, modalReplyTo, modalReplyCc, modalReplyAttachments, replySignatures, selectedReplySignatureId]);
+
+  const handleSendReplyClick = () => {
+    if (!undoWindowSeconds) { sendModalReply(); return; }
+    const snapshot = { selectedEmail, replyDraft, modalReplyMode, modalReplyTo, modalReplyCc, modalReplyAttachments, signatureBody: currentReplySignatureBody() };
+    const intervalId = setInterval(() => {
+      setPendingReplySend(prev => {
+        if (!prev) { clearInterval(intervalId); return prev; }
+        if (prev.secondsLeft <= 1) {
+          clearInterval(intervalId);
+          performReplySend(snapshot);
+          return null;
+        }
+        return { ...prev, secondsLeft: prev.secondsLeft - 1 };
+      });
+    }, 1000);
+    setPendingReplySend({ secondsLeft: undoWindowSeconds, intervalId });
+  };
+
+  const cancelPendingReplySend = () => {
+    if (pendingReplySend?.intervalId) clearInterval(pendingReplySend.intervalId);
+    setPendingReplySend(null);
+  };
 
   const handleViewSender = useCallback((senderEmail, senderName) => {
     setSenderFilter({ email: senderEmail, name: senderName });
@@ -376,9 +569,9 @@ const DashboardView = ({
       <ToastContainer toasts={toasts} removeToast={removeToast} />
 
       {/* ─── FILE MODAL ─── */}
+      <AnimatePresence>
       {fileModalData && (
-        <div className="modal-overlay" onClick={() => setFileModalData(null)}>
-          <div className="modal-content file-modal" onClick={e => e.stopPropagation()}>
+        <AnimatedModal onOverlayClick={() => setFileModalData(null)} contentClassName="modal-content file-modal">
             <div className="modal-header">
               <h3><Paperclip size={18} /> {fileModalData.title}</h3>
               <button className="btn-close" onClick={() => setFileModalData(null)}><X size={20} /></button>
@@ -404,13 +597,20 @@ const DashboardView = ({
                   </div>
                 ))}
             </div>
-          </div>
-        </div>
+        </AnimatedModal>
       )}
+      </AnimatePresence>
 
       {/* ─── INSIGHTS EMAIL DETAIL OVERLAY ─── */}
+      <AnimatePresence>
       {selectedEmail && mainView === 'INSIGHTS' && (
-        <div style={{ position: 'fixed', right: 0, top: '72px', width: '58%', minWidth: '520px', height: 'calc(100vh - 72px)', background: 'var(--bg-main)', borderLeft: '2px solid var(--border-color)', display: 'flex', flexDirection: 'column', overflow: 'hidden', zIndex: 500, boxShadow: '-8px 0 48px rgba(0,0,0,0.45)', animation: 'slideInRight 0.28s cubic-bezier(0.4,0,0.2,1)' }}>
+        <motion.div
+          style={{ position: 'fixed', right: 0, top: '72px', width: '58%', minWidth: '520px', height: 'calc(100vh - 72px)', background: 'var(--bg-main)', borderLeft: '2px solid var(--border-color)', display: 'flex', flexDirection: 'column', overflow: 'hidden', zIndex: 500, boxShadow: '-8px 0 48px rgba(0,0,0,0.45)' }}
+          initial={{ x: '100%' }}
+          animate={{ x: 0 }}
+          exit={{ x: '100%' }}
+          transition={{ duration: 0.28, ease: [0.4, 0, 0.2, 1] }}
+        >
           <div ref={detailPaneRef} style={{ flex: 1, overflowY: 'auto' }}>
 
             {/* SUBJECT BAR */}
@@ -505,13 +705,43 @@ const DashboardView = ({
               </div>
               <div style={{ padding: '10px 20px 0' }}>
                 {replyLoading ? <div className="ai-thinking">Thinking...</div>
-                  : <textarea value={replyDraft} onChange={(e) => setReplyDraft(e.target.value)} className="reply-textarea" placeholder="Write your reply here, or click ✨ AI Draft below..." style={{ minHeight: '90px' }} />}
+                  : (
+                    <div>
+                      <RichTextToolbar targetRef={insightsReplyBodyRef} />
+                      <div
+                        ref={insightsReplyBodyRef}
+                        contentEditable
+                        suppressContentEditableWarning
+                        onInput={e => setReplyDraft(e.currentTarget.innerHTML)}
+                        className="reply-textarea"
+                        data-placeholder="Write your reply here, or click ✨ AI Draft below..."
+                        style={{ minHeight: '90px' }}
+                      />
+                    </div>
+                  )}
               </div>
-              <div style={{ padding: '8px 20px 0', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+              <div style={{ padding: '8px 20px 0', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', position: 'relative' }}>
                 <input type="file" multiple id="insights-reply-attach" style={{ display: 'none' }} onChange={(e) => { if (e.target.files) setModalReplyAttachments(prev => [...prev, ...Array.from(e.target.files)]); }} />
                 <label htmlFor="insights-reply-attach" style={{ background: 'var(--bg-main)', border: '1px solid var(--border-color)', padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: '600', color: 'var(--text-primary)', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
                   <Paperclip size={14} /> Attach Files {modalReplyAttachments.length > 0 && (<span style={{ background: '#0ea5e9', color: 'white', fontSize: '0.62rem', fontWeight: '800', borderRadius: '999px', padding: '1px 6px' }}>{modalReplyAttachments.length}</span>)}
                 </label>
+                {replySignatures.length > 0 && (
+                  <>
+                    <button type="button" onClick={() => setReplySignaturePickerOpen(o => !o)} style={{ background: 'var(--bg-main)', border: '1px solid var(--border-color)', padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: '600', color: 'var(--text-primary)' }}>
+                      ✍ {replySignatures.find(s => s.id === selectedReplySignatureId)?.name || 'None'}
+                    </button>
+                    {replySignaturePickerOpen && (
+                      <div style={{ position: 'absolute', top: 'calc(100% + 4px)', left: '110px', background: 'var(--bg-card)', border: '1px solid var(--border-color)', borderRadius: '8px', padding: '6px', minWidth: '170px', boxShadow: '0 12px 28px rgba(0,0,0,0.35)', zIndex: 10 }}>
+                        <button type="button" onClick={() => { setSelectedReplySignatureId(null); setReplySignaturePickerOpen(false); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 10px', borderRadius: '6px', border: 'none', background: 'transparent', color: 'var(--text-primary)', fontSize: '0.82rem', cursor: 'pointer' }}>None</button>
+                        {replySignatures.map(sig => (
+                          <button type="button" key={sig.id} onClick={() => { setSelectedReplySignatureId(sig.id); setReplySignaturePickerOpen(false); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 10px', borderRadius: '6px', border: 'none', background: 'transparent', color: 'var(--text-primary)', fontSize: '0.82rem', cursor: 'pointer' }}>
+                            {sig.name}{sig.id === defaultReplySignatureId ? ' (default)' : ''}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
               {modalReplyAttachments.length > 0 && (
                 <div style={{ padding: '6px 20px 0', display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
@@ -532,9 +762,16 @@ const DashboardView = ({
                 <div style={{ display: 'flex', gap: '8px' }}>
                   <button onClick={() => { setShowInsightsCompose(false); setReplyDraft(''); setModalReplyAttachments([]); }} style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', fontWeight: '600', fontSize: '0.85rem' }}>Cancel</button>
                   {(() => {
-                    const sendBlocked = modalReplySending || (modalReplyMode === "forward" ? !modalReplyTo.trim() : !replyDraft.trim());
+                    if (pendingReplySend) {
+                      return (
+                        <button onClick={cancelPendingReplySend} style={{ padding: '9px 22px', borderRadius: '8px', border: 'none', background: '#9ca3af', color: 'white', fontWeight: '700', fontSize: '0.9rem', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          Sending in {pendingReplySend.secondsLeft}s · Undo
+                        </button>
+                      );
+                    }
+                    const sendBlocked = modalReplySending || (modalReplyMode === "forward" ? !modalReplyTo.trim() : isBlankHtml(replyDraft));
                     return (
-                      <button onClick={sendModalReply} disabled={sendBlocked} style={{ padding: '9px 22px', borderRadius: '8px', border: 'none', background: 'linear-gradient(135deg, #16a34a, #15803d)', color: 'white', fontWeight: '700', fontSize: '0.9rem', cursor: sendBlocked ? 'not-allowed' : 'pointer', opacity: sendBlocked ? 0.5 : 1, boxShadow: '0 6px 20px rgba(22,163,74,0.35)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <button onClick={handleSendReplyClick} disabled={sendBlocked} style={{ padding: '9px 22px', borderRadius: '8px', border: 'none', background: 'linear-gradient(135deg, #16a34a, #15803d)', color: 'white', fontWeight: '700', fontSize: '0.9rem', cursor: sendBlocked ? 'not-allowed' : 'pointer', opacity: sendBlocked ? 0.5 : 1, boxShadow: '0 6px 20px rgba(22,163,74,0.35)', display: 'flex', alignItems: 'center', gap: '6px' }}>
                         {modalReplySending ? <><Loader size={14} className="animate-spin" /> Sending...</> : <>➤ Send</>}
                       </button>
                     );
@@ -567,35 +804,19 @@ const DashboardView = ({
               )}
             </div>
           </div>
-        </div>
+        </motion.div>
       )}
+      </AnimatePresence>
 
       {/* ─── MAIN CONTENT ─── */}
       <main className="main-content">
-        <header className="top-bar">
-          <div className="top-left">
-            <div className="brand" style={{ marginRight: '20px' }}>
-              <img src="https://cdn.prod.website-files.com/65943a67d00c014c2d920492/65943bb45991d7c7423aada3_logo.webp" alt="Horizon Family Medical Group" style={{ height: '36px', width: 'auto', objectFit: 'contain', filter: 'brightness(1.05)', display: 'block' }} />
-            </div>
-            <div className="view-switcher">
-              <button className={`view-btn ${mainView === 'INSIGHTS' ? 'active' : ''}`} onClick={() => { setSelectedEmail(null); setMainView('INSIGHTS'); }}><PieChart size={18} /> Insights</button>
-              <button className={`view-btn ${mainView === 'THREADS' ? 'active' : ''}`}  onClick={() => { setSelectedEmail(null); setMainView('THREADS'); }}><Mail size={18} /> Inbox</button>
-              <button className="view-btn" onClick={() => navigate('/calendar')} title="Open Calendar"><Calendar size={18} /> Calendar</button>
-              {canUseTracking && (
-                <button className="view-btn" onClick={() => navigate('/tracking')} title="Follow-Up Tracking" style={{ position: 'relative' }}><Radar size={18} /> Tracking</button>
-              )}
-              {canUseActivity && (
-                <button className="view-btn" onClick={() => navigate('/activity')} title="Team Activity"><Users size={18} /> Activity</button>
-              )}
-              <Iris
-                emails={emails}
-                canUseTracking={canUseTracking}
-                report={report}
-                triageStats={triageStats}
-                getParticipantDisplay={getParticipantDisplay}
-                getEffectiveReceivedAt={getEffectiveReceivedAt}
-              />
-            </div>
+        <AppHeader
+          active={mainView}
+          onSelectView={(v) => { setSelectedEmail(null); setMainView(v); }}
+          canUseTracking={canUseTracking}
+          canUseActivity={canUseActivity}
+          irisProps={{ emails, report, triageStats, getParticipantDisplay, getEffectiveReceivedAt }}
+          leftExtras={
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginLeft: "20px" }}>
               <button className="menu-btn" onClick={fetchAndAnalyze} title="Refresh Inbox"><Zap size={20} /></button>
               <button className={`bubble-btn bubble-sync ${autoSyncEnabled ? 'bubble-sync-on' : 'bubble-sync-off'}`} onClick={() => setAutoSyncEnabled(prev => !prev)} title="Toggle Auto Sync">
@@ -623,26 +844,63 @@ const DashboardView = ({
                 </span>
               )}
             </div>
-            <button className="menu-btn" style={{ marginLeft: '15px' }} onClick={toggleTheme} title="Toggle Theme">
-              {theme === 'dark' ? <Sun size={20} color="#fbbf24" /> : <Moon size={20} color="#64748b" />}
-            </button>
-          </div>
-          <button className="bubble-btn bubble-compose" onClick={() => setShowCompose(true)} style={{ marginRight: '15px' }} title="Compose new email">
-            <SquarePen size={16} /> <span className="compose-btn-text">Compose</span>
-          </button>
-          <div className="user-profile" onClick={() => setIsProfileOpen(!isProfileOpen)}>
-            <div className="user-info welcome-text" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginRight: '10px' }}>
-              <span style={{ fontSize: '1.3rem', fontWeight: '700', letterSpacing: '-0.5px' }}>{greetingInfo.greeting}, {username.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ')}</span>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px', fontWeight: '500' }}>{greetingInfo.date}</span>
-            </div>
-            <div className="avatar">{(username.trim().split(/\s+/)[0] || "U").charAt(0).toUpperCase()}</div>
-            {isProfileOpen && (
-              <div className="profile-dropdown">
-                <button onClick={(e) => { e.stopPropagation(); handleLogout(); }} className="dropdown-item text-red"><LogOut size={16} /> Sign Out</button>
+          }
+          actions={
+            <>
+              {/* Small, separate calendar icon — quick peek at today's
+                  meetings without leaving Insights/Inbox for the full
+                  Calendar page. */}
+              <div style={{ position: 'relative', marginRight: '10px' }}>
+                <button
+                  className="menu-btn"
+                  onClick={() => setMeetingsDropdownOpen(o => !o)}
+                  title="Today's meetings"
+                >
+                  <Calendar size={18} />
+                </button>
+                {meetingsDropdownOpen && (
+                  <div className="profile-dropdown" style={{ width: '280px' }}>
+                    <div style={{
+                      padding: '8px 12px 10px', fontSize: '0.68rem', fontWeight: '800',
+                      letterSpacing: '0.6px', color: 'var(--text-secondary)', textTransform: 'uppercase',
+                      borderBottom: '1px solid var(--border-color)', marginBottom: '4px',
+                    }}>
+                      Today's Meetings
+                    </div>
+                    {meetingsLoading ? (
+                      <div style={{ padding: '10px 12px', fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Loading…</div>
+                    ) : todaysMeetings.length === 0 ? (
+                      <div style={{ padding: '10px 12px', fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Nothing on your calendar today.</div>
+                    ) : (
+                      <div style={{ maxHeight: '260px', overflowY: 'auto' }}>
+                        {todaysMeetings.map((m, i) => (
+                          <div key={i} style={{ padding: '8px 12px' }}>
+                            <div style={{ fontSize: '0.84rem', fontWeight: '700', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {m.subject || 'No Title'}
+                            </div>
+                            <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                              {m.isAllDay ? 'All day' : `${formatMeetingTime(m.start)} – ${formatMeetingTime(m.end)}`}
+                              {m.location ? ` · ${m.location}` : ''}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <button
+                      className="dropdown-item"
+                      onClick={() => { setMeetingsDropdownOpen(false); navigate('/calendar'); }}
+                    >
+                      View full calendar →
+                    </button>
+                  </div>
+                )}
               </div>
-            )}
-          </div>
-        </header>
+              <button className="bubble-btn bubble-compose" onClick={() => setShowCompose(true)} style={{ marginRight: '15px' }} title="Compose new email">
+                <SquarePen size={16} /> <span className="compose-btn-text">Compose</span>
+              </button>
+            </>
+          }
+        />
 
         {loading ? (
           <div className="ai-loading-container"><AILoadingScreen emailCount={emails?.length || 0} /></div>
@@ -653,10 +911,13 @@ const DashboardView = ({
               <div className="dashboard-grid">
                 <div className="col-left">
                   <TriageSummary stats={triageStats} emails={emails} report={report} threadCount={(realThreads || []).length}
+                    waitingOnCount={waitingOnCount}
+                    waitingOnNames={waitingOnNames}
                     onAttachmentClick={() => { const allFiles = getAllAttachments(); setFileModalData({ title: `All Attachments (${allFiles.length})`, files: allFiles }); }}
                     onEmailsClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('ALL'); }}
                     onThreadsClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('THREADS'); setActiveCategory('ALL'); }}
-                    onInvitesClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('INVITES'); }} />
+                    onInvitesClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('INVITES'); }}
+                    onWaitingClick={() => navigate('/tracking')} />
 
                   {emails.length > 0 && (<div style={{ marginBottom: "4px" }}><InsightsInstantPanel emails={emails} onViewSender={handleViewSender} /></div>)}
 
@@ -954,6 +1215,30 @@ const DashboardView = ({
                         <div className="modal-summary-box"><strong>💡 AI Summary:</strong> {selectedEmail.summary}</div>
                       </div>
 
+                      {/* THREAD CONTEXT NOTE — the person's own record of what happened
+                          on this thread, read back by Iris when it comes up again. */}
+                      <div style={{ margin: '14px 0', padding: '12px 14px', background: 'var(--bg-card)', border: '1px solid var(--border-color)', borderRadius: '10px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', gap: '10px' }}>
+                          <span style={{ fontSize: '0.68rem', fontWeight: '800', letterSpacing: '1px', color: 'var(--text-secondary)', textTransform: 'uppercase' }}>
+                            📝 Your Notes on This Thread
+                          </span>
+                          <button
+                            onClick={saveThreadNote}
+                            disabled={threadNoteSaving || threadNote === threadNoteSavedValue}
+                            className="btn-copy"
+                            style={{ fontSize: '0.76rem', flexShrink: 0 }}
+                          >
+                            {threadNoteSaving ? 'Saving...' : 'Save'}
+                          </button>
+                        </div>
+                        <textarea
+                          value={threadNote}
+                          onChange={(e) => setThreadNote(e.target.value)}
+                          placeholder="Jot what happened on this thread — Iris will read it back next time this comes up."
+                          style={{ width: '100%', minHeight: '52px', resize: 'vertical', background: 'transparent', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '8px 10px', fontSize: '0.84rem', color: 'var(--text-primary)', fontFamily: 'inherit', boxSizing: 'border-box' }}
+                        />
+                      </div>
+
                       {/* REPLY SECTION */}
                       <div className="reply-section">
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "14px", flexWrap: "wrap", gap: "10px" }}>
@@ -962,9 +1247,17 @@ const DashboardView = ({
                             {replyDraft && (<button onClick={handleCopy} className="btn-copy" title="Copy">{copySuccess ? <Check size={14} color="#10b981" /> : <Copy size={14} />} {copySuccess ? "Copied!" : "Copy"}</button>)}
                             {/* Forward doesn't require a note — only Reply/Reply All need drafted text before Send appears */}
                             {(modalReplyMode === "forward" || replyDraft) && (() => {
-                              const sendBlocked = modalReplySending || (modalReplyMode === "forward" ? !modalReplyTo.trim() : !replyDraft.trim());
+                              if (pendingReplySend) {
+                                return (
+                                  <button onClick={cancelPendingReplySend}
+                                    style={{ background: "#9ca3af", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", fontWeight: "700", cursor: "pointer", display: "flex", alignItems: "center", gap: "6px" }}>
+                                    Sending in {pendingReplySend.secondsLeft}s · Undo
+                                  </button>
+                                );
+                              }
+                              const sendBlocked = modalReplySending || (modalReplyMode === "forward" ? !modalReplyTo.trim() : isBlankHtml(replyDraft));
                               return (
-                                <button onClick={sendModalReply} disabled={sendBlocked}
+                                <button onClick={handleSendReplyClick} disabled={sendBlocked}
                                   style={{ background: modalReplySending ? "#9ca3af" : "linear-gradient(135deg, #16a34a, #15803d)", color: "white", border: "none", borderRadius: "6px", padding: "6px 14px", fontSize: "0.8rem", fontWeight: "700", cursor: sendBlocked ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: "6px", boxShadow: "0 4px 12px rgba(22,163,74,0.3)" }}>
                                   {modalReplySending ? <><Loader size={13} className="animate-spin" /> Sending...</> : <>➤ Send</>}
                                 </button>
@@ -1006,14 +1299,43 @@ const DashboardView = ({
 
                         <div className="reply-box">
                           {replyLoading ? <div className="ai-thinking">Thinking...</div>
-                            : <textarea value={replyDraft} onChange={(e) => setReplyDraft(e.target.value)} className="reply-textarea" placeholder="Type your reply here, or click Auto-Draft to generate one with AI..." />}
+                            : (
+                              <div>
+                                <RichTextToolbar targetRef={readingPaneReplyBodyRef} />
+                                <div
+                                  ref={readingPaneReplyBodyRef}
+                                  contentEditable
+                                  suppressContentEditableWarning
+                                  onInput={e => setReplyDraft(e.currentTarget.innerHTML)}
+                                  className="reply-textarea"
+                                  data-placeholder="Type your reply here, or click Auto-Draft to generate one with AI..."
+                                />
+                              </div>
+                            )}
                         </div>
 
-                        <div style={{ marginTop: "10px", display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                        <div style={{ marginTop: "10px", display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", position: "relative" }}>
                           <input type="file" multiple id="modal-reply-attach" style={{ display: "none" }} onChange={(e) => { if (e.target.files) setModalReplyAttachments(prev => [...prev, ...Array.from(e.target.files)]); }} />
                           <label htmlFor="modal-reply-attach" style={{ background: "var(--bg-card)", border: "1px solid var(--border-color)", padding: "5px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "0.8rem", fontWeight: "600", color: "var(--text-primary)", display: "inline-flex", alignItems: "center", gap: "5px" }}>
                             <Paperclip size={14} /> Attach Files {modalReplyAttachments.length > 0 && (<span style={{ background: "#0ea5e9", color: "white", fontSize: "0.62rem", fontWeight: "800", borderRadius: "999px", padding: "1px 6px" }}>{modalReplyAttachments.length}</span>)}
                           </label>
+                          {replySignatures.length > 0 && (
+                            <>
+                              <button type="button" onClick={() => setReplySignaturePickerOpen(o => !o)} style={{ background: "var(--bg-card)", border: "1px solid var(--border-color)", padding: "5px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "0.8rem", fontWeight: "600", color: "var(--text-primary)" }}>
+                                ✍ {replySignatures.find(s => s.id === selectedReplySignatureId)?.name || 'None'}
+                              </button>
+                              {replySignaturePickerOpen && (
+                                <div style={{ position: "absolute", top: "calc(100% + 4px)", left: "110px", background: "var(--bg-card)", border: "1px solid var(--border-color)", borderRadius: "8px", padding: "6px", minWidth: "170px", boxShadow: "0 12px 28px rgba(0,0,0,0.35)", zIndex: 10 }}>
+                                  <button type="button" onClick={() => { setSelectedReplySignatureId(null); setReplySignaturePickerOpen(false); }} style={{ display: "block", width: "100%", textAlign: "left", padding: "7px 10px", borderRadius: "6px", border: "none", background: "transparent", color: "var(--text-primary)", fontSize: "0.82rem", cursor: "pointer" }}>None</button>
+                                  {replySignatures.map(sig => (
+                                    <button type="button" key={sig.id} onClick={() => { setSelectedReplySignatureId(sig.id); setReplySignaturePickerOpen(false); }} style={{ display: "block", width: "100%", textAlign: "left", padding: "7px 10px", borderRadius: "6px", border: "none", background: "transparent", color: "var(--text-primary)", fontSize: "0.82rem", cursor: "pointer" }}>
+                                      {sig.name}{sig.id === defaultReplySignatureId ? ' (default)' : ''}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </>
+                          )}
                         </div>
                         {modalReplyAttachments.length > 0 && (
                           <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "6px" }}>

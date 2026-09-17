@@ -263,7 +263,15 @@ function Dashboard() {
   const [isAnalyzingBackground, setIsAnalyzingBackground] = useState(false);
   const pollIntervalRef = useRef(null);
   const [activeTab, setActiveTab] = useState('ALL');
-  const [mainView, setMainView] = useState('THREADS');
+  // AppHeader parks the wanted view here when Insights/Inbox is clicked from
+  // another route, since those two are states of this page rather than routes.
+  const [mainView, setMainView] = useState(() => {
+    try {
+      const pending = sessionStorage.getItem('pendingMainView');
+      if (pending) { sessionStorage.removeItem('pendingMainView'); return pending; }
+    } catch { /* blocked storage */ }
+    return 'THREADS';
+  });
   const [username, setUsername] = useState("User");
   const [mailStats, setMailStats] = useState(null);
   
@@ -292,6 +300,7 @@ function Dashboard() {
   const [senderFilter, setSenderFilter] = useState(null); // { email, name } | null
   const [canUseTracking, setCanUseTracking] = useState(false);
   const [canUseActivity, setCanUseActivity] = useState(false); // gates the Activity tab — see activity_access.json
+  const [trackingSummary, setTrackingSummary] = useState(null); // raw /api/tracking payload — powers the "Waiting on others" rollup
   const [autoDigest, setAutoDigest] = useState(null);       // complete 7-day digest from EWS
   const [digestLoading, setDigestLoading] = useState(true); // shows skeleton until first load
 
@@ -446,6 +455,36 @@ function Dashboard() {
     };
   }, [report, mailStats, emails]);
 
+  // "Waiting on others" rollup for TriageSummary — people tracked from sent
+  // mail who haven't replied yet, aggregated from the same /api/tracking
+  // payload the Tracking page itself reads. Mirrors the exact active-item
+  // and follow-up filtering Trackingview.jsx uses so the two counts agree.
+  const waitingOnOthers = useMemo(() => {
+    const isFollowUp = (item) =>
+      /^(quick follow-up\s*[–\-]|following up again\s*[\|–\-]|following up:)/i.test(item.subject || '');
+
+    const active = [
+      ...(trackingSummary?.awaiting || []),
+      ...(trackingSummary?.reminders_sent || []),
+    ].filter(i => !isFollowUp(i));
+
+    const resolvedIds = new Set((trackingSummary?.resolved || []).map(i => i.messageId));
+    const activePending = active.filter(i => !resolvedIds.has(i.messageId));
+
+    const byAddress = new Map(); // lowercased address → display name
+    activePending.forEach(item => {
+      Object.entries(item.recipients || {}).forEach(([addr, info]) => {
+        if (info.replied || info.dismissed) return;
+        const original = info.originalAddress || addr;
+        const key = original.toLowerCase();
+        if (byAddress.has(key)) return;
+        byAddress.set(key, original.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, c => c.toUpperCase()));
+      });
+    });
+
+    return { count: byAddress.size, names: [...byAddress.values()] };
+  }, [trackingSummary]);
+
   // --- GREETING & DATE ---
   const [greetingInfo, setGreetingInfo] = useState({ greeting: 'Hello', date: '' });
 
@@ -588,7 +627,18 @@ function Dashboard() {
     if (email) {
       fetch(`${API_BASE}/tracking/access?user_email=${encodeURIComponent(email)}`)
         .then(r => r.json())
-        .then(data => setCanUseTracking(!!data.allowed))
+        .then(data => {
+          setCanUseTracking(!!data.allowed);
+          // Powers the dashboard's "Waiting on others" rollup — same endpoint
+          // TrackingView itself reads, fetched once here so the count shows
+          // up without requiring a visit to the Tracking page.
+          if (data.allowed) {
+            fetch(`${API_BASE}/tracking?user_email=${encodeURIComponent(email)}`)
+              .then(r => r.json())
+              .then(setTrackingSummary)
+              .catch(() => setTrackingSummary(null));
+          }
+        })
         .catch(() => setCanUseTracking(false));
 
       // ── Check activity-view access for this user (see activity_access.json) ──
@@ -1534,6 +1584,8 @@ function Dashboard() {
       setSenderFilter={setSenderFilter}
       canUseTracking={canUseTracking}
       canUseActivity={canUseActivity}
+      waitingOnCount={waitingOnOthers.count}
+      waitingOnNames={waitingOnOthers.names}
 
       // Flag / AI correction
       flagOpen={flagOpen}
