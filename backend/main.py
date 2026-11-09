@@ -1,6 +1,8 @@
 import os
 import uuid
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import requests
 import httpx
@@ -18,22 +20,81 @@ from dotenv import load_dotenv
 from typing import List
 from urllib.parse import unquote
 
-from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, IrisChatRequest
-from iris_service import get_iris_reply
+from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, IrisChatRequest, ActivityPingRequest
+from iris_service import get_iris_reply, get_needs_response_emails, preview_tag_matches
 
 import logging
 
 # ── App logger ──
+#
+# Two destinations, two levels. The console is what you watch during a deploy,
+# so it stays at ERROR: nothing prints unless something is actually wrong. The
+# log FILE keeps INFO, because the background scheduler is otherwise invisible
+# — every line proving it ran ("cycle start", "Needs Review", "reminder sent")
+# is INFO, and on a server nobody is watching the console anyway. Quietening
+# the terminal should not mean going blind; it means the record moves to disk.
+#
+#   LOG_LEVEL=INFO        chatty console again (local development)
+#   LOG_FILE=off          no file, console only
+#   LOG_FILE_LEVEL=DEBUG  more detail on disk
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("hfmg")
 
+_LOG_FMT = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+_CONSOLE_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()
+_FILE_LEVEL    = os.getenv("LOG_FILE_LEVEL", "INFO").upper()
+_LOG_FILE      = os.getenv("LOG_FILE", "logs/dashboard.log").strip()
+
+# Handlers hang off this logger directly and propagation is off, so the root
+# handler installed by basicConfig never gets a second copy of the same line.
+log.handlers.clear()
+log.propagate = False
+
+_console = logging.StreamHandler()
+# A Windows console defaults to cp1252, which turns every em dash in these log
+# lines into a replacement character. The log file is already UTF-8; this makes
+# the terminal agree with it.
+try:
+    _console.stream.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+_console.setLevel(_CONSOLE_LEVEL)
+_console.setFormatter(_LOG_FMT)
+log.addHandler(_console)
+
+_file_level_num = logging.ERROR
+if _LOG_FILE.lower() not in ("off", "none", ""):
+    try:
+        os.makedirs(os.path.dirname(_LOG_FILE) or ".", exist_ok=True)
+        _fh = RotatingFileHandler(
+            _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        _fh.setLevel(_FILE_LEVEL)
+        _fh.setFormatter(_LOG_FMT)
+        log.addHandler(_fh)
+        _file_level_num = _fh.level
+    except Exception as _log_err:
+        # A read-only or missing directory must not stop the app from booting.
+        # Say so on the console, which is at ERROR and therefore will show it.
+        logging.getLogger().error(
+            f"Could not open log file {_LOG_FILE!r}: {_log_err} — console only"
+        )
+
+# The logger's own level gates records BEFORE any handler sees them, so it has
+# to sit at the more verbose of the two or the file silently loses lines.
+log.setLevel(min(_console.level, _file_level_num))
+
 # ── Silence uvicorn access log (kills the per-request flood) ──
 logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
-logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
 from services import (
     group_emails_by_subject,
     split_reply_chain,
@@ -56,7 +117,22 @@ from services import (
     set_last_email_count,
     get_cached_emails_by_id,
     save_emails_to_id_cache,
+    get_last_known_inbox,
+    get_last_fetch_ok_at,
+    set_last_fetch_ok_at,
+    get_cached_detail,
+    save_cached_detail,
+    load_outbox,
+    queue_action,
+    remove_from_outbox,
+    update_outbox_item,
+    outbox_summary,
+    OUTBOX_MAX_ATTEMPTS,
+    has_cached_detail,
+    cached_detail_age_seconds,
+    detail_is_complete,
     generate_day_brief_summary,
+    get_or_generate_calendar_bullets,
     extract_sender_email,
     # ── Tracking system ──
     run_tracking_scheduler,
@@ -64,12 +140,42 @@ from services import (
     get_tracking_digest,
     dismiss_tracking_recipient,
     is_tracking_allowed,
+    get_tracking_allowed_users,
     load_tracking,
     sync_replies_from_ews,
     analyze_sent_thread_reply,
+    get_tracking_progress,
+    begin_tracking_progress,
+    fetch_thread_messages,
+    norm_thread_message,
     get_group_members_dict,
     add_group_member,
     remove_group_member,
+    # ── Activity tracking ──
+    is_activity_allowed,
+    record_activity_ping,
+    get_activity_summary,
+    # ── Thread notes ──
+    get_thread_note,
+    save_thread_note,
+    # ── Send settings ──
+    load_send_settings,
+    save_send_settings,
+    # ── Signatures ──
+    load_signature_settings,
+    create_signature,
+    update_signature,
+    delete_signature,
+    set_default_signatures,
+    # ── Custom tags ──
+    load_tags,
+    create_tag,
+    update_tag,
+    delete_tag,
+    approve_tag_matches,
+    get_ai_category_summary,
+    get_emails_by_category,
+    get_emails_by_ids,
 )
 
 # 1. LOAD CONFIGURATION
@@ -91,7 +197,10 @@ MEETINGS_CACHE_TTL = 300  # seconds
 _analysis_jobs: dict = {}
 
 # ─── ORG SERVER CONFIG ───
-ORG_BASE = "http://172.22.6.188:177"
+# Overridable via env (same pattern as ALLOWED_ORIGINS) so the mail-server
+# outage path can be exercised — point it at a dead port and every call
+# fails the way a firewall block does — without editing this file.
+ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177")
 
 # =====================================================
 # 🔧 CONFIGURE THIS: Your org server's endpoint to
@@ -110,19 +219,62 @@ ORG_BASE = "http://172.22.6.188:177"
 
 
 # ─── TRACKING SCHEDULER ───
-# Runs every 2 hours for each user who has used the portal.
+# Users seen on the tracking endpoints this process. Kept only so a newly
+# granted account starts on its next request instead of waiting for a cycle —
+# the schedule itself comes from the access list, see _scheduler_targets.
 _active_tracking_users: set = set()
 
+TRACKING_CYCLE_SECONDS = 5 * 60
+# Short grace period so the first sweep doesn't fight app startup for the
+# event loop. It is not a "wait until someone opens the page" delay — the
+# first full sync runs this many seconds after boot, unprompted.
+TRACKING_STARTUP_DELAY = int(os.getenv("TRACKING_STARTUP_DELAY", "10"))
+
+
+def _scheduler_targets() -> list:
+    """
+    Who the background scheduler runs for this cycle.
+
+    Read from tracking_access.json every cycle, not from an in-memory set of
+    whoever opened the page. That set starts empty on every restart, so
+    reminders stopped firing entirely until each user happened to visit the
+    tracking tab — approve a follow-up, close the tab, restart the server, and
+    the Day-1 and Day-3 mails were never sent. Re-reading the file each cycle
+    also means granting or revoking access takes effect without a restart.
+    """
+    try:
+        targets = get_tracking_allowed_users()
+    except Exception as e:
+        log.error(f"[tracking loop] could not read the access list: {e}")
+        targets = set()
+    targets |= {u.lower().strip() for u in _active_tracking_users if u}
+    return sorted(targets)
+
+
 async def _tracking_scheduler_loop():
-    """Background loop: runs tracking scheduler every 5 minutes for all active users."""
-    await asyncio.sleep(30)
+    """
+    Background loop: sweeps every enabled user on a fixed cycle, starting
+    shortly after boot.
+
+    The first sweep is a full sync — it pulls each user's sent mail, reads the
+    bodies and runs the AI over anything new — so the Needs Review queue is
+    being built before anyone opens the Tracking tab.
+    """
+    await asyncio.sleep(TRACKING_STARTUP_DELAY)
+    first = True
     while True:
-        for user_email in list(_active_tracking_users):
+        targets = _scheduler_targets()
+        log.info(
+            f"[tracking loop] {'STARTUP sync' if first else 'cycle'} — "
+            f"{len(targets)} user(s): {', '.join(targets) or 'none'}"
+        )
+        first = False
+        for user_email in targets:
             try:
                 await run_tracking_scheduler(user_email)
             except Exception as e:
                 log.error(f"[tracking loop] error for {user_email}: {e}")
-        await asyncio.sleep(5 * 60)
+        await asyncio.sleep(TRACKING_CYCLE_SECONDS)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -145,6 +297,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Custom response headers are NOT readable by browser JS cross-origin
+    # unless listed here — without this, the frontend's
+    # res.headers["x-data-source"] check on /api/fetch-inbox silently reads
+    # undefined and treats every stale-cache fallback as a fresh live sync.
+    expose_headers=["X-Data-Source", "X-Cache-As-Of"],
 )
 
 # --- HELPER FUNCTIONS ---
@@ -242,6 +399,214 @@ async def login(credentials: LoginRequest):
         raise HTTPException(status_code=500, detail="Login failed.")
 
 
+def _normalize_onemail(data, messageId: str) -> dict:
+    """
+    Normalise a .NET GetOneMail response into the detail shape the frontend
+    expects. Shared by /api/email-details and the background prefetcher so
+    a prefetched copy is byte-for-byte what a live open would have produced.
+
+    The updated .NET GetOneMail returns List<MailDto> — the full EWS
+    conversation thread (Inbox + SentItems), ordered oldest→newest. A legacy
+    / single-message response may still come back as a plain dict.
+
+    Strategy:
+      1. Find the specific email that was asked for (matched by messageId).
+      2. Use that as the primary data object (FROM / TO / CC / BODY / ATTS).
+      3. Attach the full list as data["messages"] so the frontend can render
+         the complete conversation thread without a separate call.
+    """
+    if isinstance(data, list):
+        if not data:
+            raise HTTPException(status_code=404, detail="Email not found")
+
+        # Find the requested email by its EWS messageId. Fall back to the
+        # most-recent message if not found (edge case where EWS regenerates
+        # IDs after a move).
+        thread_messages = data
+        primary = next(
+            (m for m in thread_messages
+             if isinstance(m, dict) and
+                (m.get("messageId") or m.get("MessageId") or "").strip() == (messageId or "").strip()),
+            thread_messages[-1]
+        )
+        # Normalise PascalCase .NET fields on the primary so downstream code
+        # always sees camelCase regardless of serializer config.
+        def _lc(d, *keys):
+            for k in keys:
+                v = d.get(k) or d.get(k[0].upper() + k[1:])
+                if v is not None:
+                    d[k] = v
+        _lc(primary, "from", "to", "cc", "body", "subject",
+            "received", "messageId", "conversationId", "attachments")
+        data = dict(primary)                 # shallow copy so we can mutate safely
+        data["messages"] = thread_messages   # full thread for conversation view
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Unexpected response shape from mail server")
+
+    def _norm_atts(raw, owner_id):
+        return [
+            {
+                "name":         a.get("name", ""),
+                "type":         a.get("type", "application/octet-stream"),
+                "size":         a.get("size", 0),
+                "attachmentId": a.get("attachmentId") or a.get("AttachmentId", ""),
+                "storage":      "api",
+                "messageId":    owner_id,
+            }
+            for a in (raw or []) if isinstance(a, dict)
+        ]
+
+    data["attachments"] = _norm_atts(data.get("attachments"), messageId)
+    data["hasAttachments"] = len(data["attachments"]) > 0
+
+    for msg in data.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        msg["attachments"] = _norm_atts(
+            msg.get("attachments"),
+            msg.get("messageId") or msg.get("MessageId") or messageId,
+        )
+
+    return data
+
+
+# ─── BACKGROUND DETAIL PREFETCH ──────────────────────────────────────────────
+# After an inbox fetch we already know every messageId, so the bodies can be
+# pulled in the background instead of waiting for the user to click. Two wins:
+# opening an email becomes a local disk read rather than a round trip to the
+# org server, and the whole inbox — not just what happens to have been opened
+# — is readable when that server is unreachable.
+#
+# Deliberately conservative about the org server: only ever fetches what
+# isn't already cached, caps how much it pulls per sync, runs a small number
+# of workers, and never lets one run stack on top of another for the same
+# user. In steady state this is a handful of requests for genuinely new mail.
+PREFETCH_WORKERS = 3
+PREFETCH_BUDGET_PER_SYNC = 120     # spread the initial backfill over syncs
+
+# How long a cached detail is served without re-checking the mail server.
+# The body itself is immutable; this bounds how stale the surrounding
+# conversation thread can be. Comfortably longer than the inbox sync
+# interval, so prefetched mail opens instantly, but short enough that a
+# thread gaining a reply corrects itself quickly.
+DETAIL_CACHE_FRESH_SECONDS = 600   # 10 minutes
+
+# ─── ORG SERVER CIRCUIT BREAKER ──────────────────────────────────────────────
+# Once the mail server is unreachable, stop dialling it for a short while and
+# answer from cache immediately.
+#
+# Without this, every read still paid the full timeout before falling back —
+# 60s to open an email whose body was already on disk, 120s per inbox sync.
+# The data was there the whole time; we were just waiting for a server we
+# already knew was down. The breaker turns an outage from "everything is
+# slow" into "everything is instant, just not fresh".
+#
+# Deliberately shallow: two consecutive failures to open, any success closes
+# it at once, and it lapses on its own so the next call is a natural probe
+# for recovery. When the server is healthy this does nothing at all.
+# One failure is enough. Waiting for a second means the person pays the full
+# timeout twice before anything improves, and the cost of being wrong is
+# tiny: 60 seconds of reads answered from cache — real data, just not
+# freshly checked — after which the next call probes the server anyway.
+ORG_FAIL_THRESHOLD = 1      # consecutive failures before we stop trying
+ORG_DOWN_COOLDOWN = 60      # seconds to stay closed off before probing again
+_org_fail_count = 0
+_org_down_until = 0.0
+_org_breaker_lock = threading.Lock()
+
+
+def org_mark_failure(reason: str = ""):
+    """Record a failed org-server call; trip the breaker once they repeat."""
+    global _org_fail_count, _org_down_until
+    with _org_breaker_lock:
+        _org_fail_count += 1
+        if _org_fail_count >= ORG_FAIL_THRESHOLD and time.time() >= _org_down_until:
+            _org_down_until = time.time() + ORG_DOWN_COOLDOWN
+            log.error(
+                f"org server marked unreachable for {ORG_DOWN_COOLDOWN}s after "
+                f"{_org_fail_count} failures ({reason}) — serving cached data immediately"
+            )
+
+
+def org_mark_success():
+    """A call got through: close the breaker straight away."""
+    global _org_fail_count, _org_down_until
+    with _org_breaker_lock:
+        if _org_fail_count or _org_down_until:
+            log.info("org server reachable again — resuming live calls")
+        _org_fail_count = 0
+        _org_down_until = 0.0
+
+
+def org_is_down() -> bool:
+    """True while we should skip the live call and answer from cache."""
+    with _org_breaker_lock:
+        return time.time() < _org_down_until
+
+_prefetch_active: set = set()
+_prefetch_lock = threading.Lock()
+
+def _prefetch_one_detail(message_id: str, user_email: str) -> bool:
+    if org_is_down():
+        return False
+    try:
+        resp = requests.get(
+            f"{ORG_BASE}/api/Values/inbox/onemail",
+            params={"messageId": message_id, "targetUserEmail": user_email},
+            timeout=45,
+        )
+        if resp.status_code != 200:
+            return False
+        detail = _normalize_onemail(resp.json(), message_id)
+        save_cached_detail(user_email, message_id, detail)
+        return True
+    except Exception:
+        # Best effort by design — a prefetch failure is a non-event, the
+        # email simply gets fetched live when someone opens it.
+        return False
+
+def _run_prefetch(message_ids: list, user_email: str):
+    done = 0
+    try:
+        with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as pool:
+            for ok in pool.map(lambda mid: _prefetch_one_detail(mid, user_email), message_ids):
+                if ok:
+                    done += 1
+        log.info(f"[prefetch] cached {done}/{len(message_ids)} email bodies for {user_email}")
+    except Exception as e:
+        log.warning(f"[prefetch] run failed for {user_email}: {e}")
+    finally:
+        with _prefetch_lock:
+            _prefetch_active.discard(user_email)
+
+def schedule_detail_prefetch(emails: list, user_email: str):
+    """Queue background body-fetching for emails we don't have cached yet."""
+    try:
+        with _prefetch_lock:
+            if user_email in _prefetch_active:
+                return           # a run is already in flight for this user
+            pending = []
+            for e in emails or []:
+                if not isinstance(e, dict):
+                    continue
+                mid = e.get("messageId") or e.get("id")
+                if mid and not has_cached_detail(user_email, mid):
+                    pending.append(mid)
+                if len(pending) >= PREFETCH_BUDGET_PER_SYNC:
+                    break
+            if not pending:
+                return
+            _prefetch_active.add(user_email)
+
+        log.info(f"[prefetch] fetching {len(pending)} email bodies in background for {user_email}")
+        threading.Thread(
+            target=_run_prefetch, args=(pending, user_email), daemon=True
+        ).start()
+    except Exception as e:
+        log.warning(f"[prefetch] could not schedule for {user_email}: {e}")
+
+
 @app.get("/api/email-details")
 async def get_email_details(messageId: str, userEmail: str):
     """
@@ -259,6 +624,24 @@ async def get_email_details(messageId: str, userEmail: str):
     params  = {"messageId": messageId, "targetUserEmail": userEmail}
     log.debug(f"email-details: {messageId[:20]}... user={userEmail}")
 
+    # ── Cache-first for recently prefetched mail ──────────────────────────────
+    # The background prefetcher pulls bodies right after each inbox sync, so
+    # most opens can be answered from local disk in milliseconds instead of a
+    # round trip to the org server. A message's own body never changes once
+    # received, but the thread around it can gain replies — so a cached copy
+    # is only trusted inside a short window, after which we go live again.
+    # While the mail server is known to be down, age doesn't matter: a body
+    # from disk now beats the same body after a 60-second timeout.
+    age = cached_detail_age_seconds(userEmail, messageId)
+    if age is not None and (age < DETAIL_CACHE_FRESH_SECONDS or org_is_down()):
+        cached = get_cached_detail(userEmail, messageId)
+        # Only a complete copy may short-circuit the live call. A partial one
+        # would render a conversation of empty messages; treating it as a miss
+        # means we refetch and overwrite it with a real copy instead.
+        if cached and detail_is_complete(cached):
+            log.debug(f"email-details: serving fresh cache ({int(age)}s old) for {messageId[:20]}...")
+            return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.get(org_url, params=params)
@@ -271,141 +654,142 @@ async def get_email_details(messageId: str, userEmail: str):
             try:
                 from services import load_tracking
                 tracking = load_tracking(userEmail)
-                for tracked_item in tracking.get("tracked", []):
-                    if tracked_item.get("messageId") == messageId:
-                        log.info(
-                            f"[email-details] .NET {resp.status_code} — "
-                            f"serving tracking-cache body for {messageId[:20]}..."
-                        )
-                        return {
-                            "messageId":          messageId,
-                            "subject":            tracked_item.get("subject", ""),
-                            "body":               tracked_item.get("body", ""),
-                            "from":               userEmail,
-                            "to":                 [],
-                            "cc":                 [],
-                            "attachments":        [],
-                            "hasAttachments":     False,
-                            "messages":           [],
-                            "_fromTrackingCache": True,
-                        }
+                # Search both active tracking AND pending AI suggestions —
+                # the "View Email" button on a pending approval card hits this
+                # same endpoint before the item has ever been approved.
+                cached_item = next(
+                    (item for item in (
+                        tracking.get("tracked", [])
+                        + tracking.get("pending_tracking_approvals", [])
+                    ) if item.get("messageId") == messageId),
+                    None
+                )
+                if cached_item:
+                    log.info(
+                        f"[email-details] .NET {resp.status_code} — "
+                        f"serving tracking-cache body for {messageId[:20]}..."
+                    )
+                    return {
+                        "messageId":          messageId,
+                        "subject":            cached_item.get("subject", ""),
+                        "body":               cached_item.get("body", ""),
+                        "from":               userEmail,
+                        "to":                 [],
+                        "cc":                 [],
+                        "attachments":        [],
+                        "hasAttachments":     False,
+                        "messages":           [],
+                        "_fromTrackingCache": True,
+                    }
             except Exception as fallback_err:
                 log.warning(f"[email-details] Tracking cache fallback failed: {fallback_err}")
+
+            # ── Fallback: offline detail cache ────────────────────────────────
+            # An error status is just as unusable as an unreachable server, so
+            # serve the copy saved while it was healthy rather than a dead panel.
+            cached = get_cached_detail(userEmail, messageId)
+            if cached:
+                log.warning(
+                    f"[email-details] .NET {resp.status_code} — "
+                    f"serving cached copy for {messageId[:20]}..."
+                )
+                return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
+
             # No cache hit — propagate the original error
             raise HTTPException(
                 status_code=resp.status_code,
                 detail=f"Mail server error: {resp.text[:300]}"
             )
 
-        data = resp.json()
-
-        # ── Shape normalisation ───────────────────────────────────────────────
-        # The updated .NET GetOneMail returns List<MailDto> — the full EWS
-        # conversation thread (Inbox + SentItems), ordered oldest→newest.
-        # A legacy / single-message response may still come back as a plain dict.
-        #
-        # Strategy:
-        #   1. Find the specific email the user clicked (matched by messageId).
-        #   2. Use that as the primary data object (FROM / TO / CC / BODY / ATTS).
-        #   3. Attach the full list as data["messages"] so the frontend can
-        #      render the complete conversation thread without a separate call.
-        if isinstance(data, list):
-            if not data:
-                raise HTTPException(status_code=404, detail="Email not found")
-
-            # Find the clicked email by its EWS messageId (case-insensitive).
-            # Fall back to the most-recent message if not found (edge case where
-            # EWS regenerates IDs after a move).
-            thread_messages = data
-            primary = next(
-                (m for m in thread_messages
-                 if isinstance(m, dict) and
-                    (m.get("messageId") or m.get("MessageId") or "").strip() == messageId.strip()),
-                thread_messages[-1]   # newest as fallback (EWS ID regen edge case)
-            )
-            # Normalise PascalCase .NET fields on the primary so downstream
-            # code always sees camelCase regardless of serializer config.
-            def _lc(d, *keys):
-                for k in keys:
-                    v = d.get(k) or d.get(k[0].upper() + k[1:])
-                    if v is not None:
-                        d[k] = v
-            _lc(primary, "from", "to", "cc", "body", "subject",
-                "received", "messageId", "conversationId", "attachments")
-            data = dict(primary)          # shallow copy so we can mutate safely
-            data["messages"] = thread_messages   # full thread for conversation view
-
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=502, detail="Unexpected response shape from mail server")
-
-        # ── Normalise attachments on the primary email ────────────────────────
-        raw_atts = data.get("attachments") or []
-
-        data["attachments"] = [
-            {
-                "name":         att.get("name", ""),
-                "type":         att.get("type", "application/octet-stream"),
-                "size":         att.get("size", 0),
-                "attachmentId": att.get("attachmentId") or att.get("AttachmentId", ""),
-                "storage":      "api",
-                "messageId":    messageId,
-            }
-            for att in raw_atts if isinstance(att, dict)
-        ]
-        data["hasAttachments"] = len(data["attachments"]) > 0
-
-        # ── Normalise attachments on every thread message too ─────────────────
-        for msg in data.get("messages", []):
-            if not isinstance(msg, dict):
-                continue
-            msg_id   = msg.get("messageId") or msg.get("MessageId") or messageId
-            msg_atts = msg.get("attachments") or []
-            msg["attachments"] = [
-                {
-                    "name":         a.get("name", ""),
-                    "type":         a.get("type", "application/octet-stream"),
-                    "size":         a.get("size", 0),
-                    "attachmentId": a.get("attachmentId") or a.get("AttachmentId", ""),
-                    "storage":      "api",
-                    "messageId":    msg_id,
-                }
-                for a in msg_atts if isinstance(a, dict)
-            ]
+        org_mark_success()
+        data = _normalize_onemail(resp.json(), messageId)
 
         thread_count = len(data.get("messages", []))
         log.debug(f"email-details OK: {len(data['attachments'])} attachments, {thread_count} thread messages")
-        return data
+
+        # Keep this exact payload so the same email still opens during an
+        # outage. Best-effort — never fail a good response over a cache write.
+        try:
+            save_cached_detail(userEmail, messageId, data)
+        except Exception as e:
+            log.warning(f"email-details: detail cache write failed: {e}")
+
+        return JSONResponse(content=data, headers={"X-Data-Source": "live"})
 
     except HTTPException:
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Mail server timeout")
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach mail server")
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
+        # Mail server unreachable/slow — serve the copy we saved when it was
+        # last reachable, so reading mail keeps working while it's down.
+        org_mark_failure(type(e).__name__)
+        cached = get_cached_detail(userEmail, messageId)
+        if cached:
+            log.warning(f"email-details: org server unreachable ({type(e).__name__}) — serving cached copy for {messageId[:20]}...")
+            return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
+        status = 504 if isinstance(e, httpx.TimeoutException) else 503
+        raise HTTPException(status_code=status, detail="Cannot reach mail server, and this email isn't saved offline.")
     except Exception as e:
         log.error(f"get_email_details error: {e}")
+        cached = get_cached_detail(userEmail, messageId)
+        if cached:
+            log.warning(f"email-details: falling back to cached copy for {messageId[:20]}...")
+            return JSONResponse(content=cached, headers={"X-Data-Source": "cache"})
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/fetch-inbox")
-def fetch_inbox(email: str):
+def fetch_inbox(email: str, count: int = 500):
+    # Build the org server inbox URL from the email address.
+    # Route template: GET /api/Values/inbox/{mail}/count{num}
+    # "count" and the number share the same path segment — no slash between them.
+    # `count` is caller-controlled so the frontend can request a small fast
+    # batch first (near-instant paint) and the full inbox afterward, instead
+    # of blocking on all 500 emails before showing anything.
+    clean_email = unquote(email).strip()
+    clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count{count}"
+
+    def _serve_stale(reason: str, hard_status: int, hard_detail: str):
+        """
+        The org mail server is unreachable or erroring (firewall down,
+        timeout, 5xx, ...). Fall back to the last inbox we successfully
+        fetched+analyzed for this user (from the /api/analyze id-cache) so
+        the UI keeps showing real data instead of going blank — flagged via
+        response headers so the frontend can show a "reconnecting" banner
+        instead of treating this as a normal live sync. Only raise the hard
+        error if there's truly nothing cached yet to fall back to.
+        """
+        fallback = get_last_known_inbox(clean_email, limit=count)
+        if fallback:
+            as_of = get_last_fetch_ok_at(clean_email)
+            log.warning(f"fetch_inbox: {reason} — serving {len(fallback)} cached emails for {clean_email}")
+            resp_obj = JSONResponse(content=fallback)
+            resp_obj.headers["X-Data-Source"] = "cache"
+            if as_of:
+                resp_obj.headers["X-Cache-As-Of"] = as_of
+            return resp_obj
+        log.error(f"fetch_inbox: {reason} — no cache to fall back to for {clean_email}")
+        raise HTTPException(status_code=hard_status, detail=hard_detail)
+
+    # Skip the 120s wait entirely when the server has just failed — the
+    # fallback below is what we'd end up serving anyway.
+    if org_is_down():
+        return _serve_stale("org server known unreachable", 502, "Mail server unreachable.")
+
     try:
-        # Build the org server inbox URL from the email address.
-        # Route template: GET /api/Values/inbox/{mail}/count{num}
-        # "count" and the number share the same path segment — no slash between them.
-        clean_email = unquote(email).strip()
-        clean_url = f"{ORG_BASE}/api/Values/inbox/{clean_email}/count500"
-
         log.debug(f"Fetching org inbox: {clean_url}")
-
         resp = requests.get(clean_url, timeout=120)
+    except requests.exceptions.RequestException as e:
+        org_mark_failure(type(e).__name__)
+        return _serve_stale(f"org server unreachable ({e})", 502, f"Mail server unreachable: {e}")
 
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Mail server error: {resp.text}"
-            )
+    if resp.status_code != 200:
+        return _serve_stale(
+            f"org server returned {resp.status_code}",
+            resp.status_code,
+            f"Mail server error: {resp.text[:300]}"
+        )
 
+    try:
         raw = resp.json()
 
         # ─── FIX: Unwrap PagedMailResponse if .NET returns the paged shape ───
@@ -474,13 +858,35 @@ def fetch_inbox(email: str):
 
         data.sort(key=_sort_key, reverse=True)
 
-        return data
+        org_mark_success()
+        # A successful sync is our signal the server is back — replay anything
+        # queued during the outage.
+        schedule_outbox_flush(clean_email)
+        set_last_fetch_ok_at(datetime.now(timezone.utc).isoformat(), clean_email)
 
-    except HTTPException:
-        raise
+        # Pull bodies in the background so opening an email is a local read
+        # rather than a round trip, and so the whole inbox — not just what's
+        # been opened — survives the mail server going away.
+        #
+        # This is deliberately the ONLY writer of the detail cache. An earlier
+        # version also warmed it straight from this inbox payload, which was a
+        # mistake twice over: the inbox list carries no per-message bodies, so
+        # those entries rendered a thread of empty messages, and their mere
+        # existence made the prefetcher skip the emails that needed it most.
+        schedule_detail_prefetch(data, clean_email)
+
+        resp_final = JSONResponse(content=data)
+        resp_final.headers["X-Data-Source"] = "live"
+        return resp_final
+
     except Exception as e:
-        log.error(f"fetch_inbox error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Org server answered 200 but the body was unusable (malformed JSON,
+        # an HTML error page served with a 200 status, or a bug in the
+        # processing above) — treat it the same as "unreachable" rather than
+        # showing the user a hard error when we have real cached data to
+        # fall back to instead. log.error keeps this visible operationally.
+        log.error(f"fetch_inbox: processing error on 200 response: {e}")
+        return _serve_stale(f"org response unusable ({e})", 500, f"Mail server response error: {e}")
 
 
 @app.post("/api/analyze")
@@ -811,6 +1217,249 @@ async def generate_reply(payload: ReplyRequest):
     return {"reply": reply_text}
 
 
+# ─── OUTBOX REPLAY ───────────────────────────────────────────────────────────
+# Actions taken while the mail server was unreachable, carried out once it
+# returns. Only the idempotent ones replay by themselves; sends wait for a
+# person, because firing a three-hour-old reply unattended is how someone
+# ends up answering a legal firm twice.
+_outbox_flushing: set = set()
+_outbox_flush_lock = threading.Lock()
+
+
+def _perform_org_action(action: str, payload: dict, user_email: str) -> str:
+    """Carry out one action against the org server. Raises on failure."""
+    if action == "mark_read":
+        resp = requests.post(
+            f"{ORG_BASE}/api/Values/mail/read-status",
+            params={"messageId": payload.get("messageId"),
+                    "targetUserEmail": user_email, "isRead": "true"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"mail server {resp.status_code}: {resp.text[:120]}")
+        update_cache_mark_read(payload.get("messageId"), user_email)
+        return "Marked as read."
+
+    if action == "rsvp":
+        resp = requests.post(
+            f"{ORG_BASE}/api/Values/meetings/Action",
+            params={"meetingId": payload.get("messageId"),
+                    "action": payload.get("response", "accept"),
+                    "targetUserEmail": user_email},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"calendar {resp.status_code}: {resp.text[:120]}")
+        return "RSVP sent."
+
+    raise RuntimeError(f"'{action}' is not replayable automatically")
+
+
+def _flush_outbox(user_email: str):
+    """Replay the auto-safe queue. Held sends are left alone by design."""
+    done = failed = 0
+    try:
+        for item in load_outbox(user_email):
+            if item.get("needsConfirm"):
+                continue                      # a send — needs a person
+            if org_is_down():
+                break                         # server went away again; stop early
+            item_id = item.get("id")
+            try:
+                _perform_org_action(item.get("action"), item.get("payload") or {}, user_email)
+                remove_from_outbox(user_email, item_id)
+                done += 1
+            except Exception as e:
+                failed += 1
+                attempts = int(item.get("attempts", 0)) + 1
+                if attempts >= OUTBOX_MAX_ATTEMPTS:
+                    # Stop retrying forever; keep it visible rather than
+                    # silently dropping something the person asked for.
+                    update_outbox_item(user_email, item_id, attempts=attempts,
+                                       lastError=str(e)[:200], needsConfirm=True)
+                    log.error(f"[outbox] {item.get('action')} gave up after {attempts} tries: {e}")
+                else:
+                    update_outbox_item(user_email, item_id, attempts=attempts, lastError=str(e)[:200])
+        if done or failed:
+            log.info(f"[outbox] replayed {done} action(s) for {user_email}, {failed} still pending")
+    except Exception as e:
+        log.error(f"[outbox] flush failed for {user_email}: {e}")
+    finally:
+        with _outbox_flush_lock:
+            _outbox_flushing.discard(user_email)
+
+
+def schedule_outbox_flush(user_email: str):
+    """Kick off a replay in the background; never more than one per user."""
+    try:
+        if org_is_down():
+            return
+        pending = [i for i in load_outbox(user_email) if not i.get("needsConfirm")]
+        if not pending:
+            return
+        with _outbox_flush_lock:
+            if user_email in _outbox_flushing:
+                return
+            _outbox_flushing.add(user_email)
+        log.info(f"[outbox] mail server is back — replaying {len(pending)} action(s) for {user_email}")
+        threading.Thread(target=_flush_outbox, args=(user_email,), daemon=True).start()
+    except Exception as e:
+        log.warning(f"[outbox] could not schedule flush for {user_email}: {e}")
+
+
+@app.get("/api/outbox")
+async def get_outbox(user_email: str):
+    """What's queued: replaying by itself, and what's waiting on a person."""
+    return outbox_summary(user_email)
+
+
+@app.post("/api/outbox/send")
+async def outbox_send(payload: dict = Body(...)):
+    """
+    Send one held message, on an explicit press.
+
+    Not retried on failure: a timeout leaves it unknown whether the mail
+    went, and retrying is how the same email goes out twice. It stays in the
+    outbox with the error attached so the person decides what to do.
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    item_id = (payload.get("id") or "").strip()
+    if not user_email or not item_id:
+        raise HTTPException(status_code=400, detail="Missing user_email or id.")
+
+    item = next((i for i in load_outbox(user_email) if i.get("id") == item_id), None)
+    if not item:
+        return {"ok": True, "already_gone": True, "message": "Nothing left to send."}
+
+    p = item.get("payload") or {}
+    body = p.get("body") or ""
+    to = [x for x in (p.get("to") or []) if x]
+    if not body or not to:
+        raise HTTPException(status_code=400, detail="That message has no recipient or body.")
+
+    html_body = body if "<" in body else "<p>" + body.replace(chr(10), "<br>") + "</p>"
+    action = item.get("action")
+
+    # A composed email has no thread behind it, so it uses the plain send
+    # endpoint and a different set of field names from reply/forward.
+    if action == "compose":
+        endpoint = "send"
+        parts = [
+            ("Subject", (None, p.get("subject") or "", "text/plain")),
+            ("BodyHtml", (None, html_body, "text/plain")),
+        ]
+        for t in to:
+            parts.append(("To", (None, t, "text/plain")))
+        for cc in (p.get("cc") or []):
+            parts.append(("Cc", (None, cc, "text/plain")))
+        parts.append(("FromEmail", (None, user_email, "text/plain")))
+        parts.append(("Attachments", ("", b"", "application/octet-stream")))
+    else:
+        endpoint = "forwardmail" if action == "forward" else "reply"
+        parts = [
+            ("MessageItemId", (None, p.get("messageId", ""), "text/plain")),
+            ("ReplyBodyHtml", (None, html_body, "text/plain")),
+            ("IsReplyAll", (None, "false", "text/plain")),
+        ]
+        for t in to:
+            parts.append(("To", (None, t, "text/plain")))
+        for cc in (p.get("cc") or []):
+            parts.append(("Cc", (None, cc, "text/plain")))
+        parts.append(("TargetUserEmail", (None, user_email, "text/plain")))
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client_:
+            resp = await client_.post(f"{ORG_BASE}/api/Values/mail/{endpoint}", files=parts)
+        if resp.status_code != 200:
+            raise RuntimeError(f"{resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        org_mark_failure(type(e).__name__)
+        update_outbox_item(user_email, item_id, lastError=str(e)[:200],
+                           attempts=int(item.get("attempts", 0)) + 1)
+        raise HTTPException(status_code=502, detail=f"Still couldn't send: {e}")
+
+    org_mark_success()
+    remove_from_outbox(user_email, item_id)
+    log.info(f"[outbox] sent held message {item_id} for {user_email}")
+    return {"ok": True, "message": "Sent."}
+
+
+@app.delete("/api/outbox/{item_id}")
+async def outbox_discard(item_id: str, user_email: str):
+    """Throw a queued item away without carrying it out."""
+    removed = remove_from_outbox(user_email, item_id)
+    return {"ok": True, "removed": removed}
+
+
+# Blank line terminates one server-sent event.
+SSE_END = chr(10) + chr(10)
+
+
+@app.post("/api/iris/chat/stream")
+async def iris_chat_stream(payload: IrisChatRequest):
+    """
+    Same as /api/iris/chat, streamed as server-sent events so the panel can
+    show what Iris is doing while it happens.
+
+    A question that searches and then reads two emails can take fifteen
+    seconds; without this the panel sits silent for all of it and then
+    dumps everything at once. Each tool announces itself as it starts.
+
+    Falls back cleanly: the non-streaming route is untouched, so a client
+    that can't read a stream still works.
+    """
+    async def events():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def on_step(label: str):
+            await queue.put({"type": "step", "label": label})
+
+        task = asyncio.create_task(get_iris_reply(
+            payload.message, payload.history, payload.user_name,
+            payload.inbox_context, payload.user_email,
+            payload.focus_message_id, on_step,
+        ))
+
+        # Drain progress while the work runs. The short timeout doubles as a
+        # keepalive tick so proxies don't sit on a silent connection.
+        while not task.done() or not queue.empty():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                yield "data: " + json.dumps(event) + SSE_END
+            except asyncio.TimeoutError:
+                yield ": keepalive" + SSE_END
+
+        try:
+            result = task.result()
+            yield "data: " + json.dumps({
+                "type": "done",
+                "reply": result.get("reply", ""),
+                "steps": result.get("steps", []),
+                "proposals": result.get("proposals", []),
+            }) + SSE_END
+        except Exception as e:
+            kind = type(e).__name__
+            if "APIConnection" in kind or "APITimeout" in kind:
+                detail = ("Can't reach the AI service right now — your inbox is fine, "
+                          "this is the connection to the assistant. Try again in a moment.")
+            elif "RateLimit" in kind:
+                detail = "The AI service is busy right now. Give it a few seconds and try again."
+            else:
+                detail = "Iris couldn't respond right now."
+            log.error(f"iris_chat_stream error ({kind}): {e}")
+            yield "data: " + json.dumps({"type": "error", "detail": detail}) + SSE_END
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",   # stop proxies buffering the stream
+        },
+    )
+
+
 @app.post("/api/iris/chat")
 async def iris_chat(payload: IrisChatRequest):
     """
@@ -822,17 +1471,229 @@ async def iris_chat(payload: IrisChatRequest):
     tool-calling loop itself.
     """
     try:
-        reply_text = await get_iris_reply(
+        result = await get_iris_reply(
             payload.message,
             payload.history,
             payload.user_name,
             payload.inbox_context,
             payload.user_email,
+            payload.focus_message_id,
         )
-        return {"reply": reply_text}
+        # steps  = what Iris actually did, so the UI isn't a silent pause
+        # proposals = actions waiting on the person's confirmation. Iris
+        # never performs them; /api/iris/confirm does, after they press it.
+        return {
+            "reply": result.get("reply", ""),
+            "steps": result.get("steps", []),
+            "proposals": result.get("proposals", []),
+        }
     except Exception as e:
-        log.error(f"iris_chat error: {e}")
+        # Name the actual problem. This network drops the AI service fairly
+        # often, and "something went wrong" sends people looking at the
+        # dashboard when nothing about the dashboard is broken.
+        kind = type(e).__name__
+        if "APIConnection" in kind or "APITimeout" in kind:
+            log.error(f"iris_chat: AI service unreachable ({kind})")
+            raise HTTPException(
+                status_code=503,
+                detail="Can't reach the AI service right now — your inbox is fine, this is the connection to the assistant. Try again in a moment.",
+            )
+        if "RateLimit" in kind:
+            log.error("iris_chat: rate limited")
+            raise HTTPException(status_code=429, detail="The AI service is busy right now. Give it a few seconds and try again.")
+        log.error(f"iris_chat error ({kind}): {e}")
         raise HTTPException(status_code=500, detail="Iris couldn't respond right now.")
+
+
+# Action ids already carried out, so a double-click or a retry after a
+# timeout can't run the same thing twice. In memory by design: the worst a
+# restart can do is allow a repeat the person has to press for again.
+_iris_done_actions: dict = {}
+IRIS_ACTION_TTL = 3600
+
+
+@app.post("/api/iris/confirm")
+async def iris_confirm(payload: dict = Body(...)):
+    """
+    Carry out an action Iris proposed, after the person pressed confirm.
+
+    Iris itself can only ever propose — this is the single place any of it
+    actually happens, and it only runs on an explicit click. Sends are
+    deliberately NOT retried: if the mail server times out we cannot know
+    whether it went, and silently retrying could send the same email twice.
+    """
+    action_id = (payload.get("actionId") or "").strip()
+    action = (payload.get("action") or "").strip()
+    user_email = (payload.get("userEmail") or "").strip()
+    message_id = (payload.get("messageId") or "").strip()
+
+    if not action_id or not action:
+        raise HTTPException(status_code=400, detail="Missing actionId or action.")
+
+    now = time.time()
+    for k, ts in list(_iris_done_actions.items()):
+        if now - ts > IRIS_ACTION_TTL:
+            _iris_done_actions.pop(k, None)
+    if action_id in _iris_done_actions:
+        return {"ok": True, "duplicate": True, "message": "Already done — not repeating it."}
+
+    try:
+        if action == "mark_read":
+            if not message_id:
+                raise HTTPException(status_code=400, detail="mark_read needs a messageId.")
+            resp = requests.post(
+                f"{ORG_BASE}/api/Values/mail/read-status",
+                params={"messageId": message_id, "targetUserEmail": user_email, "isRead": "true"},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Mail server refused: {resp.text[:200]}")
+            update_cache_mark_read(message_id, user_email)
+            result = {"ok": True, "message": "Marked as read."}
+
+        elif action == "compose":
+            # A brand-new email, not tied to any thread — so it goes to the
+            # plain send endpoint rather than reply/forward, which both need
+            # a MessageItemId to hang off.
+            body = payload.get("body") or ""
+            to = [x for x in (payload.get("to") or []) if x]
+            subject = (payload.get("subject") or "").strip()
+            if not body or not to:
+                raise HTTPException(status_code=400, detail="A recipient and a message body are required.")
+            if not subject:
+                raise HTTPException(status_code=400, detail="A new email needs a subject line.")
+            if org_is_down():
+                queue_action(user_email, "compose", {
+                    "to": to, "cc": payload.get("cc") or [],
+                    "subject": subject, "body": body,
+                })
+                _iris_done_actions[action_id] = now
+                return {"ok": True, "queued": True,
+                        "message": "Outlook is unreachable — saved to your outbox to send when it's back."}
+            html_body = body if "<" in body else "<p>" + body.replace(chr(10), "<br>") + "</p>"
+            parts = [
+                ("Subject", (None, subject, "text/plain")),
+                ("BodyHtml", (None, html_body, "text/plain")),
+            ]
+            for t in to:
+                parts.append(("To", (None, t, "text/plain")))
+            for c in (payload.get("cc") or []):
+                parts.append(("Cc", (None, c, "text/plain")))
+            if user_email:
+                parts.append(("FromEmail", (None, user_email, "text/plain")))
+            # The org endpoint expects the multipart Attachments key present
+            # even when there is nothing attached — same as /api/send-email.
+            parts.append(("Attachments", ("", b"", "application/octet-stream")))
+            # No retry — see the docstring. An ambiguous timeout on a fresh
+            # email is exactly how the same message goes out twice.
+            async with httpx.AsyncClient(timeout=120) as client_:
+                resp = await client_.post(f"{ORG_BASE}/api/Values/mail/send", files=parts)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Send failed: {resp.text[:200]}")
+            result = {"ok": True, "message": "Sent."}
+
+        elif action in ("send_reply", "forward"):
+            body = payload.get("body") or ""
+            to = [x for x in (payload.get("to") or []) if x]
+            if not body or not to:
+                raise HTTPException(status_code=400, detail="A recipient and a message body are required.")
+            # Server unreachable: park it in the outbox instead of losing the
+            # message. It waits for a press rather than firing on its own —
+            # an hours-old reply going out unattended is its own problem.
+            if org_is_down():
+                queue_action(user_email, action, {
+                    "messageId": message_id, "to": to, "cc": payload.get("cc") or [],
+                    "subject": payload.get("subject") or "", "body": body,
+                })
+                _iris_done_actions[action_id] = now
+                return {"ok": True, "queued": True,
+                        "message": "Outlook is unreachable — saved to your outbox to send when it's back."}
+            html_body = body if "<" in body else "<p>" + body.replace("\n", "<br>") + "</p>"
+            endpoint = "reply" if action == "send_reply" else "forwardmail"
+            parts = [
+                ("MessageItemId", (None, message_id, "text/plain")),
+                ("ReplyBodyHtml", (None, html_body, "text/plain")),
+                ("IsReplyAll", (None, "false", "text/plain")),
+            ]
+            for t in to:
+                parts.append(("To", (None, t, "text/plain")))
+            for c in (payload.get("cc") or []):
+                parts.append(("Cc", (None, c, "text/plain")))
+            if user_email:
+                parts.append(("TargetUserEmail", (None, user_email, "text/plain")))
+            # No retry here, on purpose — see the docstring above.
+            async with httpx.AsyncClient(timeout=120) as client_:
+                resp = await client_.post(f"{ORG_BASE}/api/Values/mail/{endpoint}", files=parts)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Send failed: {resp.text[:200]}")
+            result = {"ok": True, "message": "Sent."}
+
+        elif action == "rsvp":
+            answer = (payload.get("response") or "accept").lower()
+            resp = requests.post(
+                f"{ORG_BASE}/api/Values/meetings/Action",
+                params={"meetingId": message_id, "action": answer, "targetUserEmail": user_email},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Calendar refused: {resp.text[:200]}")
+            result = {"ok": True, "message": f"RSVP sent ({answer})."}
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+
+        _iris_done_actions[action_id] = now
+        log.info(f"[iris-action] {action} confirmed by {user_email} ({action_id})")
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"iris_confirm '{action}' failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Couldn't complete that: {e}")
+
+
+@app.get("/api/health")
+async def health():
+    """
+    Liveness plus the handful of facts that decide whether a deploy is sane:
+    is the AI key present, where is mail being sent, and is unattended
+    reminder delivery armed. Checking those by reading the code on a live box
+    is how the wrong ORG_BASE stays unnoticed until someone gets a real email.
+
+    Deliberately exposes no secrets — only whether the key is configured.
+    """
+    from services import (
+        ORG_BASE as SVC_ORG_BASE, REMINDERS_ENABLED, MAX_REMINDERS_PER_CYCLE,
+        ACTIVE_MODEL, api_key, AI_LAST_ERROR,
+    )
+    targets = _scheduler_targets()
+    return {
+        "status": "ok",
+        "time":   datetime.now(timezone.utc).isoformat(),
+        "ai": {
+            "key_configured": bool(api_key),
+            "model":          ACTIVE_MODEL,
+            # Last failure from the tracking classifier. A populated value here
+            # is why Needs Review is empty or why emails are being deferred —
+            # far faster to read than inferring it from the queue.
+            "last_error":     AI_LAST_ERROR.get("error"),
+            "last_error_at":  AI_LAST_ERROR.get("at"),
+        },
+        "org_base": {
+            "api":       ORG_BASE,
+            "scheduler": SVC_ORG_BASE,
+            # These are read from different modules; if they ever disagree the
+            # API and the scheduler are talking to different mail servers.
+            "agree":     ORG_BASE.rstrip("/") == SVC_ORG_BASE.rstrip("/"),
+        },
+        "tracking": {
+            "reminders_enabled":   REMINDERS_ENABLED,
+            "max_per_cycle":       MAX_REMINDERS_PER_CYCLE,
+            "cycle_seconds":       TRACKING_CYCLE_SECONDS,
+            "scheduled_users":     len(targets),
+        },
+    }
 
 
 @app.post("/api/parse-thread")
@@ -1110,14 +1971,31 @@ def mark_mail_as_read(payload: dict = Body(...)):
         if not email or not message_id:
             raise HTTPException(status_code=400, detail="Missing email or messageId")
 
+        # Mail server unreachable: queue it rather than failing. Marking read
+        # twice is still read, so this replays by itself on recovery — the
+        # card can flip to read immediately and stay that way.
+        if org_is_down():
+            queue_action(email, "mark_read", {"messageId": message_id})
+            update_cache_mark_read(message_id, email)
+            return {"success": True, "queued": True,
+                    "message": "Marked as read — will sync when Outlook is back."}
+
         org_api_url = f"{ORG_BASE}/api/Values/mail/read-status"
         params = {"email": email, "messageId": message_id, "isRead": True}
 
-        resp = requests.post(org_api_url, params=params, timeout=20)
+        try:
+            resp = requests.post(org_api_url, params=params, timeout=20)
+        except requests.exceptions.RequestException as e:
+            org_mark_failure(type(e).__name__)
+            queue_action(email, "mark_read", {"messageId": message_id})
+            update_cache_mark_read(message_id, email)
+            return {"success": True, "queued": True,
+                    "message": "Marked as read — will sync when Outlook is back."}
 
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=f"Org API error: {resp.text}")
 
+        org_mark_success()
         update_cache_mark_read(message_id, email)
 
         return {"success": True, "message": "Email marked as read"}
@@ -1357,6 +2235,9 @@ async def get_meetings(email: str, startDate: str = None, endDate: str = None):
     if cached and (time.time() - cached["fetched_at"]) < MEETINGS_CACHE_TTL:
         log.debug(f"Meetings cache HIT: {cache_key}")
         return cached["data"]
+    # Past its TTL, but still real data from the last successful call — kept
+    # as a fallback for the handlers below if the server can't be reached.
+    stale = cached
 
     org_url = f"{ORG_BASE}/api/Values/meetings"
     params  = {"email": email, "startDate": startDate, "endDate": endDate}
@@ -1388,14 +2269,22 @@ async def get_meetings(email: str, startDate: str = None, endDate: str = None):
         log.debug(f"Returning {len(meetings)} meetings")
         return meetings
 
-    except HTTPException:
+    except HTTPException as e:
+        # Serve the expired cache rather than an error: a stale calendar beats
+        # a blank one, and this entry was real data when it was fetched.
+        if stale and stale.get("data") is not None:
+            log.warning(f"get_meetings: calendar server error {e.status_code} — serving stale cache for {cache_key}")
+            return stale["data"]
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Calendar server timeout")
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach calendar server")
     except Exception as e:
         log.error(f"get_meetings error: {e}")
+        if stale and stale.get("data") is not None:
+            log.warning(f"get_meetings: {type(e).__name__} — serving stale cache for {cache_key}")
+            return stale["data"]
+        if isinstance(e, httpx.TimeoutException):
+            raise HTTPException(status_code=504, detail="Calendar server timeout")
+        if isinstance(e, httpx.ConnectError):
+            raise HTTPException(status_code=503, detail="Cannot reach calendar server")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1485,6 +2374,27 @@ async def get_day_brief(payload: dict = Body(...)):
 
     summary = await generate_day_brief_summary(meetings, date_label)
     return {"summary": summary}
+
+
+@app.post("/api/meetings/bullets")
+async def get_calendar_bullets_route(payload: dict = Body(...)):
+    """
+    Cached AI bullet points for a day's meetings — used by the header's
+    today's-meetings dropdown. Body: { user_email, date, meetings, dateLabel }
+    Cached per user+date+meetings fingerprint, so reopening the dropdown
+    doesn't re-call the model every time; regenerates only when the day or
+    the schedule itself changes.
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    date_key   = (payload.get("date") or "").strip()
+    meetings   = payload.get("meetings") or []
+    date_label = payload.get("dateLabel") or "today"
+
+    if not user_email or not date_key:
+        raise HTTPException(status_code=400, detail="Missing user_email or date")
+
+    bullets = await get_or_generate_calendar_bullets(user_email, date_key, meetings, date_label)
+    return {"bullets": bullets}
 
 
 # ── AUTO DIGEST ENDPOINT ─────────────────────────────────────────────────────
@@ -1606,6 +2516,50 @@ async def check_tracking_access(user_email: str):
     return {"allowed": is_tracking_allowed(user_email)}
 
 
+# ── ACTIVITY TRACKING ENDPOINTS ───────────────────────────────────────────────
+# Shows when each person using the dashboard is active and from which
+# (best-effort) device. This is data ABOUT other people, not just the caller,
+# so /api/activity/summary is gated by activity_access.json the same way
+# tracking is gated by tracking_access.json — edit that file to add/remove
+# who can see the summary; no server restart needed.
+
+@app.post("/api/activity/ping")
+async def activity_ping(payload: ActivityPingRequest):
+    """
+    Heartbeat from an active browser tab — the frontend calls this roughly
+    every 60s while the user is NOT idle (reuses the existing idle-detection
+    state, see Dashboard.jsx). No access check here: every logged-in user can
+    report their own activity, same as they can already see their own inbox.
+    """
+    record_activity_ping(payload.user_email, payload.device_id, payload.device_label)
+    return {"ok": True}
+
+
+@app.get("/api/activity/access")
+async def check_activity_access(user_email: str):
+    """
+    Returns whether the given user may view the (everyone's) activity
+    summary. The frontend calls this once on mount to decide whether to show
+    the Activity tab. Real enforcement is in /api/activity/summary itself.
+    """
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return {"allowed": is_activity_allowed(user_email)}
+
+
+@app.get("/api/activity/summary")
+async def activity_summary(requester_email: str, days: int = 14):
+    """
+    Per-user active-hours + device summary for everyone who has ever pinged.
+    requester_email must be listed in activity_access.json.
+    """
+    if not requester_email:
+        raise HTTPException(status_code=400, detail="Missing requester_email")
+    if not is_activity_allowed(requester_email):
+        raise HTTPException(status_code=403, detail="Not authorized to view activity data.")
+    return {"users": get_activity_summary(days=days)}
+
+
 @app.get("/api/tracking")
 async def get_tracking(user_email: str):
     """
@@ -1629,12 +2583,17 @@ async def get_tracking(user_email: str):
     # Wrapped in a broad try/except — an EWS failure must never block
     # the tracking load; the user still gets their data, just un-synced.
     try:
+        if org_is_down():
+            raise RuntimeError("org server known unreachable — skipping live sync")
         async with httpx.AsyncClient(timeout=20) as client:
             ews_resp = await client.get(
                 f"{ORG_BASE}/api/Values/sent7days",
                 params={"email": user_email}
             )
-        if ews_resp.status_code == 200:
+        if ews_resp.status_code != 200:
+            org_mark_failure(f"sent7days HTTP {ews_resp.status_code}")
+        else:
+            org_mark_success()
             ews_data = ews_resp.json()
             if isinstance(ews_data, list) and ews_data:
                 updated = sync_replies_from_ews(user_email, ews_data)
@@ -1673,59 +2632,13 @@ async def dismiss_tracking(payload: dict = Body(...)):
     return {"success": True}
 
 
-@app.get("/api/tracking/pending")
-async def get_pending_reminders(user_email: str):
-    """Returns all pending reminders awaiting review for this user."""
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    tracking = load_tracking(user_email)
-    pending  = tracking.get("pending_reminders", [])
-    return {"pending": pending, "total": len(pending)}
-
-
-@app.post("/api/tracking/pending/approve")
-async def approve_reminder(
-    user_email:  str  = Form(...),
-    reminder_id: str  = Form(...),
-    body:        str  = Form(""),   # empty = use the AI draft body stored in the reminder
-):
-    """
-    Approve and send a pending reminder (body may have been edited by user).
-    Per-user — each user only approves reminders from their own queue.
-    """
-    if not user_email or not reminder_id:
-        raise HTTPException(status_code=400, detail="Missing fields")
-    try:
-        from services import approve_pending_reminder
-        result = await approve_pending_reminder(user_email, reminder_id, body)
-        if not result.get("ok"):
-            raise HTTPException(status_code=500, detail=result.get("error", "Send failed"))
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        log.error(f"[approve_reminder] CRASH: {e}\n{tb}")
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
-
-
-@app.post("/api/tracking/pending/dismiss")
-async def dismiss_reminder(
-    user_email:  str = Form(...),
-    reminder_id: str = Form(...),
-):
-    """
-    Dismiss a pending reminder without sending it.
-    Per-user — only affects the requesting user's queue.
-    """
-    if not user_email or not reminder_id:
-        raise HTTPException(status_code=400, detail="Missing fields")
-    from services import dismiss_pending_reminder
-    result = dismiss_pending_reminder(user_email, reminder_id)
-    if not result.get("ok"):
-        raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
-    return result
+# The pending_reminders queue was retired when Day-1/Day-3 reminders moved to
+# auto-send from the scheduler. Nothing has written that key since, so
+# GET /api/tracking/pending could only ever return [], and its approve route
+# called a stub that returned ok=True without sending anything — an endpoint
+# that reports a reminder as sent when none was is worse than no endpoint.
+# Removed rather than left as a trap. Reminder sending now lives solely in
+# run_tracking_scheduler Pass 4 (services.py).
 
 
 @app.get("/api/sent-emails")
@@ -1740,7 +2653,9 @@ async def get_sent_emails(user_email: str):
       - notRepliedAddresses recipients who haven't replied yet
       - hasPendingReplies  any recipient still outstanding
       - hasQuestionMark    subject/body contains a question mark
-    Body is null (not loaded for performance) — display-only fields are sufficient.
+    NOTE: the docstring used to say the body is null "for performance". It
+    isn't — every sent email comes back with its text, which is what lets
+    Iris answer "what did I tell X" from the person's own words.
     """
     if not user_email:
         raise HTTPException(status_code=400, detail="Missing user_email")
@@ -1748,33 +2663,69 @@ async def get_sent_emails(user_email: str):
     org_url = f"{ORG_BASE}/api/Values/sent7days"
     log.debug(f"sent-emails: user={user_email}")
 
+    import re as _sre
+    cache_path = f"sent_cache_{_sre.sub(r'[^\w@.-]', '_', user_email.lower().strip())}.json"
+
+    def _serve_stale(reason: str, status: int, detail: str):
+        # Same idea as fetch_inbox: when the org server is down, show the last
+        # sent list we fetched instead of a blank tab, flagged as cached.
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("items"):
+                log.warning(f"sent-emails: {reason} — serving {len(cached['items'])} cached items for {user_email}")
+                r = JSONResponse(content=cached["items"])
+                r.headers["X-Data-Source"] = "cache"
+                r.headers["X-Cache-As-Of"] = cached.get("as_of", "")
+                return r
+        except Exception:
+            pass
+        raise HTTPException(status_code=status, detail=detail)
+
+    # Same circuit breaker as the inbox: once the org server has just failed,
+    # skip the wait and answer from the saved copy immediately.
+    if org_is_down():
+        return _serve_stale("org server known unreachable", 502, "Mail server unreachable.")
+
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(org_url, params={"email": user_email})
 
         if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Mail server error: {resp.text[:200]}"
+            org_mark_failure(f"sent7days HTTP {resp.status_code}")
+            return _serve_stale(
+                f"org server returned {resp.status_code}", resp.status_code,
+                f"Mail server error: {resp.text[:200]}"
             )
 
+        org_mark_success()
         data = resp.json()
         if not isinstance(data, list):
             return []
 
         # Return all emails — .NET already limits to 7 days
         log.debug(f"sent-emails: returning {len(data)} items for {user_email}")
+        if data:
+            try:
+                tmp = cache_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"as_of": datetime.now(timezone.utc).isoformat(), "items": data}, f)
+                os.replace(tmp, cache_path)   # atomic: never leaves a half-written cache
+            except Exception as ce:
+                log.warning(f"sent-emails: could not write cache: {ce}")
         return data
 
     except HTTPException:
         raise
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Mail server timeout")
+        org_mark_failure("sent7days timeout")
+        return _serve_stale("timeout", 504, "Mail server timeout")
     except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach mail server")
+        org_mark_failure("sent7days connect error")
+        return _serve_stale("connect error", 503, "Cannot reach mail server")
     except Exception as e:
         log.error(f"get_sent_emails error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return _serve_stale(f"error {e}", 500, str(e))
 
 
 @app.get("/api/tracking/pending-tracking")
@@ -1843,6 +2794,228 @@ async def get_tracking_skipped(user_email: str):
     from services import load_not_tracked_log
     entries = load_not_tracked_log(user_email)
     return {"skipped": entries, "total": len(entries)}
+
+
+@app.get("/api/tracking/needs-response")
+async def get_needs_response_route(user_email: str):
+    """
+    The inbound half of "what do I owe" — received emails whose thread the
+    person has never replied into. Shown in the Tracking page's
+    Deliverables tab alongside the existing outbound (sent-mail) tracking.
+    """
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    rows = await get_needs_response_emails(user_email)
+    return {"emails": rows, "total": len(rows)}
+
+
+@app.get("/api/thread-notes")
+async def get_thread_note_route(user_email: str, message_id: str = "", conversation_id: str = ""):
+    """
+    Returns the person's own context note for one thread, if any.
+    Keyed by conversation_id when present, else message_id.
+    """
+    thread_key = (conversation_id or message_id or "").strip()
+    if not user_email or not thread_key:
+        raise HTTPException(status_code=400, detail="Missing user_email or message_id/conversation_id")
+    return {"note": get_thread_note(user_email, thread_key)}
+
+
+@app.post("/api/thread-notes")
+async def save_thread_note_route(payload: dict = Body(...)):
+    """
+    Save (or clear, when note is blank) the person's context note for one
+    thread. Body: { user_email, message_id, conversation_id?, note }
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    thread_key = (payload.get("conversation_id") or payload.get("message_id") or "").strip()
+    note       = payload.get("note") or ""
+
+    if not user_email or not thread_key:
+        raise HTTPException(status_code=400, detail="Missing user_email or message_id/conversation_id")
+
+    updated_at = save_thread_note(user_email, thread_key, note)
+    return {"success": True, "updatedAt": updated_at}
+
+
+@app.get("/api/send-settings")
+async def get_send_settings_route(user_email: str):
+    """Per-user compose/send preferences — currently just the undo-send window."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return load_send_settings(user_email)
+
+
+@app.post("/api/send-settings")
+async def save_send_settings_route(payload: dict = Body(...)):
+    """Body: { user_email, undoWindowSeconds }"""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    seconds = save_send_settings(user_email, payload.get("undoWindowSeconds"))
+    return {"success": True, "undoWindowSeconds": seconds}
+
+
+@app.get("/api/signatures")
+async def get_signatures_route(user_email: str):
+    """Returns { signatures: [{id,name,body}], defaultNewId, defaultReplyId }."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return load_signature_settings(user_email)
+
+
+@app.post("/api/signatures")
+async def create_signature_route(payload: dict = Body(...)):
+    """Body: { user_email, name }"""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    sig = create_signature(user_email, payload.get("name"))
+    return {"success": True, "signature": sig}
+
+
+@app.post("/api/signatures/{sig_id}")
+async def update_signature_route(sig_id: str, payload: dict = Body(...)):
+    """Body: { user_email, name?, body? }"""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    updates = {k: v for k, v in payload.items() if k in ("name", "body")}
+    sig = update_signature(user_email, sig_id, updates)
+    if not sig:
+        raise HTTPException(status_code=404, detail="Signature not found")
+    return {"success": True, "signature": sig}
+
+
+@app.delete("/api/signatures/{sig_id}")
+async def delete_signature_route(sig_id: str, user_email: str):
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    if not delete_signature(user_email, sig_id):
+        raise HTTPException(status_code=404, detail="Signature not found")
+    return {"success": True}
+
+
+@app.post("/api/signature-defaults")
+async def set_signature_defaults_route(payload: dict = Body(...)):
+    """
+    Body: { user_email, defaultNewId?, defaultReplyId? } — either field may
+    be omitted (leaves that slot untouched) or null (clears it).
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    kwargs = {}
+    if "defaultNewId" in payload:
+        kwargs["default_new_id"] = payload["defaultNewId"]
+    if "defaultReplyId" in payload:
+        kwargs["default_reply_id"] = payload["defaultReplyId"]
+    settings = set_default_signatures(user_email, **kwargs)
+    return {"success": True, **settings}
+
+
+# ── Custom tags (Admin > Tags) ──────────────────────────────────────────
+
+@app.get("/api/tags/summary")
+async def get_ai_tags_summary_route(user_email: str):
+    """
+    Read-only counts for the categories that are pure AI decisions with no
+    folder behind them (URGENT/CONFIDENTIAL/MEETING/ZOOM/NEWSLETTER/NORMAL)
+    — shown as "AI tags" alongside the person's own custom tags below.
+    """
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return {"counts": get_ai_category_summary(user_email)}
+
+
+@app.get("/api/tags/ai-category/{category}")
+async def get_ai_tag_emails_route(category: str, user_email: str):
+    """Drill-down list for one of the read-only AI categories above."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return {"emails": get_emails_by_category(user_email, category)}
+
+
+@app.get("/api/tags")
+async def get_tags_route(user_email: str):
+    """Returns the person's own custom tags: [{id, name, prompt, status, matchedIds, ...}]."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    return {"tags": load_tags(user_email)}
+
+
+@app.post("/api/tags")
+async def create_tag_route(payload: dict = Body(...)):
+    """Body: { user_email, name, prompt }. Starts life as status='draft' until scanned + approved."""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    tag = create_tag(user_email, payload.get("name"), payload.get("prompt"))
+    return {"success": True, "tag": tag}
+
+
+@app.post("/api/tags/{tag_id}")
+async def update_tag_route(tag_id: str, payload: dict = Body(...)):
+    """Body: { user_email, name?, prompt? }. Editing the prompt resets the tag to draft — see update_tag()."""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    updates = {k: v for k, v in payload.items() if k in ("name", "prompt")}
+    tag = update_tag(user_email, tag_id, updates)
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    return {"success": True, "tag": tag}
+
+
+@app.delete("/api/tags/{tag_id}")
+async def delete_tag_route(tag_id: str, user_email: str):
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    if not delete_tag(user_email, tag_id):
+        raise HTTPException(status_code=404, detail="Tag not found")
+    return {"success": True}
+
+
+@app.post("/api/tags/{tag_id}/preview")
+async def preview_tag_route(tag_id: str, payload: dict = Body(...)):
+    """
+    "Scan Now" — body: { user_email }. Runs the tag's own prompt against
+    recent cached emails and returns candidate matches WITHOUT persisting
+    anything; the frontend shows these for review before /approve commits.
+    """
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    tags = load_tags(user_email)
+    tag = next((t for t in tags if t.get("id") == tag_id), None)
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    results = await preview_tag_matches(user_email, tag.get("name", ""), tag.get("prompt", ""))
+    return {"results": results}
+
+
+@app.post("/api/tags/{tag_id}/approve")
+async def approve_tag_route(tag_id: str, payload: dict = Body(...)):
+    """Body: { user_email, matchedIds: [messageId, ...] } — commits a previewed scan."""
+    user_email = (payload.get("user_email") or "").strip()
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    tag = approve_tag_matches(user_email, tag_id, payload.get("matchedIds") or [])
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    return {"success": True, "tag": tag}
+
+
+@app.get("/api/tags/{tag_id}/matches")
+async def get_tag_matches_route(tag_id: str, user_email: str):
+    """The emails currently carrying this tag, for a drill-down view."""
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    tags = load_tags(user_email)
+    tag = next((t for t in tags if t.get("id") == tag_id), None)
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    return {"emails": get_emails_by_ids(user_email, tag.get("matchedIds") or [])}
 
 
 @app.get("/api/tracking/digest")
@@ -2206,54 +3379,9 @@ async def analyze_sent_thread(payload: dict = Body(...)):
     if not user_email or not message_id:
         raise HTTPException(status_code=400, detail="Missing user_email or messageId")
 
-    org_url = f"{ORG_BASE}/api/Values/inbox/onemail"
-    params  = {"messageId": message_id, "targetUserEmail": user_email}
-
-    def _norm(msg: dict) -> dict:
-        """
-        Normalize a .NET MailDto from PascalCase to camelCase.
-        Handles both C# default serialization (PascalCase) and
-        previously-normalized (camelCase) objects transparently.
-        """
-        if not isinstance(msg, dict):
-            return {}
-        return {
-            "from":          msg.get("from")        or msg.get("From")        or "",
-            "to":            msg.get("to")          or msg.get("To")          or [],
-            "cc":            msg.get("cc")          or msg.get("Cc")          or [],
-            "subject":       msg.get("subject")     or msg.get("Subject")     or "",
-            "body":          msg.get("body")        or msg.get("Body")        or "",
-            "received":      msg.get("received")    or msg.get("Received")    or
-                             msg.get("received_at") or msg.get("date")        or "",
-            "messageId":     msg.get("messageId")   or msg.get("MessageId")   or "",
-            "conversationId":msg.get("conversationId") or msg.get("ConversationId") or "",
-            "attachments":   msg.get("attachments") or msg.get("Attachments") or [],
-        }
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(org_url, params=params)
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Mail server error: {resp.text[:200]}"
-            )
-        data = resp.json()
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Mail server timeout")
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach mail server")
-
-    # ── Extract + normalise all thread messages ───────────────────────────────
-    if isinstance(data, list):
-        raw_messages = data
-    elif isinstance(data, dict):
-        # Legacy shape: dict with optional messages[] inside
-        raw_messages = data.get("messages") or data.get("Messages") or [data]
-    else:
-        raw_messages = []
-
-    thread_messages = [_norm(m) for m in raw_messages if isinstance(m, dict)]
+    # Same fetch the tracking scheduler uses, so this button and the background
+    # pass are always looking at the same conversation, ordered the same way.
+    thread_messages = await fetch_thread_messages(user_email, message_id, timeout=60)
 
     # ── Fallback: empty list means EWS conversationId search returned nothing ─
     # Re-fetch via email-details (which also hits onemail but already has its
@@ -2273,9 +3401,9 @@ async def analyze_sent_thread(payload: dict = Body(...)):
                 fb_data = fb.json()
                 # email-details always returns a normalized dict with optional messages[]
                 if isinstance(fb_data.get("messages"), list) and fb_data["messages"]:
-                    thread_messages = [_norm(m) for m in fb_data["messages"]]
+                    thread_messages = [norm_thread_message(m) for m in fb_data["messages"]]
                 else:
-                    thread_messages = [_norm(fb_data)]
+                    thread_messages = [norm_thread_message(fb_data)]
         except Exception as fb_err:
             log.error(f"[analyze-sent-thread] fallback fetch failed: {fb_err}")
 
@@ -2388,8 +3516,24 @@ async def sync_tracking(payload: dict = Body(...)):
     if not is_tracking_allowed(user_email):
         raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
     _active_tracking_users.add(user_email)
+    begin_tracking_progress(user_email)
     asyncio.create_task(run_tracking_scheduler(user_email))
     return {"success": True, "message": "Tracking sync started"}
+
+
+@app.get("/api/tracking/sync-status")
+async def tracking_sync_status(user_email: str):
+    """
+    Where the current scan has got to, for the Tracking page's progress panel.
+
+    Cheap and poll-friendly: an in-memory read, no disk and no mail server. The
+    page polls this roughly once a second while a sync is running.
+    """
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Missing user_email")
+    if not is_tracking_allowed(user_email):
+        raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
+    return get_tracking_progress(user_email)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2400,5 +3544,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         access_log=False,          # silence per-request noise
-        log_level="warning"        # uvicorn internal logs: warnings+ only
+        log_level="error"          # uvicorn internal logs: errors only
     )

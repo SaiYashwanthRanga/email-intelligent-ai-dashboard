@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useMemo, useRef } from "react";
 import InboxView from './InboxView.jsx';
+import { getDeviceId, getDeviceLabel } from './deviceIdentity';
 
 const API_BASE = import.meta.env.VITE_API_URL;
 
@@ -243,6 +244,7 @@ function Dashboard() {
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(true);
   const [senderFilter, setSenderFilter] = useState(null); // { email, name } | null
   const [canUseTracking, setCanUseTracking] = useState(false);
+  const [canUseActivity, setCanUseActivity] = useState(false);
   const [autoDigest, setAutoDigest] = useState(null);       // complete 7-day digest from EWS
   const [digestLoading, setDigestLoading] = useState(true); // shows skeleton until first load
 
@@ -526,6 +528,11 @@ function Dashboard() {
         .then(r => r.json())
         .then(data => setCanUseTracking(!!data.allowed))
         .catch(() => setCanUseTracking(false));
+
+      fetch(`${API_BASE}/activity/access?user_email=${encodeURIComponent(email)}`)
+        .then(r => r.json())
+        .then(data => setCanUseActivity(!!data.allowed))
+        .catch(() => setCanUseActivity(false));
     }
   }, [navigate]);
 
@@ -590,6 +597,26 @@ function Dashboard() {
       window.removeEventListener("scroll", handleActivity);
     };
   }, []);
+
+  // ── ACTIVITY PING: heartbeat for the Team Activity feature ──────────────
+  // Fires roughly every 60s while this user is NOT idle. Reuses the idle
+  // detection above so pinging naturally pauses the moment they stop
+  // moving the mouse/typing, and resumes as soon as they're active again.
+  useEffect(() => {
+    const email = localStorage.getItem("userEmail") || "";
+    if (!email) return;
+    const ping = () => {
+      axios.post(`${API_BASE}/activity/ping`, {
+        user_email: email,
+        device_id: getDeviceId(),
+        device_label: getDeviceLabel(),
+      }).catch(() => {});
+    };
+    if (isIdle) return;
+    ping();
+    const interval = setInterval(ping, 60 * 1000);
+    return () => clearInterval(interval);
+  }, [isIdle]);
 
   // --- INITIAL LOAD (First time dashboard opens) ---
   useEffect(() => {
@@ -1269,6 +1296,7 @@ function Dashboard() {
       senderFilter={senderFilter}
       setSenderFilter={setSenderFilter}
       canUseTracking={canUseTracking}
+      canUseActivity={canUseActivity}
 
       // Flag / AI correction
       flagOpen={flagOpen}

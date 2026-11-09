@@ -1,7 +1,23 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
+import ReactQuill from "react-quill-new";
+import "react-quill-new/dist/quill.snow.css";
 import EmailAutocomplete from "./EmailAutocomplete";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+const SIGNATURE_MARKER = "signature-block";
+
+// Replaces the previous <div data-signature-block> in html with a new one (or
+// appends one if there wasn't one yet) — so switching signatures never
+// disturbs whatever the person actually typed above it.
+function mergeSignatureIntoBody(html, signatureHtml) {
+  const block = signatureHtml
+    ? `<div data-${SIGNATURE_MARKER}="true">${signatureHtml}</div>`
+    : "";
+  const markerRegex = new RegExp(`<div data-${SIGNATURE_MARKER}="true">[\\s\\S]*?</div>\\s*$`, "i");
+  const withoutOldSignature = (html || "").replace(markerRegex, "").trim();
+  if (!block) return withoutOldSignature;
+  return withoutOldSignature ? `${withoutOldSignature}<br/>${block}` : block;
+}
 
 const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = "", prefillQuotedBody = "", useReminderSender = false, onSent }) => {
   const [to, setTo] = useState("");
@@ -14,10 +30,25 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
   const [showCc, setShowCc] = useState(false);
   const [quotedBody, setQuotedBody] = useState("");
 
+  // ── Signatures ───────────────────────────────────────────────────────
+  const [signatures, setSignatures] = useState([]);
+  const [defaultNewId, setDefaultNewId] = useState(null);
+  const [defaultReplyId, setDefaultReplyId] = useState(null);
+  const [selectedSignatureId, setSelectedSignatureId] = useState(null);
+  const [showSignaturePicker, setShowSignaturePicker] = useState(false);
+
+  // ── Undo-send ────────────────────────────────────────────────────────
+  const [undoWindowSeconds, setUndoWindowSeconds] = useState(0);
+  const [countdown, setCountdown] = useState(null); // null = not pending, otherwise seconds remaining
+  const pendingSendRef = useRef(null); // { formData, endpoint }
+  const countdownIntervalRef = useRef(null);
+
   const resetCompose = () => {
     setTo(prefillTo || ""); setCc(""); setSubject(prefillSubject || ""); setBody("");
     setQuotedBody(prefillQuotedBody || "");
     setError(null); setAttachments([]); setShowCc(false);
+    setSelectedSignatureId(null); setShowSignaturePicker(false);
+    cancelPendingSend();
   };
 
   // Open/close — full reset
@@ -29,6 +60,51 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
     if (isOpen) setQuotedBody(prefillQuotedBody || "");
   }, [prefillQuotedBody]);
 
+  // Load send-settings (undo window) and signatures whenever the modal opens.
+  // Reminder sends go out via a shared reminders@ mailbox, so this user's own
+  // signature preferences don't apply there.
+  useEffect(() => {
+    if (!isOpen) return;
+    const email = localStorage.getItem("userEmail") || "";
+    if (!email) return;
+
+    fetch(`${API_BASE}/send-settings?user_email=${encodeURIComponent(email)}`)
+      .then(res => res.json())
+      .then(data => setUndoWindowSeconds(data.undoWindowSeconds || 0))
+      .catch(() => {});
+
+    if (!useReminderSender) {
+      fetch(`${API_BASE}/signatures?user_email=${encodeURIComponent(email)}`)
+        .then(res => res.json())
+        .then(data => {
+          setSignatures(data.signatures || []);
+          setDefaultNewId(data.defaultNewId || null);
+          setDefaultReplyId(data.defaultReplyId || null);
+          // Replying (there's a quoted original) uses the reply default; a
+          // fresh message uses the new-message default.
+          setSelectedSignatureId((prefillQuotedBody ? data.defaultReplyId : data.defaultNewId) || null);
+        })
+        .catch(() => {});
+    }
+  }, [isOpen, useReminderSender]);
+
+  // Insert/replace the signature block whenever the selection changes.
+  useEffect(() => {
+    const sigHtml = signatures.find(s => s.id === selectedSignatureId)?.body || "";
+    setBody(prev => mergeSignatureIntoBody(prev, sigHtml));
+  }, [selectedSignatureId, signatures]);
+
+  const cancelPendingSend = () => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    pendingSendRef.current = null;
+    setCountdown(null);
+  };
+
+  useEffect(() => () => cancelPendingSend(), []); // cleanup on unmount
+
   const handleAttachmentSelect = (e) => {
     setAttachments(prev => [...prev, ...Array.from(e.target.files)]);
   };
@@ -39,30 +115,10 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
 
   if (!isOpen) return null;
 
-  const sendEmail = async () => {
+  const dispatchSend = async ({ formData, endpoint }) => {
     setSending(true);
     setError(null);
     try {
-      const formData = new FormData();
-      to.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("to", em); });
-      cc.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("cc", em); });
-      formData.append("subject", subject);
-      // Combine user's reply body + quoted original below
-      const resolvedQuote = (quotedBody && quotedBody !== "loading") ? quotedBody : "";
-      const quotedSection = resolvedQuote
-        ? `<br/><br/><hr style="border:none;border-top:1px solid #ccc;margin:16px 0"/>` +
-          `<p style="color:#555;font-size:0.85em;margin:0 0 8px 0"><strong>--- Original Message ---</strong></p>` +
-          `<div style="color:#333;font-size:0.9em">${resolvedQuote}</div>`
-        : "";
-      formData.append("bodyHtml", body.replace(/\n/g, "<br/>") + quotedSection);
-      // Only set fromEmail for regular sends — reminder endpoint uses
-      // reminders@hfmg.net via EWS impersonation, no fromEmail needed
-      if (!useReminderSender) {
-        formData.append("fromEmail", localStorage.getItem("userEmail") || "");
-      }
-      attachments.forEach(file => formData.append("attachments", file));
-
-      const endpoint = useReminderSender ? "send-reminder" : "send-email";
       const response = await fetch(`${API_BASE}/${endpoint}`, {
         method: "POST",
         body: formData
@@ -79,6 +135,52 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
     } finally {
       setSending(false);
     }
+  };
+
+  const sendEmail = async () => {
+    const formData = new FormData();
+    to.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("to", em); });
+    cc.split(",").forEach(e => { const em = e.trim(); if (em) formData.append("cc", em); });
+    formData.append("subject", subject);
+    // Combine user's reply body (already HTML from the rich text editor) + quoted original below
+    const resolvedQuote = (quotedBody && quotedBody !== "loading") ? quotedBody : "";
+    const quotedSection = resolvedQuote
+      ? `<br/><br/><hr style="border:none;border-top:1px solid #ccc;margin:16px 0"/>` +
+        `<p style="color:#555;font-size:0.85em;margin:0 0 8px 0"><strong>--- Original Message ---</strong></p>` +
+        `<div style="color:#333;font-size:0.9em">${resolvedQuote}</div>`
+      : "";
+    formData.append("bodyHtml", body + quotedSection);
+    // Only set fromEmail for regular sends — reminder endpoint uses
+    // reminders@hfmg.net via EWS impersonation, no fromEmail needed
+    if (!useReminderSender) {
+      formData.append("fromEmail", localStorage.getItem("userEmail") || "");
+    }
+    attachments.forEach(file => formData.append("attachments", file));
+
+    const endpoint = useReminderSender ? "send-reminder" : "send-email";
+
+    if (!undoWindowSeconds) {
+      await dispatchSend({ formData, endpoint });
+      return;
+    }
+
+    // Undo window: hold the request and count down before actually firing it.
+    pendingSendRef.current = { formData, endpoint };
+    setCountdown(undoWindowSeconds);
+    countdownIntervalRef.current = setInterval(() => {
+      setCountdown(prev => {
+        if (prev === null) return null;
+        if (prev <= 1) {
+          clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
+          const pending = pendingSendRef.current;
+          pendingSendRef.current = null;
+          if (pending) dispatchSend(pending);
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
   };
 
   return (
@@ -137,13 +239,13 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
 
         {/* BODY */}
         <div style={s.bodyWrapper}>
-          <textarea
+          <ReactQuill
+            theme="snow"
             value={body}
-            onChange={e => setBody(e.target.value)}
+            onChange={setBody}
             placeholder="Write your message here..."
-            style={s.textarea}
+            style={s.quillWrapper}
           />
-          <span style={s.charCount}>{body.length} chars</span>
         </div>
 
         {/* QUOTED ORIGINAL EMAIL */}
@@ -203,25 +305,62 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
 
         {/* FOOTER */}
         <div style={s.footer}>
-          <div style={{ display: 'flex', gap: '10px' }}>
-            <input type="file" multiple onChange={handleAttachmentSelect} style={{ display: "none" }} id="attach-input" />
-            <label htmlFor="attach-input" style={s.attachBtn}>
-              📎 Attach
-              {attachments.length > 0 && <span style={s.attachBadge}>{attachments.length}</span>}
-            </label>
-          </div>
-          <div style={{ display: 'flex', gap: '10px' }}>
-            <button onClick={() => { resetCompose(); onClose(); }} disabled={sending} style={s.cancelBtn}>
-              Discard
-            </button>
-            <button
-              onClick={sendEmail}
-              disabled={sending || !to || !subject}
-              style={{ ...s.sendBtn, opacity: (sending || !to || !subject) ? 0.5 : 1, cursor: (sending || !to || !subject) ? 'not-allowed' : 'pointer' }}
-            >
-              {sending ? '⏳ Sending...' : '➤ Send'}
-            </button>
-          </div>
+          {countdown !== null ? (
+            <div style={s.undoBar}>
+              <span>Sending in {countdown}s…</span>
+              <button onClick={cancelPendingSend} style={s.undoBtn}>Undo</button>
+            </div>
+          ) : (
+            <>
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <input type="file" multiple onChange={handleAttachmentSelect} style={{ display: "none" }} id="attach-input" />
+                <label htmlFor="attach-input" style={s.attachBtn}>
+                  📎 Attach
+                  {attachments.length > 0 && <span style={s.attachBadge}>{attachments.length}</span>}
+                </label>
+                {!useReminderSender && signatures.length > 0 && (
+                  <div style={{ position: 'relative' }}>
+                    <button onClick={() => setShowSignaturePicker(p => !p)} style={s.attachBtn} title="Insert signature">
+                      ✍️ Signature
+                    </button>
+                    {showSignaturePicker && (
+                      <div style={s.sigDropdown}>
+                        <div
+                          style={s.sigDropdownItem}
+                          onClick={() => { setSelectedSignatureId(null); setShowSignaturePicker(false); }}
+                        >
+                          None
+                        </div>
+                        {signatures.map(sig => (
+                          <div
+                            key={sig.id}
+                            style={{ ...s.sigDropdownItem, fontWeight: selectedSignatureId === sig.id ? '700' : '400' }}
+                            onClick={() => { setSelectedSignatureId(sig.id); setShowSignaturePicker(false); }}
+                          >
+                            {sig.name}
+                            {sig.id === defaultNewId && <span style={s.sigBadge}>NEW</span>}
+                            {sig.id === defaultReplyId && <span style={s.sigBadge}>REPLY</span>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button onClick={() => { resetCompose(); onClose(); }} disabled={sending} style={s.cancelBtn}>
+                  Discard
+                </button>
+                <button
+                  onClick={sendEmail}
+                  disabled={sending || !to || !subject}
+                  style={{ ...s.sendBtn, opacity: (sending || !to || !subject) ? 0.5 : 1, cursor: (sending || !to || !subject) ? 'not-allowed' : 'pointer' }}
+                >
+                  {sending ? '⏳ Sending...' : '➤ Send'}
+                </button>
+              </div>
+            </>
+          )}
         </div>
 
       </div>
@@ -294,17 +433,9 @@ const s = {
     flex: 1, display: "flex", flexDirection: "column",
     position: "relative", overflow: "hidden"
   },
-  textarea: {
-    flex: 1, border: "none", outline: "none", resize: "none",
-    background: "var(--bg-main)", color: "var(--text-primary)",
-    fontSize: "0.95rem", lineHeight: "1.75",
-    padding: "20px 24px", fontFamily: "inherit", height: "100%",
-    boxSizing: "border-box"
-  },
-  charCount: {
-    position: "absolute", bottom: "8px", right: "14px",
-    fontSize: "0.68rem", color: "var(--text-secondary)",
-    fontVariantNumeric: "tabular-nums", opacity: 0.45, pointerEvents: "none"
+  quillWrapper: {
+    flex: 1, display: "flex", flexDirection: "column",
+    background: "var(--bg-main)", color: "var(--text-primary)"
   },
   attachList: {
     padding: "10px 24px",
@@ -352,6 +483,22 @@ const s = {
     fontSize: "0.65rem", fontWeight: "800",
     borderRadius: "999px", padding: "1px 6px", lineHeight: "1.4"
   },
+  sigDropdown: {
+    position: "absolute", bottom: "calc(100% + 6px)", left: 0,
+    background: "var(--bg-card)", border: "1px solid var(--border-color)",
+    borderRadius: "8px", boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
+    minWidth: "180px", zIndex: 10, overflow: "hidden"
+  },
+  sigDropdownItem: {
+    padding: "9px 14px", fontSize: "0.82rem", cursor: "pointer",
+    color: "var(--text-primary)", display: "flex", alignItems: "center", gap: "6px",
+    whiteSpace: "nowrap"
+  },
+  sigBadge: {
+    fontSize: "0.58rem", fontWeight: "800", color: "#00d9ff",
+    background: "rgba(0,217,255,0.1)", border: "1px solid rgba(0,217,255,0.25)",
+    borderRadius: "4px", padding: "1px 5px"
+  },
   cancelBtn: {
     padding: "8px 16px", borderRadius: "8px",
     border: "1px solid var(--border-color)",
@@ -364,6 +511,16 @@ const s = {
     color: "white", fontWeight: "700", fontSize: "0.9rem",
     boxShadow: "0 6px 20px rgba(37,99,235,0.35)",
     transition: "opacity 0.15s"
+  },
+  undoBar: {
+    display: "flex", alignItems: "center", gap: "14px",
+    fontSize: "0.88rem", color: "var(--text-primary)", fontWeight: "600",
+    width: "100%", justifyContent: "flex-end"
+  },
+  undoBtn: {
+    padding: "7px 16px", borderRadius: "8px", border: "none",
+    background: "linear-gradient(135deg, #f59e0b, #d97706)",
+    color: "white", fontWeight: "700", fontSize: "0.85rem", cursor: "pointer"
   },
   quotedWrapper: {
     borderTop: "2px solid var(--border-color)",

@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
   Paperclip, BarChart3, X, PieChart, Mail, ArrowLeft, Calendar,
-  FileText, Download, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader, LogOut
+  FileText, Download, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader, LogOut,
+  Users, Settings
 } from 'lucide-react';
 import TriageSummary from './TriageSummary';
 import ToastContainer from './Toast';
@@ -183,6 +184,7 @@ const DashboardView = ({
   senderFilter, setSenderFilter,
   triageStats,
   canUseTracking = false,
+  canUseActivity = false,
   autoDigest = null,
   digestLoading = false,
   // Flag / correction props
@@ -533,6 +535,10 @@ const DashboardView = ({
               {canUseTracking && (
                 <button className="view-btn" onClick={() => navigate('/tracking')} title="Follow-Up Tracking" style={{ position: 'relative' }}>📡 Tracking</button>
               )}
+              {canUseActivity && (
+                <button className="view-btn" onClick={() => navigate('/activity')} title="Team Activity"><Users size={18} /> Activity</button>
+              )}
+              <button className="view-btn" onClick={() => navigate('/admin')} title="Admin"><Settings size={18} /> Admin</button>
               <Iris
                 emails={emails}
                 report={report}

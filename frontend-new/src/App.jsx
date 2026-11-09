@@ -4,6 +4,8 @@ import Login from './Login';
 import Dashboard from './Dashboard';
 import Calendarview from './Calendarview';
 import TrackingView from './Trackingview';
+import ActivityView from './ActivityView';
+import { AdminHome, AdminSection } from './AdminView';
 import BootAnimation from './BootAnimation';
 import './animations.css';
 
@@ -25,6 +27,9 @@ function App() {
             <Route path="/" element={<PrivateRoute><Dashboard /></PrivateRoute>} />
             <Route path="/calendar" element={<PrivateRoute><Calendarview /></PrivateRoute>} />
             <Route path="/tracking" element={<PrivateRoute><TrackingView /></PrivateRoute>} />
+            <Route path="/activity" element={<PrivateRoute><ActivityView /></PrivateRoute>} />
+            <Route path="/admin" element={<PrivateRoute><AdminHome /></PrivateRoute>} />
+            <Route path="/admin/:section" element={<PrivateRoute><AdminSection /></PrivateRoute>} />
           </Routes>
         </Router>
       )}

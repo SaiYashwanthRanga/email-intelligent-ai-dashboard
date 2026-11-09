@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import time
+import uuid
 import asyncio
 import hashlib
 import html
@@ -11,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+
+import email_classifier as ec
 
 
 # ── Human-correction feedback injection ──────────────────────────────────────
@@ -62,6 +66,13 @@ def clean_for_ai(text: str, max_chars: int = 800) -> str:
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
+    # Stored bodies are capped at 5000 chars, which can sever a tag and leave a
+    # dangling "<div style=..." with no closing bracket for the rule above to
+    # match. Requires a letter or slash after the "<" so ordinary prose like
+    # "value < 5" at the end of a message survives. Must stay BEFORE unescape:
+    # afterwards, quoted addresses such as &lt;a@b.net&gt; become <a@b.net> and
+    # would be eaten as if they were markup.
+    text = re.sub(r"<[a-zA-Z/][^>]*$", " ", text)
     # Decode HTML entities
     text = html.unescape(text)
     # Collapse whitespace
@@ -101,70 +112,6 @@ def extract_sender_email(from_field: str) -> str:
         return ""
     match = re.search(r'[\w.+-]+@[\w.-]+', from_field)
     return match.group(0).lower() if match else from_field.lower()
-
-
-def is_newsletter_body(body: str, sender: str = "", attachment_count: int = 0) -> bool:
-    """Detect newsletter/marketing emails by body signals.
-
-    Hard vetoes (always return False):
-      - Sender domain is in NEWSLETTER_NEVER_DOMAINS
-      - Body contains any TRANSACTIONAL_SIGNALS keyword
-      - Email has 2+ attachments (real newsletters never have multiple attachments)
-
-    Signal thresholds:
-      - Internal senders (hfmg.net): 3+ signals required
-      - External with 1 attachment:  3+ signals required
-      - External with 0 attachments: 1+ signal required (original behaviour)
-    """
-    if not body:
-        return False
-
-    sender_lower = (sender or "").lower()
-
-    # ── Hard veto 1: protected partner / signing-service domains ──
-    if any(domain in sender_lower for domain in NEWSLETTER_NEVER_DOMAINS):
-        return False
-
-    body_lower = body.lower()
-
-    # ── Hard veto 2: transactional signals in body ──
-    if any(sig in body_lower for sig in TRANSACTIONAL_SIGNALS):
-        return False
-
-    # ── Hard veto 3: multiple attachments ──
-    if attachment_count >= 2:
-        return False
-
-    signals = [
-        "unsubscribe",
-        "view online",
-        "view in browser",
-        "view this email",
-        "you are receiving this",
-        "you're receiving this",
-        "copyright ©",
-        "copyright &copy",
-        "our address is",
-        "opt out",
-        "opt-out",
-        "email preferences",
-        "manage preferences",
-        "forward for signup",
-        "sign up for our",
-        "mailchimp",
-        "hubspot",
-        "sendgrid",
-        "constantcontact",
-    ]
-    matched = sum(1 for s in signals if s in body_lower)
-    is_internal = "hfmg.net" in sender_lower
-
-    # Internal or has 1 attachment → require 3+ signals to reduce false positives
-    if is_internal or attachment_count >= 1:
-        return matched >= 3
-
-    # External with no attachments → 1 signal is sufficient (original behaviour)
-    return matched >= 1
 
 
 # --- STEP 1: Create a strict classification prompt ---
@@ -209,15 +156,7 @@ Your job is to strictly classify an email into ONE of the following categories:
    - Any email that contains a Zoom meeting link (zoom.us URL)
 
 7. NEWSLETTER
-   - Marketing, announcements, automated updates, weekly/daily digests from publications or bulk senders
-   - Strong signals: unsubscribe link + no attachments + no direct action request + no payment/contract language
-   - NEVER classify as NEWSLETTER if: the email has attachments, contains a signature/DocuSign request,
-     references payments, HEDIS, ACO, chart chase, vendor agreements, office hours (partner programs),
-     or directly names the recipient with a specific action item.
-   - An unsubscribe footer alone is NOT sufficient — many legitimate partner and vendor platforms
-     (healthcare payers, ACO partners, e-signature services) append unsubscribe links to all their emails.
-   - A newsletter mentioning Zoom or any company as a news item is still NEWSLETTER
-   - [SPAM] or [JUNK] in subject does NOT change category — classify based on body content only
+   - Defined below under "NEWSLETTER RULES". Apply it exactly; it is the only definition.
 
 8. NORMAL
    - Everything else including: routine contract updates, employment paperwork status, weekly reports, operational counts, vendor analytics
@@ -229,6 +168,8 @@ Any email that is ONLY sharing information, counts, or reports (e.g. inactive in
 denial reports, productivity summaries, patient lists, weekly stats) must be classified as NORMAL.
 These are NEVER URGENT and NEVER CONFIDENTIAL, no matter how large the numbers are.
 URGENT and CONFIDENTIAL require an explicit action, decision, or same-day deadline.
+
+{NEWSLETTER_RULES}
 
 Rules:
 - Always choose exactly ONE category.
@@ -254,16 +195,46 @@ JSON format:
   "summary": "Detailed 2-4 sentence summary with all key facts."
 }
 """
+CLASSIFICATION_PROMPT = CLASSIFICATION_PROMPT.replace("{NEWSLETTER_RULES}", ec.NEWSLETTER_RULES)
 
 # 1. SETUP AI CLIENT
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
-ACTIVE_MODEL = "gpt-5.4-mini"
+ACTIVE_MODEL = "gpt-4o-mini"
 
 if not api_key:
     log.critical("OPENAI_API_KEY is missing from .env file!")
 
 client = AsyncOpenAI(api_key=api_key)
+
+# --- CONFIGURATION: ORG MAIL SERVER + REMINDER SAFETY -----------------------
+# One source of truth for the .NET mail server. This used to be hardcoded in
+# four places here while main.py read ORG_BASE from the environment, so
+# pointing the app at a staging server moved the API but left the scheduler
+# still mailing through production.
+ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177").rstrip("/")
+
+# The tracking scheduler mails real people with nobody in the loop, so it gets
+# an off switch and a ceiling.
+#   TRACKING_REMINDERS=off      parks delivery; nothing is marked sent, so a
+#                               pause loses no reminders — they go out when
+#                               it is switched back on.
+#   TRACKING_MAX_REMINDERS_PER_CYCLE
+#                               bounds the blast radius. The failure to design
+#                               against is a bad sentAt or a restored backup
+#                               mailing a hundred colleagues in one cycle;
+#                               a cap turns that into a capped burst plus a
+#                               loud log line.
+REMINDERS_ENABLED = os.getenv("TRACKING_REMINDERS", "on").strip().lower() not in (
+    "off", "0", "false", "no",
+)
+try:
+    MAX_REMINDERS_PER_CYCLE = max(0, int(os.getenv("TRACKING_MAX_REMINDERS_PER_CYCLE", "25")))
+except ValueError:
+    MAX_REMINDERS_PER_CYCLE = 25
+
+if not REMINDERS_ENABLED:
+    log.warning("[tracking] TRACKING_REMINDERS=off — reminder delivery is PARKED")
 
 # --- CONFIGURATION: VIP + PRIORITY SENDERS ---
 VIP_FILE      = "vip_list.json"
@@ -317,6 +288,18 @@ def _load_tracking_allowed():
 
 _load_tracking_allowed()   # run once at startup
 
+def get_tracking_allowed_users() -> set:
+    """
+    Everyone permitted to use tracking, re-read from disk.
+
+    The background scheduler runs off this rather than off whoever happened to
+    open the tracking page since the last restart — automation that only works
+    while someone is watching isn't automation.
+    """
+    _load_tracking_allowed()
+    return set(_TRACKING_ALLOWED_USERS)
+
+
 def is_tracking_allowed(user_email: str) -> bool:
     """
     Return True if user_email is permitted to use the tracking feature.
@@ -326,52 +309,137 @@ def is_tracking_allowed(user_email: str) -> bool:
     _load_tracking_allowed()   # reload from disk each time — file is tiny
     return user_email.lower().strip() in _TRACKING_ALLOWED_USERS
 # ────────────────────────────────────────────────────────────────────────────
+
+# ── ACTIVITY ACCESS CONTROL ──────────────────────────────────────────────────
+# The activity view shows every user's active hours and devices — that's
+# other people's data, not just the viewer's own, so it's gated the same way
+# tracking access is: only emails listed in activity_access.json can see it.
+# Edit that file to add/remove viewers — no code change or restart required.
+ACTIVITY_ACCESS_FILE = "activity_access.json"
+_ACTIVITY_ALLOWED_USERS: set = set()
+
+def _load_activity_allowed():
+    global _ACTIVITY_ALLOWED_USERS
+    users = load_sender_list(ACTIVITY_ACCESS_FILE)
+    _ACTIVITY_ALLOWED_USERS = {u.lower().strip() for u in users}
+
+_load_activity_allowed()   # run once at startup
+
+def is_activity_allowed(user_email: str) -> bool:
+    """Return True if user_email may view the (everyone's) activity summary."""
+    _load_activity_allowed()
+    return (user_email or "").lower().strip() in _ACTIVITY_ALLOWED_USERS
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── ACTIVITY TRACKING — active hours + device, per user ─────────────────────
+# Storage is bucketed by hour rather than one row per heartbeat, so a user
+# active every day for a year stays at ~24 counters/day instead of one row
+# every ~60s forever. "Device" is best-effort: browsers don't expose a real
+# OS-level device/computer name to a web page, so this is a persistent
+# per-browser id (generated client-side, see deviceIdentity.js) paired with
+# an OS+browser label sniffed from the user agent — the same physical laptop
+# shows up as a "different device" if the person switches browsers or clears
+# site data.
+ACTIVITY_LOG_FILE = "activity_log.json"
+_activity_lock = threading.Lock()
+ACTIVITY_RETENTION_DAYS = 60   # drop hour-buckets older than this on write
+
+def _load_activity_log() -> dict:
+    if os.path.exists(ACTIVITY_LOG_FILE):
+        try:
+            with open(ACTIVITY_LOG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_activity_log(data: dict):
+    with open(ACTIVITY_LOG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _parse_hour_key(key: str):
+    try:
+        return datetime.strptime(key, "%Y-%m-%dT%H")
+    except Exception:
+        return datetime.min
+
+def record_activity_ping(user_email: str, device_id: str, device_label: str = "") -> None:
+    """Record one heartbeat from an active (non-idle) browser tab."""
+    user_email = (user_email or "").lower().strip()
+    device_id  = (device_id or "").strip()
+    if not user_email or not device_id:
+        return
+
+    now      = datetime.now()
+    hour_key = now.strftime("%Y-%m-%dT%H")
+    now_iso  = now.isoformat()
+
+    with _activity_lock:
+        data = _load_activity_log()
+        user_entry = data.setdefault(user_email, {"devices": {}, "hourBuckets": {}, "lastSeen": now_iso})
+        user_entry["lastSeen"] = now_iso
+
+        device_entry = user_entry["devices"].setdefault(device_id, {"firstSeen": now_iso})
+        device_entry["label"]    = device_label or device_entry.get("label", "Unknown device")
+        device_entry["lastSeen"] = now_iso
+
+        buckets = user_entry.setdefault("hourBuckets", {})
+        buckets[hour_key] = buckets.get(hour_key, 0) + 1
+
+        cutoff = now - timedelta(days=ACTIVITY_RETENTION_DAYS)
+        user_entry["hourBuckets"] = {k: v for k, v in buckets.items() if _parse_hour_key(k) >= cutoff}
+
+        _save_activity_log(data)
+
+def get_activity_summary(days: int = 14) -> list:
+    """
+    Per-user summary for the activity dashboard: last-seen time, whether
+    they're active right now (pinged in the last 3 minutes — 3x the
+    frontend's 60s heartbeat interval, to absorb one missed beat), the
+    devices seen, and hour-bucketed activity counts for the requested window.
+    """
+    with _activity_lock:
+        data = _load_activity_log()
+
+    now    = datetime.now()
+    cutoff = now - timedelta(days=days)
+    result = []
+
+    for user_email, entry in data.items():
+        buckets = {
+            k: v for k, v in entry.get("hourBuckets", {}).items()
+            if _parse_hour_key(k) >= cutoff
+        }
+
+        last_seen_raw = entry.get("lastSeen")
+        try:
+            last_seen_dt = datetime.fromisoformat(last_seen_raw) if last_seen_raw else None
+        except Exception:
+            last_seen_dt = None
+        is_active_now = bool(last_seen_dt and (now - last_seen_dt) <= timedelta(minutes=3))
+
+        devices = [
+            {"deviceId": did, "label": d.get("label", "Unknown device"), "lastSeen": d.get("lastSeen")}
+            for did, d in entry.get("devices", {}).items()
+        ]
+        devices.sort(key=lambda d: d.get("lastSeen") or "", reverse=True)
+
+        result.append({
+            "userEmail":    user_email,
+            "lastSeen":     last_seen_raw,
+            "isActiveNow":  is_active_now,
+            "devices":      devices,
+            "hourBuckets":  buckets,   # { "2026-09-02T14": <ping count>, ... }
+        })
+
+    result.sort(key=lambda u: u.get("lastSeen") or "", reverse=True)
+    return result
+# ────────────────────────────────────────────────────────────────────────────
 # Domain-based matching for legal firms (catches any address at these firms)
 LEGAL_DOMAINS     = ["ropesgray.com", "garfunkelwild.com", "jclancylaw.com", "ambpclaw.com"]
 
-# ── NEWSLETTER PROTECTION ────────────────────────────────────────────────────
-# Domains that must NEVER be classified as NEWSLETTER regardless of body signals.
-# Covers ACO/healthcare partners, payment platforms, and e-signature services
-# whose system emails legitimately contain unsubscribe footers.
-NEWSLETTER_NEVER_DOMAINS = [
-    # ACO / healthcare partners
-    "stellarhealth.com", "stellar.com", "guideprogram.com",
-    "molinahealthcare.com", "molina.com",
-    "xenterdiagnostics.com", "xenter.com",
-    # E-signature platforms — all contain unsubscribe by design
-    "docusign.com", "docusign.net",
-    "hellosign.com", "signnow.com",
-    "esignlive.com", "adobesign.com", "echosign.com",
-    "dropboxsign.com",
-]
-
-# Body keywords that prove an email is transactional/operational — never newsletter.
-# If ANY of these are present the newsletter classifier short-circuits to False.
-TRANSACTIONAL_SIGNALS = [
-    "please sign",
-    "signature required",
-    "sign the document",
-    "review and sign",
-    "docusign",
-    "completed document",          # DocuSign completion notice
-    "hedis",
-    "chart chase",
-    "chart retrieval",
-    "aco partner",
-    "guide program",
-    "office hours program",        # partner/vendor program cadence calls
-    "office hours call",           # partner/vendor program cadence calls
-    "join our office hours",       # partner/vendor program cadence calls
-    "annual payment",
-    "invoice attached",
-    "payment attached",
-    "agreement attached",
-    "contract attached",
-    "see attached",
-    "please find attached",
-    "attached for your review",
-]
-# ────────────────────────────────────────────────────────────────────────────
+# NEWSLETTER_NEVER_DOMAINS / TRANSACTIONAL_SIGNALS and all newsletter detection
+# live in email_classifier.py (single source of truth, unit-tested).
 
 # ── DEDUPLICATION: VIP > LEGAL > PRIORITY > PROVIDERS ──────────────────────
 # If the same email appears in multiple lists, the highest-priority list wins.
@@ -599,6 +667,12 @@ def normalize_email(e: dict):
         # Exchange-authoritative thread identifier — groups all replies/forwards
         # in the same conversation regardless of subject line changes.
         "conversationId": e.get("conversationId") or e.get("ConversationId") or "",
+
+        # RFC 5322 headers (List-Unsubscribe, List-Id, Precedence, ...), if the
+        # mail server exposes them. Not every deployment does; email_classifier
+        # works without them and gets much more certain when they are present.
+        "headers": (e.get("headers") or e.get("internetMessageHeaders")
+                    or e.get("InternetMessageHeaders") or None),
     }
 
 
@@ -616,7 +690,7 @@ def _cache_file_for(user_email: str) -> str:
 # Bump this string any time the cache schema or AI logic changes.
 # Any cache file written with a different version will be discarded
 # automatically on next load, forcing a clean re-analysis.
-CACHE_VERSION = "v10"  # bumped: newsletter fast-path — skip AI for detected newsletters, fixes healthcare publication misclassification
+CACHE_VERSION = "v11"  # bumped: id-cache entries drop the full body (see save_emails_to_id_cache) and gain isMeetingInvite
 CACHE_VERSION_KEY = "meta_cache_version"
 
 def load_cache(user_email: str = "default"):
@@ -690,14 +764,284 @@ def set_last_email_count(count, user_email: str):
 def get_cached_emails_by_id(user_email: str) -> dict:
     return load_cache(user_email).get(EMAIL_ID_CACHE_KEY, {})
 
+# Categories the AI assigns purely from content — no sender list/folder
+# backs these (unlike VIP/LEGAL/PRIORITY/PROVIDERS), so Admin > Tags can
+# surface them read-only as "AI tags" by just counting the category field
+# already on each cached email. Read-only: this never writes a category.
+AI_ONLY_CATEGORIES = ["URGENT", "CONFIDENTIAL", "MEETING", "ZOOM", "NEWSLETTER", "NORMAL"]
+
+def get_ai_category_summary(user_email: str) -> dict:
+    """{ CATEGORY: count } for each of AI_ONLY_CATEGORIES, from cached emails."""
+    cached = get_cached_emails_by_id(user_email) or {}
+    counts = {cat: 0 for cat in AI_ONLY_CATEGORIES}
+    for entry in cached.values():
+        if not isinstance(entry, dict) or entry.get("_threadRef"):
+            continue
+        cat = (entry.get("category") or "").upper()
+        if cat in counts:
+            counts[cat] += 1
+    return counts
+
+def _cached_entry_to_row(entry: dict) -> dict:
+    return {
+        "messageId": entry.get("id") or entry.get("messageId"),
+        "conversationId": entry.get("conversationId"),
+        "from": entry.get("from") or entry.get("sender") or "Unknown Sender",
+        "subject": entry.get("subject") or "No Subject",
+        "category": entry.get("category") or "NORMAL",
+        "summary": entry.get("summary") or "",
+        "received_at": entry.get("received_at") or entry.get("received"),
+    }
+
+def get_emails_by_category(user_email: str, category: str, limit: int = 50) -> list:
+    """Read-only lookup for the Admin > Tags 'AI tags' drill-down."""
+    cached = get_cached_emails_by_id(user_email) or {}
+    category = (category or "").upper()
+    rows = [
+        _cached_entry_to_row(e) for e in cached.values()
+        if isinstance(e, dict) and not e.get("_threadRef") and (e.get("category") or "").upper() == category
+    ]
+    rows.sort(key=lambda r: str(r.get("received_at") or ""), reverse=True)
+    return rows[:limit]
+
+def get_emails_by_ids(user_email: str, message_ids: list) -> list:
+    """Read-only lookup for a custom tag's matched-emails drill-down."""
+    cached = get_cached_emails_by_id(user_email) or {}
+    wanted = set(message_ids or [])
+    rows = [
+        _cached_entry_to_row(e) for e in cached.values()
+        if isinstance(e, dict) and (e.get("id") or e.get("messageId")) in wanted
+    ]
+    rows.sort(key=lambda r: str(r.get("received_at") or ""), reverse=True)
+    return rows
+
+# ── Live-fetch fallback — when the org mail server can't be reached ────────
+# Stamped every time /api/fetch-inbox gets a real 200 back, so the UI can
+# show "last synced <time>" even while it's currently serving stale data.
+LAST_FETCH_OK_KEY = "meta_last_fetch_ok_at"
+
+def get_last_fetch_ok_at(user_email: str):
+    return load_cache(user_email).get(LAST_FETCH_OK_KEY)
+
+def set_last_fetch_ok_at(ts, user_email: str):
+    save_cache({LAST_FETCH_OK_KEY: ts}, user_email)
+
+# ── Email body/detail cache — makes mail readable during an outage ────────
+# The id-cache above deliberately drops bodies to keep syncs light, so
+# without this the inbox list would render during an outage but every email
+# would open blank. Stored one file per message rather than one big blob:
+# the access pattern is "read one, write one", and a single JSON file of a
+# few hundred HTML bodies would mean rewriting megabytes on every open.
+DETAIL_CACHE_DIR = "detail_cache"
+DETAIL_CACHE_MAX = 300          # per user; oldest pruned first
+DETAIL_BODY_MAX_CHARS = 400_000  # skip absurd bodies rather than bloat the disk
+
+def _detail_dir_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", (user_email or "default").lower().strip())
+    return os.path.join(DETAIL_CACHE_DIR, safe)
+
+def _detail_path_for(user_email: str, message_id: str) -> str:
+    # messageIds are long base64-ish EWS strings with characters that are not
+    # filename-safe, so key by hash.
+    digest = hashlib.sha1((message_id or "").encode("utf-8")).hexdigest()
+    return os.path.join(_detail_dir_for(user_email), f"{digest}.json")
+
+def detail_is_complete(detail) -> bool:
+    """
+    True when a cached detail carries everything the reader actually needs:
+    a body, and — for a conversation — a body on every message in the thread.
+
+    This is the guard against serving a half-populated copy. Only the
+    /api/Values/inbox/onemail response carries per-message bodies; anything
+    derived from the inbox listing has the thread's shape but none of its
+    content, and rendering that produces a conversation of blank messages.
+    Entries failing this check are treated as a cache miss, so they get
+    refetched and overwritten with a real copy on first use.
+    """
+    if not isinstance(detail, dict):
+        return False
+    if not detail.get("body"):
+        return False
+    messages = detail.get("messages") or []
+    if messages:
+        return all(isinstance(m, dict) and m.get("body") for m in messages)
+    return True
+
+def cached_detail_age_seconds(user_email: str, message_id: str):
+    """
+    Age of the cached copy in seconds, or None if there isn't one. Used to
+    decide whether a cached detail is fresh enough to serve without going to
+    the mail server: an individual message's body never changes, but the
+    conversation thread around it can gain replies, so a copy is only trusted
+    for a short window.
+    """
+    if not message_id:
+        return None
+    path = _detail_path_for(user_email, message_id)
+    try:
+        if os.path.exists(path):
+            return max(0.0, time.time() - os.path.getmtime(path))
+    except Exception:
+        pass
+    return None
+
+def has_cached_detail(user_email: str, message_id: str) -> bool:
+    """
+    Cheap existence check — the prefetcher asks this for every email in the
+    inbox on every sync, so it must not pay to parse hundreds of JSON bodies
+    just to find out they're already there.
+    """
+    if not message_id:
+        return False
+    return os.path.exists(_detail_path_for(user_email, message_id))
+
+def get_cached_detail(user_email: str, message_id: str):
+    """Return a previously cached email-details payload, or None."""
+    if not message_id:
+        return None
+    path = _detail_path_for(user_email, message_id)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"[detail-cache] read failed for {message_id[:20]}...: {e}")
+    return None
+
+def _prune_detail_cache(directory: str):
+    """Keep the newest DETAIL_CACHE_MAX files; drop the rest."""
+    try:
+        entries = [os.path.join(directory, n) for n in os.listdir(directory) if n.endswith(".json")]
+        if len(entries) <= DETAIL_CACHE_MAX:
+            return
+        entries.sort(key=lambda p: os.path.getmtime(p))   # oldest first
+        for stale in entries[:len(entries) - DETAIL_CACHE_MAX]:
+            try:
+                os.remove(stale)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"[detail-cache] prune failed: {e}")
+
+def save_cached_detail(user_email: str, message_id: str, detail: dict):
+    """
+    Persist one email-details payload for offline reading. Best-effort: a
+    cache write must never break the live request that triggered it.
+    """
+    if not message_id or not isinstance(detail, dict):
+        return
+    # Refuse to store a half-populated copy. Caching one is worse than
+    # caching nothing: it would later be served in place of a live fetch and
+    # render a thread of empty messages, and it would mask the email from the
+    # prefetcher that could have fetched it properly.
+    if not detail_is_complete(detail):
+        log.debug(f"[detail-cache] skipping incomplete payload for {message_id[:20]}...")
+        return
+    body = detail.get("body")
+    if isinstance(body, str) and len(body) > DETAIL_BODY_MAX_CHARS:
+        return
+    try:
+        directory = _detail_dir_for(user_email)
+        os.makedirs(directory, exist_ok=True)
+        path = _detail_path_for(user_email, message_id)
+        tmp = f"{path}.tmp"
+        # Write-then-rename so a crash mid-write can't leave a truncated file
+        # that later reads would choke on.
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(detail, f)
+        os.replace(tmp, path)
+        _prune_detail_cache(directory)
+    except Exception as e:
+        log.warning(f"[detail-cache] write failed for {message_id[:20]}...: {e}")
+
+def get_last_known_inbox(user_email: str, limit: int = None) -> list:
+    """
+    Best-effort reconstruction of "the inbox as we last knew it" from the
+    per-id analysis cache (meta_emails_by_id) — used as a fallback when the
+    live Outlook fetch fails (firewall/timeout/org server down) so the UI
+    can keep showing real data instead of going blank. Pointer stubs left
+    behind by thread dedup (see save_emails_to_id_cache's _threadRef) carry
+    no displayable fields, so only primary entries are returned.
+
+    `limit` mirrors the caller's requested `count` on /api/fetch-inbox so a
+    fallback for the "fast batch" phase doesn't hand back the entire
+    (possibly much larger, accumulated-over-time) cache — the id-cache is
+    an upsert-only dict that keeps every email ever analyzed for this user,
+    not just the most recent fetch.
+    """
+    by_id = get_cached_emails_by_id(user_email)
+    primaries = [e for e in by_id.values() if not e.get("_threadRef")]
+
+    def _sort_key(e):
+        raw = e.get("received_at") or e.get("received") or ""
+        try:
+            return datetime.fromisoformat(raw).timestamp()
+        except Exception:
+            return 0.0
+
+    primaries.sort(key=_sort_key, reverse=True)
+    return primaries[:limit] if limit else primaries
+
+# Phrases/domains that mean "this is a meeting/call invite" — the server-side
+# mirror of BODY_SIGNALS in frontend-new/src/meetingInvite.js, which is where
+# the UI's RSVP bar, the Insights INVITES tile, and the INVITES filter all
+# get their definition. Keep the two lists in sync. We compute this once
+# here, while the body is still around, then drop the body from what gets
+# cached (see save_emails_to_id_cache) so the flag substitutes for the body
+# on every future cache hit instead of re-shipping the full HTML forever.
+_MEETING_INVITE_SIGNALS = (
+    "you're invited", "you are invited", "meeting request", "has invited you",
+    "join the meeting", "join meeting", "zoom.us", "teams.microsoft.com",
+    "meet.google.com", "webex.com",
+)
+
+def _detect_meeting_invite(entry: dict) -> bool:
+    bodies = [entry.get("body") or ""]
+    bodies += [m.get("body") or "" for m in (entry.get("messages") or [])]
+    combined = " ".join(bodies).lower()
+    if any(sig in combined for sig in _MEETING_INVITE_SIGNALS):
+        return True
+    return any(
+        (a.get("name") or "").lower().endswith(".ics")
+        for a in (entry.get("attachments") or [])
+    )
+
 def save_emails_to_id_cache(emails: list, user_email: str):
     existing = get_cached_emails_by_id(user_email)
+    skipped = 0
     for e in emails:
         eid = e.get("id") or e.get("messageId")
+        # Never persist a failed analysis. This cache is consulted before the
+        # AI runs, so caching a failure makes it permanent: the email becomes
+        # a cache hit and shows "Pending analysis" forever, even though the
+        # next sync could have summarised it fine. Leaving it out costs one
+        # re-analysis and fixes itself.
+        if e.get("_analysisFailed"):
+            skipped += 1
+            continue
         if eid:
             entry = e.copy()
             entry.pop("full_hash", None)
+
+            # The full HTML body is only needed once: to feed the AI during
+            # analysis and to detect a meeting-invite signal. Every sync
+            # after that (this session's Phase 2, and every future session)
+            # was re-shipping it for emails whose analysis never changes.
+            # Capture the one signal derived from it, then drop it — the
+            # detail view (fetchEmailDetails) re-fetches the real body on
+            # open, so nothing else reads it from the cached copy.
+            entry["isMeetingInvite"] = _detect_meeting_invite(entry)
+            entry.pop("body", None)
+            entry.pop("headers", None)   # classification input only; can be large
+            if entry.get("messages"):
+                entry["messages"] = [
+                    {k: v for k, v in m.items() if k != "body"}
+                    for m in entry["messages"]
+                ]
+
             existing[eid] = entry
+    if skipped:
+        log.error(f"[cache] not caching {skipped} failed analyses for {user_email} — they will be retried next sync")
     save_cache({EMAIL_ID_CACHE_KEY: existing}, user_email)
 
 
@@ -877,6 +1221,23 @@ def detect_real_threads(emails):
     return threads, singles
 
 
+# Categories the model may return. ZOOM/LEGAL/VIP are assigned from sender and
+# link evidence, never trusted from the model; anything outside the set (a typo,
+# an invented label, "Promotional") becomes NORMAL instead of a phantom category.
+SINGLE_AI_CATEGORIES = ("VIP", "PRIORITY", "URGENT", "CONFIDENTIAL", "MEETING",
+                        "ZOOM", "NEWSLETTER", "NORMAL")
+BATCH_AI_CATEGORIES = SINGLE_AI_CATEGORIES
+THREAD_AI_CATEGORIES = ("URGENT", "MEETING", "CONFIDENTIAL", "NEWSLETTER", "NORMAL", "ZOOM")
+
+
+def _is_listed_sender(email: dict) -> bool:
+    """VIP/LEGAL/PRIORITY/PROVIDERS senders are never auto-filed as newsletters."""
+    sender = extract_sender_email(email.get("from") or "")
+    return (sender in VIP_SENDERS or sender in PRIORITY_SENDERS
+            or sender in PROVIDERS_SENDERS or sender in LEGAL_SENDERS
+            or any(sender.endswith("@" + d) for d in LEGAL_DOMAINS))
+
+
 # --- AI CORE FUNCTIONS ---
 
 async def analyze_single_email(email):
@@ -886,32 +1247,35 @@ async def analyze_single_email(email):
     body = email.get("body", "")
     subject = clean_subject(email.get("subject", "No Subject"))
 
+    # Evidence is computed from the FULL body (footers included) and handed to
+    # the model below, which only ever sees a truncated copy.
+    decision = ec.decide(email)
+
     # ── Newsletter fast-path: skip AI entirely ──────────────────────────────
-    # If is_newsletter_body() fires, we have hard signal evidence this is a
-    # newsletter. Don't send to AI — healthcare publication content looks too
-    # "operational" and the AI overrides the hint. Force NEWSLETTER directly.
-    if is_newsletter_body(body, email.get("from", ""), len(email.get("attachments") or [])):
+    # Only when the evidence is conclusive (mailing-list/marketing-platform
+    # proof plus no counter-evidence). Anything weaker goes to the model WITH
+    # the evidence, so a newsletter with an odd footer is still found and a
+    # transactional mail with an unsubscribe link is not.
+    if decision.certain == "NEWSLETTER" and not _is_listed_sender(email):
         email["category"] = "NEWSLETTER"
         email["priority"] = 1
         email["action"]   = "READ"
-        sender_label = email.get("from") or "unknown sender"
-        email["summary"] = (
-            f"Newsletter from {sender_label}. "
-            f"Subject: {subject}. "
-            f"Automated digest — no action required."
-        )
+        email["summary"]  = ec.newsletter_stub_summary(email.get("from"), subject)
         return email
     # ────────────────────────────────────────────────────────────────────────
 
+    evidence = json.dumps(ec.prompt_fields(decision))
     prompt = f"""
 Subject: {subject}
 From: {email.get('from')}
+Classifier evidence (facts computed from the full message): {evidence}
 Body:{body}{CLASSIFICATION_PROMPT}{_get_correction_block()}
 """
 
     try:
         response = await client.chat.completions.create(
             model=ACTIVE_MODEL,
+            temperature=0,   # same email must get the same category every time
             messages=[
                 {"role": "system", "content": "Output JSON only."},
                 {"role": "user", "content": prompt}
@@ -920,11 +1284,15 @@ Body:{body}{CLASSIFICATION_PROMPT}{_get_correction_block()}
         )
 
         result = json.loads(response.choices[0].message.content)
+        result["category"] = ec.guard(
+            ec.normalise_category(result.get("category"), SINGLE_AI_CATEGORIES), decision)
 
         sender = extract_sender_email(email.get("from") or "")
         body_text = (email.get("body") or "").lower()
         subject_text = (email.get("subject") or "").lower()
-        has_zoom = "zoom.us" in body_text or "zoom.us" in subject_text
+        # A conclusive newsletter that merely links a Zoom webinar is still a
+        # newsletter; the prompt has always said so, the code now agrees.
+        has_zoom = ("zoom.us" in body_text or "zoom.us" in subject_text)             and decision.certain != "NEWSLETTER"
 
         is_legal = sender in LEGAL_SENDERS or any(sender.endswith("@" + d) for d in LEGAL_DOMAINS)
         if has_zoom:
@@ -954,6 +1322,7 @@ Body:{body}{CLASSIFICATION_PROMPT}{_get_correction_block()}
         log.error(f"Single mail analysis failed: {e}")
         email["category"] = "NORMAL"
         email["summary"] = "Pending analysis"
+        email["_analysisFailed"] = True   # not a result — never cache it
         return email
 
 
@@ -970,11 +1339,19 @@ async def analyze_emails_batch(emails: list) -> list:
     pre_classified = []
     needs_ai = []
 
+    # One evidence assessment per email, reused for the fast-path, the prompt
+    # and the post-AI guard. Keyed by object identity: emails have no
+    # guaranteed-unique id here (thread results, id-less mail).
+    decisions = {}
+
     for email in emails:
         sender = extract_sender_email(email.get("from") or "")
         body_text = (email.get("body") or "").lower()
         subject_text = (email.get("subject") or "").lower()
-        has_zoom = "zoom.us" in body_text or "zoom.us" in subject_text
+        decision = decisions[id(email)] = ec.decide(email)
+        # A conclusive newsletter that merely links a Zoom webinar stays a
+        # newsletter (the prompt always said so; the code used to disagree).
+        has_zoom = ("zoom.us" in body_text or "zoom.us" in subject_text)             and decision.certain != "NEWSLETTER"
 
         is_legal = sender in LEGAL_SENDERS or any(sender.endswith("@" + d) for d in LEGAL_DOMAINS)
         if has_zoom:
@@ -1005,67 +1382,19 @@ async def analyze_emails_batch(emails: list) -> list:
         elif email.get("category") and email.get("summary"):
             # Already analyzed — skip
             pre_classified.append(email)
-        elif is_newsletter_body(email.get("body", ""), email.get("from", ""), len(email.get("attachments") or [])):
-            # Newsletter fast-path — skip AI, force NEWSLETTER directly
+        elif decision.certain == "NEWSLETTER":
+            # Newsletter fast-path: conclusive evidence only (see email_classifier)
             email["category"] = "NEWSLETTER"
             email["priority"] = 1
             email["action"]   = "READ"
-            sender_label = email.get("from") or "unknown sender"
-            subj_label   = clean_subject(email.get("subject", "No Subject"))
-            email["summary"] = (
-                f"Newsletter from {sender_label}. "
-                f"Subject: {subj_label}. "
-                f"Automated digest — no action required."
-            )
+            email["summary"]  = ec.newsletter_stub_summary(
+                email.get("from"), clean_subject(email.get("subject", "No Subject")))
             pre_classified.append(email)
         else:
             needs_ai.append(email)
 
     if not needs_ai:
         return pre_classified
-
-    # Build a single prompt with all emails
-    emails_input = []
-    for i, e in enumerate(needs_ai):
-        emails_input.append({
-            "index": i,
-            "subject": e.get("subject", "No Subject"),
-            "from": e.get("from", "Unknown"),
-            "body_preview": clean_for_ai(e.get("body") or "", 800)
-        })
-
-    batch_prompt = f"""
-You are an enterprise email triage assistant. Classify each email below.
-
-Categories: VIP | PRIORITY | URGENT | CONFIDENTIAL | MEETING | NEWSLETTER | NORMAL
-
-Rules:
-- ZOOM links are detected automatically before AI runs — never return ZOOM as a category
-- VIP: sender is a top-tier executive (detected automatically — AI should not set this)
-- PRIORITY: from senior staff/leadership, financial/legal topics
-- URGENT: the recipient must take a specific action TODAY or TOMORROW with a real named consequence (patient safety, financial cutoff, system outage). "ASAP" or urgency language alone without a hard deadline and concrete consequence is NOT URGENT. Routine counts and reports are NEVER urgent.
-- CONFIDENTIAL: ONLY emails requiring a DECISION or APPROVAL. NOT: routine contracts, offer letters, denial reports, analytics, inactive counts, or termination forms without explicit misconduct.
-- URGENT beats CONFIDENTIAL when a hard deadline is present.
-- MEETING: sender is explicitly asking the recipient to commit to a specific time — availability requests, calendar invites (.ics), back-and-forth scheduling. NOT MEETING: emails that merely mention a date in passing, meeting minutes shared as FYI, or vague "let's catch up" with no time being coordinated.
-- NEWSLETTER: marketing, automated updates, weekly/daily digests — ONLY when no attachments, no action request, no payment/vendor/ACO/HEDIS/DocuSign language. An unsubscribe footer alone is not enough.
-- NORMAL: routine contracts, employment paperwork, operational counts, vendor analytics, FYIs
-{_get_correction_block()}
-For each email return one object with: index, category, priority (1-5), and a summary of 4-6 sentences.
-Summary must be thorough enough that the reader never needs to open the email:
-- Sentence 1: Core topic, context, and who is involved (full names and roles if present)
-- Sentence 2: All specific details — exact numbers, dollar amounts, dates, deadlines, locations, system names, patient counts
-- Sentence 3: Any background or history relevant to understanding the request or issue
-- Sentence 4: What action or decision is needed from the recipient — and by when if stated
-- Sentence 5 (if applicable): Dependencies, blockers, escalation path, or related open items
-- Sentence 6 (if applicable): Attachments or follow-up items with their actual names
-Never be vague. Every sentence must contain at least one concrete fact. Never say "this email" or "the sender".
-
-INPUT:
-{json.dumps(emails_input)}
-
-OUTPUT JSON FORMAT:
-{{"results": [{{"index": 0, "category": "...", "priority": 1, "summary": "..."}}]}}
-"""
 
     # Split into chunks of 20 to avoid token limits
     BATCH_SIZE = 20
@@ -1079,7 +1408,9 @@ OUTPUT JSON FORMAT:
                 "subject": clean_subject(e.get("subject", "No Subject")),
                 "from": e.get("from", "Unknown"),
                 "body_preview": clean_for_ai(e.get("body") or "", 800),
-                "newsletter_hint": is_newsletter_body(e.get("body") or "", e.get("from", ""), len(e.get("attachments") or []))
+                # Facts computed from the FULL body (the preview is only the
+                # first 800 characters, so footers never reach the model).
+                **ec.prompt_fields(decisions[id(e)]),
             }
             for i, e in enumerate(chunk_emails)
         ]
@@ -1099,8 +1430,10 @@ Classification Rules:
 - CONFIDENTIAL: ONLY emails requiring an actual DECISION or APPROVAL — financial approvals, payment authorizations, budget approvals, HR disciplinary/termination actions involving suspicious activity or misconduct. NOT confidential: routine employment contracts, offer letters, onboarding paperwork, contract status updates, weekly denial reports, vendor analytics reports, inactive insurance/patient counts, or termination forms unless suspicious activity is explicitly stated.
 - URGENT beats CONFIDENTIAL: if an email has a hard deadline AND sensitive content, always choose URGENT.
 - MEETING: the sender is explicitly asking the recipient to commit to a specific time — availability requests, formal calendar invites (.ics attachment), or back-and-forth scheduling ("Can you do Thursday at 2pm?", "Let me know your availability"). NOT MEETING: an email that merely mentions a date or past event in passing, meeting minutes shared as FYI with no scheduling action, or vague future intent ("let's catch up sometime") without a specific time being coordinated. ASK: "Is the sender asking me to confirm a time?" — only yes is MEETING.
-- NEWSLETTER: marketing, automated digests, bulk updates — ONLY when no attachments, no direct action request, no payment/ACO/HEDIS/DocuSign/vendor agreement language. An unsubscribe footer alone is NOT sufficient — many healthcare partners and e-signature platforms append one to every email.
+- NEWSLETTER: see NEWSLETTER RULES below.
 - NORMAL: routine contract updates, employment paperwork, operational counts, vendor analytics, FYIs
+
+{ec.NEWSLETTER_RULES}
 {_get_correction_block()}
 Summary Rules — this is the most important part:
 - Write 2-4 sentences minimum. Never one sentence.
@@ -1121,14 +1454,33 @@ OUTPUT JSON:
 {{"results": [{{"index": 0, "category": "...", "priority": 1, "summary": "..."}}]}}
 """
         try:
-            response = await client.chat.completions.create(
-                model=ACTIVE_MODEL,
-                messages=[
-                    {"role": "system", "content": "Output JSON only."},
-                    {"role": "user", "content": chunk_prompt}
-                ],
-                response_format={"type": "json_object"}
-            )
+            # Retry transient failures (rate limits, timeouts, blips) before
+            # giving up on the whole chunk. One hiccup used to mark 20 emails
+            # "Pending analysis", and because that result was cached they were
+            # never looked at again.
+            last_err = None
+            response = None
+            for attempt in range(3):
+                try:
+                    response = await client.chat.completions.create(
+                        model=ACTIVE_MODEL,
+                        temperature=0,   # same email must get the same category every time
+                        messages=[
+                            {"role": "system", "content": "Output JSON only."},
+                            {"role": "user", "content": chunk_prompt}
+                        ],
+                        response_format={"type": "json_object"}
+                    )
+                    break
+                except Exception as api_err:
+                    last_err = api_err
+                    if attempt < 2:
+                        wait = 2 ** attempt          # 1s, then 2s
+                        log.warning(f"Batch chunk attempt {attempt + 1} failed ({type(api_err).__name__}), retrying in {wait}s")
+                        await asyncio.sleep(wait)
+            if response is None:
+                raise last_err
+
             parsed = json.loads(response.choices[0].message.content)
             results_map = {r["index"]: r for r in parsed.get("results", [])}
 
@@ -1143,7 +1495,9 @@ OUTPUT JSON:
                     # VIP/LEGAL: keep pre-set category, only take AI summary
                     email["summary"] = ai.get("summary", "No summary")
                 else:
-                    ai_category = ai.get("category", "NORMAL")
+                    ai_category = ec.guard(
+                        ec.normalise_category(ai.get("category"), BATCH_AI_CATEGORIES),
+                        decisions.get(id(email)))
                     # Hard guard: AI must never set ZOOM via content alone
                     if ai_category == "ZOOM" and "zoom.us" not in body_lower and "zoom.us" not in subject_lower:
                         ai_category = "MEETING"
@@ -1157,10 +1511,17 @@ OUTPUT JSON:
                 all_ai_results.append(email)
 
         except Exception as ex:
-            log.warning(f"Batch chunk failed: {ex}")
+            # log.error, not warning: this leaves a whole chunk of mail without
+            # a summary, and the app runs at errors-only log level.
+            log.error(f"Batch chunk failed after retries ({len(chunk_emails)} emails): {ex}")
             for email in chunk_emails:
                 email["category"] = "NORMAL"
                 email["summary"] = "Pending analysis"
+                # Marks this as a failure, not a result. save_emails_to_id_cache
+                # refuses to persist it, so the email is retried on the next
+                # sync instead of being a permanent cache hit showing
+                # "Pending analysis" forever.
+                email["_analysisFailed"] = True
                 all_ai_results.append(email)
 
     return pre_classified + all_ai_results
@@ -1212,7 +1573,17 @@ async def generate_sender_report(emails):
             display_name = msgs[0].get('from').split('<')[0].strip()
             if not display_name:
                 display_name = name
-            final_list.append({"name": display_name, "count": len(msgs), "attachments": att_count, "summary": summary_text})
+            # `email` is the address these messages were actually grouped by.
+            # The UI needs it to match this sender back to their mail exactly —
+            # matching on display_name meant a substring test, where a sender
+            # shown as "IT" also matched "Smith <smith@…>" and "Whitney <…>".
+            final_list.append({
+                "name": display_name,
+                "email": name,
+                "count": len(msgs),
+                "attachments": att_count,
+                "summary": summary_text,
+            })
         return final_list
     except Exception as e:
         log.error(f"Sender report error: {e}")
@@ -1327,6 +1698,8 @@ async def analyze_single_thread(subject, messages, user_email: str = "default", 
     TASK:
     1. Categorize: URGENT | MEETING | CONFIDENTIAL | NEWSLETTER | NORMAL
        (ZOOM is detected automatically — never return ZOOM as a category)
+       {ec.NEWSLETTER_RULES}
+       A thread with replies between people is a conversation, not a NEWSLETTER.
     2. Priority: 1-5
     3. Summary: Write 2-4 sentences thorough enough that the reader never needs to open the thread.
        - Sentence 1: What is this thread about? (topic, context, who is involved)
@@ -1342,10 +1715,12 @@ async def analyze_single_thread(subject, messages, user_email: str = "default", 
     try:
         response = await client.chat.completions.create(
             model=ACTIVE_MODEL,
+            temperature=0,   # same thread must get the same category every time
             messages=[{"role": "system", "content": "Output JSON only."}, {"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
         result = json.loads(response.choices[0].message.content)
+        result["category"] = ec.normalise_category(result.get("category"), THREAD_AI_CATEGORIES)
 
         has_zoom = False
         for m in clean_messages:
@@ -1802,6 +2177,121 @@ async def generate_day_brief_summary(meetings: list, date_label: str) -> str:
         return ""
 
 
+def _meeting_brief_items(meetings: list) -> list:
+    """Shared item-shaping for both the paragraph brief and the bullet list."""
+    items = []
+    for m in meetings:
+        subject   = m.get("subject") or "Untitled"
+        start     = m.get("start", "")
+        end       = m.get("end", "")
+        location  = m.get("location", "")
+        organizer = m.get("organizer", "")
+        required  = m.get("requiredAttendees") or []
+        optional  = m.get("optionalAttendees") or []
+        all_day   = m.get("isAllDay", False)
+        cancelled = m.get("isCancelled", False)
+
+        try:
+            time_str = "All day" if all_day else (
+                f"{datetime.fromisoformat(start).strftime('%I:%M %p').lstrip('0')} – "
+                f"{datetime.fromisoformat(end).strftime('%I:%M %p').lstrip('0')}"
+            )
+        except Exception:
+            time_str = start
+
+        items.append({
+            "title": subject,
+            "time": time_str,
+            "location": location or None,
+            "organizer": organizer or None,
+            "attendees": len(required) + len(optional),
+            "cancelled": cancelled,
+        })
+    return items
+
+
+async def generate_calendar_bullets(meetings: list, date_label: str) -> list:
+    """
+    Short AI bullet points summarising a day's meetings — for a compact
+    display (the header's today's-meetings dropdown) where a full paragraph
+    (generate_day_brief_summary, used by the Calendar page) is too much.
+    """
+    if not meetings:
+        return []
+
+    items = _meeting_brief_items(meetings)
+
+    prompt = (
+        f"You are an executive assistant preparing a quick-glance briefing for {date_label}.\n\n"
+        f"Meetings:\n{json.dumps(items, indent=2)}\n\n"
+        "Write at most 4 short bullet points (each under 12 words) covering what "
+        "actually matters about today's schedule — notable meetings, back-to-back "
+        "blocks, cancellations, or how light/heavy the day is overall. Skip "
+        "routine, unremarkable meetings rather than listing every single one.\n"
+        'Respond with JSON only: {"bullets": ["...", "..."]}'
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=ACTIVE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_completion_tokens=220,
+        )
+        result = json.loads(response.choices[0].message.content or "{}")
+        bullets = result.get("bullets") or []
+        return [str(b).strip() for b in bullets if str(b).strip()][:5]
+    except Exception as ex:
+        log.error(f"generate_calendar_bullets failed: {ex}")
+        return []
+
+
+# ── Calendar bullets cache ──────────────────────────────────────────────────
+# Persisted per user so reopening the dropdown doesn't re-call the model
+# every time — only when the day changes or the schedule itself does
+# (a meeting added, moved, or cancelled).
+
+def _calendar_bullets_file_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", user_email.lower().strip())
+    return f"calendar_bullets_{safe}.json"
+
+def _meetings_signature(meetings: list) -> str:
+    """Cheap, deterministic fingerprint of a meeting list (no hash() — its
+    salt varies per process, which would invalidate the cache on every
+    server restart even when the schedule hasn't changed)."""
+    parts = sorted(f"{m.get('start','')}|{m.get('subject','')}|{bool(m.get('isCancelled'))}" for m in meetings)
+    joined = "||".join(parts)
+    return f"{len(meetings)}:{len(joined)}:{joined[:200]}"
+
+def load_calendar_bullets(user_email: str, date_key: str, signature: str):
+    path = _calendar_bullets_file_for(user_email)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            if data.get("date") == date_key and data.get("signature") == signature:
+                return data.get("bullets")
+        except Exception as e:
+            log.error(f"load_calendar_bullets error: {e}")
+    return None
+
+def save_calendar_bullets(user_email: str, date_key: str, signature: str, bullets: list):
+    with open(_calendar_bullets_file_for(user_email), "w") as f:
+        json.dump({"date": date_key, "signature": signature, "bullets": bullets}, f, indent=2)
+
+async def get_or_generate_calendar_bullets(user_email: str, date_key: str, meetings: list, date_label: str) -> list:
+    """Public entry point: cache-check, generate on miss, save, return. Keeps
+    the signature scheme and file format as services.py's own concern —
+    main.py just calls this one function."""
+    signature = _meetings_signature(meetings)
+    cached = load_calendar_bullets(user_email, date_key, signature)
+    if cached is not None:
+        return cached
+    bullets = await generate_calendar_bullets(meetings, date_label)
+    save_calendar_bullets(user_email, date_key, signature, bullets)
+    return bullets
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def analyze_sent_thread_reply(
@@ -2000,6 +2490,276 @@ def save_tracking(data: dict, user_email: str):
         with open(path, "w") as f:
             json.dump(data, f, indent=2, default=str)
 
+
+# ── Per-thread context notes ────────────────────────────────────────────────
+# A free-text note the person writes on a specific thread ("what happened"),
+# read back later both in the reading pane and by Iris. Keyed by
+# conversationId when available, falling back to messageId for singletons —
+# the same rule Trackingview.jsx uses for its own thread key, so a note
+# written from any message in a thread surfaces no matter which message of
+# that thread is opened next time.
+
+def _thread_notes_file_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", user_email.lower().strip())
+    return f"thread_notes_{safe}.json"
+
+_thread_notes_locks: dict = {}
+_thread_notes_locks_mutex = threading.Lock()
+
+def _get_thread_notes_lock(user_email: str) -> threading.Lock:
+    with _thread_notes_locks_mutex:
+        if user_email not in _thread_notes_locks:
+            _thread_notes_locks[user_email] = threading.Lock()
+        return _thread_notes_locks[user_email]
+
+def load_thread_notes(user_email: str) -> dict:
+    """Load this user's {threadKey: {note, updatedAt}} store from disk."""
+    path = _thread_notes_file_for(user_email)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log.error(f"load_thread_notes error: {e}")
+    return {}
+
+def get_thread_note(user_email: str, thread_key: str):
+    """The saved note text for one thread, or None if it has none."""
+    if not thread_key:
+        return None
+    entry = load_thread_notes(user_email).get(thread_key)
+    return entry.get("note") if entry else None
+
+def save_thread_note(user_email: str, thread_key: str, note: str):
+    """
+    Upsert (or, on a blank note, clear) one thread's note. Returns the
+    stored updatedAt timestamp, or None when the note was cleared.
+    """
+    if not thread_key:
+        return None
+    note = (note or "").strip()
+    with _get_thread_notes_lock(user_email):
+        notes = load_thread_notes(user_email)
+        updated_at = None
+        if note:
+            updated_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+            notes[thread_key] = {"note": note, "updatedAt": updated_at}
+        else:
+            notes.pop(thread_key, None)
+        path = _thread_notes_file_for(user_email)
+        with open(path, "w") as f:
+            json.dump(notes, f, indent=2, default=str)
+    return updated_at
+
+
+# ── Send settings ────────────────────────────────────────────────────────
+# Per-user compose/send preferences. Starts with just the undo-send window
+# (Admin > Sending); nudge auto-send and voice settings land here later.
+
+def _send_settings_file_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", user_email.lower().strip())
+    return f"send_settings_{safe}.json"
+
+def load_send_settings(user_email: str) -> dict:
+    path = _send_settings_file_for(user_email)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log.error(f"load_send_settings error: {e}")
+    return {"undoWindowSeconds": 0}
+
+def save_send_settings(user_email: str, undo_window_seconds) -> int:
+    """Clamped to [0, 30] to match the Admin UI's stated max. Returns the stored value."""
+    try:
+        seconds = int(undo_window_seconds)
+    except (TypeError, ValueError):
+        seconds = 0
+    seconds = max(0, min(30, seconds))
+    with open(_send_settings_file_for(user_email), "w") as f:
+        json.dump({"undoWindowSeconds": seconds}, f, indent=2)
+    return seconds
+
+
+# ── Signatures ───────────────────────────────────────────────────────────
+# Per-user compose signatures (Admin > Signatures), Outlook-style: a named
+# signature is just {id, name, body} (body is rich HTML from the same
+# contentEditable editor the composer itself uses), and there are two
+# independent default slots — one for new messages, one for replies and
+# forwards — rather than a single "the" default. Both slots may point at
+# the same signature, different ones, or nothing.
+
+def _signatures_file_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", user_email.lower().strip())
+    return f"signatures_{safe}.json"
+
+def load_signature_settings(user_email: str) -> dict:
+    """{ signatures: [{id, name, body}], defaultNewId, defaultReplyId }"""
+    path = _signatures_file_for(user_email)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                # Migrate the earlier single-isDefault-flag shape.
+                default_id = next((s.get("id") for s in data if s.get("isDefault")), None)
+                return {
+                    "signatures": [{"id": s.get("id"), "name": s.get("name", ""), "body": s.get("body", "")} for s in data],
+                    "defaultNewId": default_id,
+                    "defaultReplyId": default_id,
+                }
+            return {
+                "signatures": data.get("signatures", []),
+                "defaultNewId": data.get("defaultNewId"),
+                "defaultReplyId": data.get("defaultReplyId"),
+            }
+        except Exception as e:
+            log.error(f"load_signature_settings error: {e}")
+    return {"signatures": [], "defaultNewId": None, "defaultReplyId": None}
+
+def _save_signature_settings(user_email: str, settings: dict):
+    with open(_signatures_file_for(user_email), "w") as f:
+        json.dump(settings, f, indent=2, default=str)
+
+def create_signature(user_email: str, name: str) -> dict:
+    settings = load_signature_settings(user_email)
+    new_sig = {"id": uuid.uuid4().hex[:12], "name": (name or "").strip() or "Untitled", "body": ""}
+    settings["signatures"].append(new_sig)
+    # The very first signature ever created becomes the default for both
+    # slots — otherwise a brand-new account's composer would insert nothing.
+    if len(settings["signatures"]) == 1:
+        settings["defaultNewId"] = new_sig["id"]
+        settings["defaultReplyId"] = new_sig["id"]
+    _save_signature_settings(user_email, settings)
+    return new_sig
+
+def update_signature(user_email: str, sig_id: str, updates: dict):
+    settings = load_signature_settings(user_email)
+    target = next((s for s in settings["signatures"] if s.get("id") == sig_id), None)
+    if not target:
+        return None
+    if "name" in updates:
+        target["name"] = (updates["name"] or "").strip() or target["name"]
+    if "body" in updates:
+        target["body"] = updates["body"] or ""
+    _save_signature_settings(user_email, settings)
+    return target
+
+def delete_signature(user_email: str, sig_id: str) -> bool:
+    settings = load_signature_settings(user_email)
+    remaining = [s for s in settings["signatures"] if s.get("id") != sig_id]
+    if len(remaining) == len(settings["signatures"]):
+        return False
+    settings["signatures"] = remaining
+    # Clear (or promote a replacement into) any default slot that pointed
+    # at the signature just deleted, so the composer never references a
+    # signature that no longer exists.
+    fallback = remaining[0]["id"] if remaining else None
+    if settings.get("defaultNewId") == sig_id:
+        settings["defaultNewId"] = fallback
+    if settings.get("defaultReplyId") == sig_id:
+        settings["defaultReplyId"] = fallback
+    _save_signature_settings(user_email, settings)
+    return True
+
+_UNSET = object()
+
+def set_default_signatures(user_email: str, default_new_id=_UNSET, default_reply_id=_UNSET) -> dict:
+    """Pass None for a slot to clear it; omit a param entirely to leave that slot untouched."""
+    settings = load_signature_settings(user_email)
+    valid_ids = {s["id"] for s in settings["signatures"]}
+    if default_new_id is not _UNSET and (default_new_id is None or default_new_id in valid_ids):
+        settings["defaultNewId"] = default_new_id
+    if default_reply_id is not _UNSET and (default_reply_id is None or default_reply_id in valid_ids):
+        settings["defaultReplyId"] = default_reply_id
+    _save_signature_settings(user_email, settings)
+    return settings
+
+# ── Custom tags ──────────────────────────────────────────────────────────
+# Admin > Tags. A tag is a user-authored semantic label with a plain-
+# language prompt ("what does this tag mean") that the AI matches emails
+# against on demand — deliberately separate from CATEGORY_META and the
+# analyze_emails_batch() classification pipeline above, which this never
+# reads or writes. A tag only ever gains matched emails through an explicit
+# scan-then-approve flow (iris_service.preview_tag_matches), never
+# automatically, so there is no ongoing per-email AI cost and nothing here
+# changes what category an email is stamped with.
+
+def _tags_file_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", user_email.lower().strip())
+    return f"tags_{safe}.json"
+
+def load_tags(user_email: str) -> list:
+    """[{id, name, prompt, status: 'draft'|'active', matchedIds: [], createdAt, updatedAt}]"""
+    path = _tags_file_for(user_email)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log.error(f"load_tags error: {e}")
+    return []
+
+def _save_tags(user_email: str, tags: list):
+    with open(_tags_file_for(user_email), "w") as f:
+        json.dump(tags, f, indent=2, default=str)
+
+def create_tag(user_email: str, name: str, prompt: str) -> dict:
+    tags = load_tags(user_email)
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    new_tag = {
+        "id": uuid.uuid4().hex[:12],
+        "name": (name or "").strip() or "Untitled tag",
+        "prompt": (prompt or "").strip(),
+        "status": "draft",
+        "matchedIds": [],
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    tags.append(new_tag)
+    _save_tags(user_email, tags)
+    return new_tag
+
+def update_tag(user_email: str, tag_id: str, updates: dict):
+    tags = load_tags(user_email)
+    target = next((t for t in tags if t.get("id") == tag_id), None)
+    if not target:
+        return None
+    if "name" in updates:
+        target["name"] = (updates["name"] or "").strip() or target["name"]
+    if "prompt" in updates:
+        target["prompt"] = (updates["prompt"] or "").strip()
+        # The prompt changed — any previously-approved matches were scanned
+        # against the OLD meaning, so they'd misrepresent what this tag
+        # means now. Back to draft until it's rescanned and reapproved.
+        target["status"] = "draft"
+        target["matchedIds"] = []
+    target["updatedAt"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    _save_tags(user_email, tags)
+    return target
+
+def delete_tag(user_email: str, tag_id: str) -> bool:
+    tags = load_tags(user_email)
+    remaining = [t for t in tags if t.get("id") != tag_id]
+    if len(remaining) == len(tags):
+        return False
+    _save_tags(user_email, remaining)
+    return True
+
+def approve_tag_matches(user_email: str, tag_id: str, matched_ids: list) -> dict:
+    """Commits a previewed scan's results — the only way a tag's matchedIds ever changes."""
+    tags = load_tags(user_email)
+    target = next((t for t in tags if t.get("id") == tag_id), None)
+    if not target:
+        return None
+    target["status"] = "active"
+    target["matchedIds"] = list(dict.fromkeys(matched_ids or []))  # de-dup, preserve order
+    target["updatedAt"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    _save_tags(user_email, tags)
+    return target
+
+
 # ---------------------------------------------------------------------------
 # Business-day counter
 # ---------------------------------------------------------------------------
@@ -2028,6 +2788,31 @@ def get_business_days_since(sent_at_str: str) -> int:
         log.error(f"get_business_days_since error for value={sent_at_str!r}: {e}")
         return 0
 
+def ews_not_replied_set(item: dict):
+    """
+    The addresses EWS says have NOT replied to one sent item, or None when EWS
+    did not report on that item at all.
+
+    The distinction between "absent" and "empty" is the whole point, and both
+    directions of collapsing it have already caused bugs here:
+
+      absent treated as empty  → every recipient looks replied, the email
+                                 auto-resolves, and the follow-up silently
+                                 disappears from Active Tracking.
+      empty treated as absent  → nobody is ever marked replied, so the
+                                 scheduler keeps firing Day-1 and Day-3
+                                 reminders at people who already answered.
+
+    An empty list is a real answer: EWS ran its In-Reply-To matching and found
+    nobody outstanding. A missing field means it never ran. One helper so both
+    the scheduler and the page-load sync read the field the same way.
+    """
+    raw = item.get("notRepliedAddresses", item.get("NotRepliedAddresses"))
+    if raw is None:
+        return None
+    return {str(a).lower() for a in raw}
+
+
 # ---------------------------------------------------------------------------
 # .NET API helpers
 # ---------------------------------------------------------------------------
@@ -2035,7 +2820,7 @@ def get_business_days_since(sent_at_str: str) -> int:
 async def fetch_sent_items_for_tracking(user_email: str, count: int = 100) -> list:
     """Call GET /api/Values/sentitems/{email}/count{n} on the .NET server."""
     import httpx as _httpx
-    url = f"http://172.22.6.145/api/Values/sentitems/{user_email}/count{count}"
+    url = f"{ORG_BASE}/api/Values/sentitems/{user_email}/count{count}"
     try:
         async with _httpx.AsyncClient(timeout=60) as hc:
             resp = await hc.get(url)
@@ -2046,6 +2831,85 @@ async def fetch_sent_items_for_tracking(user_email: str, count: int = 100) -> li
     except Exception as e:
         log.error(f"fetch_sent_items exception: {e}")
         return []
+
+
+def norm_thread_message(msg: dict) -> dict:
+    """
+    Normalise one .NET MailDto to camelCase.
+
+    The mail server serialises PascalCase, but several call paths here hand back
+    objects that have already been normalised once. Accepting both means a
+    caller never has to know which side of that line its data came from.
+    """
+    if not isinstance(msg, dict):
+        return {}
+    return {
+        "from":           msg.get("from")        or msg.get("From")        or "",
+        "to":             msg.get("to")          or msg.get("To")          or [],
+        "cc":             msg.get("cc")          or msg.get("Cc")          or [],
+        "subject":        msg.get("subject")     or msg.get("Subject")     or "",
+        "body":           msg.get("body")        or msg.get("Body")        or "",
+        "received":       msg.get("received")    or msg.get("Received")    or
+                          msg.get("received_at") or msg.get("date")        or "",
+        "messageId":      msg.get("messageId")   or msg.get("MessageId")   or "",
+        "conversationId": msg.get("conversationId") or msg.get("ConversationId") or "",
+        "attachments":    msg.get("attachments") or msg.get("Attachments") or [],
+    }
+
+
+def _thread_sort_key(msg: dict):
+    """Oldest → newest. Unparseable dates sort last so they read as 'most recent
+    known', which is the safer end of the transcript to be wrong about."""
+    raw = str(msg.get("received") or "").rstrip("Z")
+    try:
+        dt = datetime.fromisoformat(raw)
+        return (0, dt.replace(tzinfo=None))
+    except Exception:
+        return (1, datetime.max)
+
+
+async def fetch_thread_messages(
+    user_email: str, message_id: str, timeout: int = 30
+) -> list:
+    """
+    Every message in the conversation that one sent item belongs to — the
+    recipient's replies included — ordered oldest → newest.
+
+    GET /api/Values/inbox/onemail searches inbox AND sent by conversationId, so
+    this is what turns "what did I write" into "where does this conversation
+    actually stand". Returns [] on any failure; callers fall back to judging the
+    single sent item rather than losing it.
+    """
+    import httpx as _httpx
+    if not message_id:
+        return []
+    url    = f"{ORG_BASE}/api/Values/inbox/onemail"
+    params = {"messageId": message_id, "targetUserEmail": user_email}
+    try:
+        async with _httpx.AsyncClient(timeout=timeout) as hc:
+            resp = await hc.get(url, params=params)
+        if resp.status_code != 200:
+            log.warning(
+                f"[thread] onemail HTTP {resp.status_code} for "
+                f"{message_id[:24]}… — {resp.text[:120]}"
+            )
+            return []
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"[thread] onemail fetch failed for {message_id[:24]}…: {e}")
+        return []
+
+    if isinstance(data, list):
+        raw_messages = data
+    elif isinstance(data, dict):
+        raw_messages = data.get("messages") or data.get("Messages") or [data]
+    else:
+        raw_messages = []
+
+    messages = [norm_thread_message(m) for m in raw_messages if isinstance(m, dict)]
+    messages = [m for m in messages if m.get("body") or m.get("subject")]
+    messages.sort(key=_thread_sort_key)
+    return messages
 
 # ---------------------------------------------------------------------------
 # AI reminder body generator
@@ -2147,13 +3011,25 @@ async def _send_reminder(
     sent_at: str,
     orig_body: str,
     sender_first: str,
-    org: str = "http://172.22.6.98",
+    org: str = None,
 ) -> bool:
     """
     Generate AI body and send one reminder immediately.
     Updates info flags in-place on success.
     Returns True if sent successfully.
+
+    Honours the TRACKING_REMINDERS kill switch. When parked, nothing is marked
+    sent, so flipping it back on delivers the reminders that were due rather
+    than skipping them — a pause, not a loss.
     """
+    if not REMINDERS_ENABLED:
+        log.warning(
+            f"[tracking] reminder PARKED (TRACKING_REMINDERS=off) "
+            f"day={day} -> {addr} | {subject[:50]!r}"
+        )
+        return False
+
+    org          = org or ORG_BASE
     rec_first    = addr.split("@")[0].split(".")[0].title()
     display_addr = info.get("originalAddress", addr)
     is_external  = info.get("type") == "external"
@@ -2229,127 +3105,394 @@ def append_not_tracked(user_email: str, entry: dict):
 # AI batch tracking decision
 # ---------------------------------------------------------------------------
 
-_AI_TRACKING_CHUNK_SIZE = 5
+
+# Last AI failure seen by the tracking classifier, surfaced on /api/health so
+# an outage is visible as an outage instead of as a queue full of junk.
+AI_LAST_ERROR: dict = {"at": None, "error": None}
+
 
 def _fallback_decision(item: dict, reason: str = "AI unavailable") -> dict:
+    """
+    Used when the model could not be reached at all.
+
+    `_deferred` marks this as "not judged yet" rather than a real verdict. The
+    caller leaves such emails completely alone so the next cycle re-asks once
+    the AI is back. Without it, an outage wrote a permanent decision for every
+    email in flight — and because queued approvals are never re-evaluated,
+    that verdict could never be revisited. A blocked proxy for ten minutes
+    should not silently decide a day's follow-ups.
+    """
     return {
         "should_track":        True,
         "reason":              reason,
         "recipients_to_track": item.get("to", []),
         "dropped_recipients":  {},
+        "_deferred":           True,
     }
 
-def _extract_json_array(raw: str, chunk_size: int) -> list:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = _re.sub(r"^```[a-z]*\n?", "", raw, flags=_re.IGNORECASE)
-        raw = _re.sub(r"\n?```$", "", raw).strip()
-    if raw.startswith("{"):
-        raw = f"[{raw}]"
-    try:
-        result = json.loads(raw)
-        return result if isinstance(result, list) else [result]
-    except json.JSONDecodeError as e:
-        if "Extra data" in str(e):
-            try:
-                result = json.loads(raw[:e.pos])
-                return result if isinstance(result, list) else [result]
-            except Exception:
-                pass
-        try:
-            depth, last_close = 0, -1
-            for i, ch in enumerate(raw):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        last_close = i
-            if last_close > 0:
-                trimmed = raw[: last_close + 1].rstrip().rstrip(",")
-                if not trimmed.endswith("]"):
-                    trimmed += "]"
-                if not trimmed.startswith("["):
-                    trimmed = "[" + trimmed
-                result = json.loads(trimmed)
-                return result if isinstance(result, list) else [result]
-        except Exception:
-            pass
-    log.error("[ai_tracking] Could not parse JSON from GPT response")
-    return []
+# ---------------------------------------------------------------------------
+# Thread-aware tracking decisions
+#
+# This replaces a classifier that judged each sent email in isolation. It never
+# saw the reply that had already answered the email, and clean_for_ai strips the
+# quoted history, so it could not see what was being answered either — five
+# emails per call, a couple of hundred tokens per verdict, on one message each.
+# Worse, every "Re:" bypassed it completely and was queued unread.
+#
+# What follows reads the actual conversation — the recipient's messages
+# included — and decides where the thread STANDS, which is the only thing that
+# makes "do I still need to chase this" answerable.
+#
+# Cost is controlled in two places: a free local prefilter drops the obvious
+# non-asks before any network call, and a per-cycle ceiling means a first sync
+# over a large sent box spreads across cycles instead of landing in one bill.
+# ---------------------------------------------------------------------------
 
-async def _ai_tracking_batch(chunk: list, sender_name: str, sender_email: str) -> list:
-    batch_lines = []
-    for i, item in enumerate(chunk):
-        is_reply     = bool(item.get("isReply", False))
-        snippet_len  = 500 if is_reply else 300
-        body_snippet = (item.get("body") or "")[:snippet_len].strip()
-        to_list      = ", ".join(item.get("to") or [])
-        cc_list      = ", ".join(item.get("cc") or [])
-        all_rec      = ", ".join(list(dict.fromkeys(
-            (item.get("to") or []) + (item.get("cc") or [])
-        )))
-        type_label = "REPLY (thread)" if is_reply else "NEW EMAIL"
-        batch_lines.append(
-            f"#{i+1} [{type_label}]\n"
-            f"Subject: {item.get('subject','(no subject)')}\n"
-            f"To: {to_list or '-'}\nCC: {cc_list or '-'}\n"
-            f"All recipients: {all_rec or '-'}\n"
-            f"Body: {body_snippet or '(empty)'}"
+# Newest N messages of a thread handed to the model. Long threads are almost
+# always decided by their tail; the head is context the subject already gives.
+_TRACKING_THREAD_MSG_CAP     = 12
+_TRACKING_THREAD_BODY_CHARS  = 900
+# Parallel thread fetches. The mail server is the constraint, not the model.
+_TRACKING_THREAD_CONCURRENCY = 4
+# Thread judgements one cycle will run. Anything over the line is left
+# completely unjudged — not queued, not skipped — so the next cycle picks it up.
+_TRACKING_MAX_JUDGEMENTS_PER_CYCLE = int(
+    os.getenv("TRACKING_MAX_JUDGEMENTS_PER_CYCLE", "40")
+)
+
+# Present → something is being asked of someone, so never prefilter it away.
+_ASK_MARKERS = (
+    "?", "please", "can you", "could you", "would you", "will you", "kindly",
+    "need", "require", "request", "send", "share", "provide", "confirm",
+    "approve", "sign", "review", "check", "update", "let me know", "advise",
+    "follow up", "asap", "by eod", "by tomorrow", "deadline", "schedule",
+    "arrange", "verify", "fix", "resolve", "get back", "waiting", "awaiting",
+)
+
+# Present, and nothing else of substance → the message closes a loop.
+_ACK_MARKERS = (
+    "thank", "thx", "noted", "received", "got it", "understood", "will do",
+    "sounds good", "perfect", "appreciate", "acknowledged", "no problem",
+    "you're welcome", "ok", "okay",
+)
+
+# Auto-generated mail that can end up in a sent box.
+_AUTOMATED_SUBJECT_RE = _re.compile(
+    r"^(automatic reply|auto[- ]?reply|out of office|undeliverable|"
+    r"delivery status notification|read:|not read:|returned mail)",
+    _re.IGNORECASE,
+)
+
+
+def _obvious_no_followup(item: dict) -> str:
+    """
+    A skip reason when this sent item plainly cannot be a follow-up, or "" when
+    it needs a real look.
+
+    Deliberately narrow. Every rule here decides WITHOUT the thread and without
+    the model, so each one is a chance to silently drop a follow-up — the exact
+    failure the thread pass exists to end. Anything that mentions an ask, or
+    that runs long enough to bury one, goes to the AI.
+    """
+    subject = item.get("subject", "") or ""
+    if _AUTOMATED_SUBJECT_RE.match(subject.strip()):
+        return "Automated message (auto-reply or delivery notice)"
+
+    body = clean_for_ai(item.get("body") or "", 400)
+    low  = f"{subject}\n{body}".lower()
+
+    if any(m in low for m in _ASK_MARKERS):
+        return ""
+
+    # Short, no ask anywhere, and it reads as an acknowledgement. A message
+    # this small has nowhere to hide a request.
+    if len(body) <= 200 and any(m in low for m in _ACK_MARKERS):
+        return "Acknowledgement only — nothing asked of anyone"
+
+    return ""
+
+
+def _build_thread_transcript(thread: list, user_email: str) -> tuple:
+    """
+    Render a thread for the model, newest-last, with every message labelled by
+    direction. Returns (transcript, included_count, omitted_count).
+
+    Direction is the whole game: "SENT BY" versus "RECEIVED FROM" is what lets
+    the model tell an answered thread from an ignored one.
+    """
+    me      = (user_email or "").lower()
+    tail    = thread[-_TRACKING_THREAD_MSG_CAP:]
+    omitted = len(thread) - len(tail)
+    lines   = []
+
+    for i, msg in enumerate(tail):
+        from_addr = extract_sender_email(msg.get("from") or "")
+        is_mine   = bool(from_addr) and from_addr == me
+        who       = "SENT BY THE USER" if is_mine else f"RECEIVED FROM {from_addr or 'unknown'}"
+
+        to_list = msg.get("to") or []
+        to_str  = ", ".join(to_list) if isinstance(to_list, list) else str(to_list)
+
+        raw_date = str(msg.get("received") or "")
+        try:
+            date_fmt = datetime.fromisoformat(raw_date.rstrip("Z")).strftime("%b %d %Y %I:%M %p")
+        except Exception:
+            date_fmt = raw_date or "(no date)"
+
+        lines.append(
+            f"[Message {i+1} — {who}]\n"
+            f"Date: {date_fmt}\n"
+            f"To: {to_str or '-'}\n"
+            f"Body: {clean_for_ai(msg.get('body') or '', _TRACKING_THREAD_BODY_CHARS) or '(empty)'}"
         )
 
-    prompt = f"""You are a follow-up tracking filter for a medical group executive portal.
+    header = (
+        f"({omitted} earlier message(s) in this thread omitted — the {len(tail)} "
+        f"most recent are shown)\n\n" if omitted > 0 else ""
+    )
+    return header + "\n---\n".join(lines), len(tail), max(0, omitted)
+
+
+async def ai_thread_tracking_decision(
+    item: dict, thread: list, sender_name: str, sender_email: str
+) -> dict:
+    """
+    Decide whether one sent item still needs chasing, judged on its whole
+    conversation. Returns the same shape as the batch classifier plus
+    `thread_state`, `thread_size` and `thread_loaded`.
+    """
+    # A failed fetch leaves us with the sent item alone. Judge it rather than
+    # losing it — but say so in the prompt, because "no replies present" must
+    # not be read as "nobody has answered" when the replies simply never loaded.
+    thread_loaded = bool(thread)
+    if not thread_loaded:
+        thread = [{
+            "from":     sender_email,
+            "to":       item.get("to") or [],
+            "body":     item.get("body") or "",
+            "received": item.get("sentAt") or "",
+        }]
+
+    transcript, shown, omitted = _build_thread_transcript(thread, sender_email)
+
+    recipients = list(dict.fromkeys(
+        (item.get("to") or []) + (item.get("cc") or [])
+    ))
+
+    load_note = (
+        "" if thread_loaded else
+        "\nNOTE: only the user's own message could be loaded for this "
+        "conversation. Replies may exist but are not shown — do NOT treat their "
+        "absence as evidence that nobody answered.\n"
+    )
+
+    prompt = f"""You are a follow-up analyst for a medical group executive portal.
 
 The logged-in user is: {sender_name} ({sender_email})
+Subject: {item.get('subject', '(no subject)')}
 
-For each email decide whether {sender_name} needs to track it for a reply.
+RECIPIENTS OF THE USER'S LATEST SENT MESSAGE (the only addresses you may return):
+{', '.join(recipients) or '-'}
 
-NEW EMAIL: TRACK if {sender_name} asked a direct question, approval, or action item. SKIP if FYI/thank-you/confirmation with no ask.
-REPLY (thread): TRACK only if {sender_name}'s OWN new text (top of body) contains a direct question or request to a SPECIFIC person. SKIP if just acknowledging/thanking.
-recipients_to_track: only people directly asked. Empty [] if should_track=false.
+FULL CONVERSATION, oldest first ({shown} message(s) shown, {omitted} omitted):
+{transcript}
+{load_note}
+TASK: as of the NEWEST message above, does somebody other than {sender_name}
+still owe {sender_name} something?
 
-Return EXACTLY {len(chunk)} JSON objects in order (raw array, no markdown):
-{{"should_track":true/false,"reason":"one sentence","recipients_to_track":["email@example.com"]}}
+TRACK when someone still owes a response or an action:
+  - a question, or a request for information, a document or a number, that has
+    not been answered since it was asked
+  - a request for approval, sign-off, confirmation or a decision, still open
+  - a task handed to someone else and not yet reported as done. An assigned
+    action counts even when no written reply is expected — {sender_name} is
+    waiting on the work, not on the words.
+  - a stated deadline or expected reply that has not arrived
 
-EMAILS:
-{chr(10).join(batch_lines)}"""
+SKIP when nothing is outstanding:
+  - everyone who was asked has since replied, answered, or delivered. THIS IS
+    THE POINT OF READING THE THREAD — if a later message from the recipient
+    answers the ask, the thread is done, so skip it and say who answered.
+  - the newest message closes the matter (agreement reached, question answered,
+    meeting confirmed, issue resolved)
+  - pure FYI, an announcement, a thank-you, or an automated notification
+  - the outstanding work is {sender_name}'s OWN ("I'll send it shortly",
+    "attached as you asked", "I'll check with them"). Delivering what someone
+    asked for is not waiting on a reply. Track only when the debt runs TOWARD
+    {sender_name}.
+
+PARTIAL REPLIES MATTER: when three people were asked and one answered, track
+the two who did not. Put only those two in recipients_to_track.
+
+Judge whether the ask was actually ANSWERED, not merely whether someone wrote
+back. "Will look into it" or "let me check" leaves the ask open — keep tracking.
+
+If only one message is shown because nobody has replied yet, that is a normal
+open thread — judge the ask on its merits and track it if one was made.
+
+WHEN GENUINELY UNSURE, TRACK IT. A wrongly tracked email costs one dismissal
+click; a wrongly skipped one is a follow-up dropped forever. This breaks real
+ties only — do not use it to overturn a conclusion you have already reached.
+
+recipients_to_track: only people who still owe something, drawn EXACTLY from
+the recipient list above, spelled the same way. Empty [] when should_track is
+false.
+
+Respond with JSON only:
+{{"should_track": true or false,
+  "reason": "one sentence naming what is outstanding, or who already answered",
+  "recipients_to_track": ["email@example.com"],
+  "thread_state": "short phrase, max 8 words, e.g. 'Waiting on Dr Patel since Sep 8'"}}"""
 
     try:
         response = await client.chat.completions.create(
             model=ACTIVE_MODEL,
             messages=[
-                {"role": "system", "content": "Output only a raw JSON array."},
+                {"role": "system", "content": "Output only valid JSON. No markdown, no preamble."},
                 {"role": "user",   "content": prompt},
             ],
-            max_completion_tokens=600,
+            response_format={"type": "json_object"},
+            max_completion_tokens=450,
         )
-        raw = response.choices[0].message.content or ""
-        parsed = _extract_json_array(raw, len(chunk))
-        if len(parsed) == len(chunk):
-            return parsed
-        log.warning(f"[ai_tracking] Got {len(parsed)} results for {len(chunk)} items — using fallbacks")
-        results = list(parsed) + [None] * (len(chunk) - len(parsed))
-        return [r if r is not None else _fallback_decision(chunk[i]) for i, r in enumerate(results)]
+        result = json.loads(response.choices[0].message.content or "{}")
     except Exception as e:
-        log.error(f"[ai_tracking] batch error: {e}")
-        return [_fallback_decision(item) for item in chunk]
+        AI_LAST_ERROR["at"]    = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+        AI_LAST_ERROR["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        log.error(f"[thread_tracking] decision failed for '{item.get('subject','')[:40]}': {e}")
+        return _fallback_decision(item)
 
-async def ai_tracking_decision(
-    items: list, sender_name: str = "the sender", sender_email: str = ""
+    decision = {
+        "should_track":        bool(result.get("should_track", True)),
+        "reason":              (result.get("reason") or "").strip() or "No reason given",
+        "recipients_to_track": result.get("recipients_to_track") or [],
+        "thread_state":        (result.get("thread_state") or "").strip(),
+        "thread_size":         len(thread),
+        "thread_loaded":       thread_loaded,
+    }
+    if not isinstance(decision["recipients_to_track"], list):
+        decision["recipients_to_track"] = []
+    return decision
+
+
+async def judge_sent_items_with_threads(
+    items: list, user_email: str, sender_name: str, on_item=None
 ) -> list:
-    """Run AI tracking decisions in chunks of 5. Returns one decision per item."""
-    all_decisions = []
-    for i in range(0, len(items), _AI_TRACKING_CHUNK_SIZE):
-        chunk = items[i: i + _AI_TRACKING_CHUNK_SIZE]
-        try:
-            decisions = await _ai_tracking_batch(chunk, sender_name, sender_email)
-        except Exception as e:
-            log.error(f"[ai_tracking] chunk error: {e}")
-            decisions = [_fallback_decision(item) for item in chunk]
-        all_decisions.extend(decisions)
-    track_count = sum(1 for d in all_decisions if d.get("should_track"))
-    log.info(f"[ai_tracking] Result — {track_count} to track, {len(all_decisions)-track_count} skipped")
-    return all_decisions
+    """
+    Fetch each item's conversation and judge it. One decision per item, in the
+    order given. Bounded concurrency so a backlog does not open a hundred
+    sockets against the mail server at once.
+
+    `on_item(done, total, item, decision)` is called as each one finishes, so a
+    caller can report real progress. Items run concurrently, so `done` is a
+    completion count, not a position in `items`.
+    """
+    if not items:
+        return []
+
+    sem = asyncio.Semaphore(_TRACKING_THREAD_CONCURRENCY)
+    total = len(items)
+    completed = 0
+
+    async def _one(item: dict) -> dict:
+        nonlocal completed
+        async with sem:
+            thread = await fetch_thread_messages(user_email, item.get("messageId", ""))
+            decision = await ai_thread_tracking_decision(item, thread, sender_name, user_email)
+        completed += 1
+        if on_item:
+            try:
+                on_item(completed, total, item, decision)
+            except Exception as cb_err:
+                log.debug(f"[thread_tracking] progress callback failed: {cb_err}")
+        return decision
+
+    results = await asyncio.gather(
+        *(_one(i) for i in items), return_exceptions=True
+    )
+
+    decisions = []
+    for item, res in zip(items, results):
+        if isinstance(res, BaseException):
+            log.error(f"[thread_tracking] item failed: {type(res).__name__}: {res}")
+            decisions.append(_fallback_decision(item))
+        else:
+            decisions.append(res)
+
+    tracked   = sum(1 for d in decisions if d.get("should_track") and not d.get("_deferred"))
+    deferred  = sum(1 for d in decisions if d.get("_deferred"))
+    no_thread = sum(1 for d in decisions if d.get("thread_loaded") is False)
+    log.info(
+        f"[thread_tracking] {len(decisions)} judged — {tracked} to track, "
+        f"{len(decisions) - tracked - deferred} skipped, {deferred} deferred, "
+        f"{no_thread} without a loadable thread"
+    )
+    return decisions
+
+# ---------------------------------------------------------------------------
+# Sync progress
+#
+# The Tracking page used to animate five canned phases on a five-second timer
+# while the scan ran — pure theatre, unconnected to the work, and it read as a
+# frozen spinner whenever the real scan took longer than the loop. Now that a
+# scan reads whole conversations it has genuine, countable stages, so it
+# publishes them here and the page shows what is actually happening.
+#
+# In-memory and per-user: a restart clears it, which is correct — a scan does
+# not survive a restart either.
+# ---------------------------------------------------------------------------
+
+TRACKING_PROGRESS: dict = {}
+
+
+def _progress_reset(user_email: str) -> None:
+    TRACKING_PROGRESS[user_email.lower()] = {
+        "state":      "running",
+        "phase":      "starting",
+        "label":      "Starting sync",
+        "detail":     "",
+        "done":       0,
+        "total":      0,
+        "queued":     0,
+        "skipped":    0,
+        "startedAt":  datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+        "updatedAt":  datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+        "finishedAt": None,
+        "error":      None,
+    }
+
+
+def _progress(user_email: str, **fields) -> None:
+    """Merge fields into this user's progress record. Never raises: a progress
+    update must not be able to break the scan it is reporting on."""
+    try:
+        cur = TRACKING_PROGRESS.setdefault(user_email.lower(), {})
+        cur.update(fields)
+        cur["updatedAt"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    except Exception:
+        pass
+
+
+def begin_tracking_progress(user_email: str) -> None:
+    """
+    Mark a sync as queued the moment the request arrives.
+
+    run_tracking_scheduler resets progress itself, but it runs as a background
+    task: without this the page's first poll could still read the PREVIOUS
+    run's "Sync complete" and close the progress panel a moment after opening
+    it.
+    """
+    _progress_reset(user_email)
+    _progress(user_email, phase="queued", label="Starting sync")
+
+
+def get_tracking_progress(user_email: str) -> dict:
+    """Current scan progress for one user, or an idle record if none has run."""
+    return TRACKING_PROGRESS.get(user_email.lower()) or {
+        "state": "idle", "phase": None, "label": "", "detail": "",
+        "done": 0, "total": 0, "queued": 0, "skipped": 0,
+        "startedAt": None, "updatedAt": None, "finishedAt": None, "error": None,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Main scheduler
@@ -2357,10 +3500,15 @@ async def ai_tracking_decision(
 
 async def run_tracking_scheduler(user_email: str):
     """
-    Main tracking scheduler — called every 2 hours and on manual sync.
+    Main tracking scheduler — called on the background cycle (see
+    TRACKING_CYCLE_SECONDS in main.py) and on manual sync.
 
     Pass 1 — filter sent items (skip reminders, invites, already pending)
-    Pass 2 — AI decision on new emails → pending_tracking_approvals
+    Pass 2 — free local prefilter, then a thread-aware AI decision on what
+              survives → pending_tracking_approvals. Every new sent item is
+              judged on its whole conversation, replies included; nothing
+              bypasses the decision, and a thread whose ask was already
+              answered is skipped instead of queued.
     Pass 3 — update reply status for existing tracked emails
               SAFE: only marks replied=True if the address is EXPLICITLY
               absent from notRepliedAddresses AND the list is non-empty.
@@ -2370,14 +3518,29 @@ async def run_tracking_scheduler(user_email: str):
               on the same run that Day-1 fires when already >= 3 bdays.
     """
     import httpx as _httpx
-    ORG = "http://172.22.6.145"
+    ORG = ORG_BASE
     log.info(f"[tracking] Scheduler start — user={user_email}")
+    _progress_reset(user_email)
 
     try:
+        _progress(user_email, phase="fetching_sent", label="Reading your sent mail")
+        # Deliberately NOT an early return when this comes back empty.
+        # fetch_sent_items_for_tracking returns [] on any failure — a timeout,
+        # a non-200, an exception — and Pass 4 below, which actually delivers
+        # the Day-1/Day-3 reminders, needs nothing from it. Returning here
+        # meant one hiccup on the mail server silently skipped every reminder
+        # due that cycle. Passes 1-3 all iterate this list, so they no-op on
+        # their own when it is empty.
         sent_items = await fetch_sent_items_for_tracking(user_email)
+        _progress(
+            user_email, phase="sorting", label="Sorting what is new",
+            detail=f"{len(sent_items)} sent email{'' if len(sent_items) == 1 else 's'} checked",
+        )
         if not sent_items:
-            log.info(f"[tracking] No sent items returned for {user_email}")
-            return
+            log.info(
+                f"[tracking] No sent items for {user_email} — skipping discovery, "
+                f"still checking reminders due"
+            )
 
         tracking         = load_tracking(user_email)
         tracked_by_id    = {t["messageId"]: t for t in tracking.get("tracked", [])}
@@ -2393,6 +3556,10 @@ async def run_tracking_scheduler(user_email: str):
         reminder_ids     = set(tracking.get("reminder_message_ids", []))
         pending_appr_ids = {
             p["messageId"] for p in tracking.get("pending_tracking_approvals", [])
+        }
+        # Emails already judged once — AI-skipped, or dismissed from Needs Review.
+        skipped_ids = {
+            e.get("messageId") for e in load_not_tracked_log(user_email) if e.get("messageId")
         }
 
         # ── Pass 1: filter sent items ──────────────────────────────────────
@@ -2434,6 +3601,16 @@ async def run_tracking_scheduler(user_email: str):
                 # on the original tracking entry instead of treating it as a
                 # brand-new email and creating a duplicate tracking entry.
                 existing_items.append(item)
+            elif msg_id in skipped_ids:
+                # Already judged — either the AI skipped it, or the person
+                # dismissed it from Needs Review. Without this, every skipped
+                # email went back through the AI on each cycle: an email
+                # dismissed from Needs Review reappeared there minutes later,
+                # and the whole skipped backlog was re-billed to the model
+                # every run for an answer already on disk. Restoring one from
+                # the AI Skipped tab removes it from this log, so it becomes
+                # eligible again exactly when the person asks for it.
+                continue
             else:
                 new_candidates.append(item)
 
@@ -2443,40 +3620,22 @@ async def run_tracking_scheduler(user_email: str):
                 p.title() for p in user_email.split("@")[0].split(".")
             )
 
-            # ── Split into three buckets ───────────────────────────────────
-            #
-            # REPLY  → isReply=True AND subject starts with "Re:"
-            #   The AI was skipping these because reply bodies rarely contain
-            #   an explicit "direct question to a specific person". We bypass
-            #   AI and route straight to Needs Review.
-            #
-            # FORWARD → isReply=True BUT subject starts with "Fw:/Fwd:"
-            #   Exchange sets In-Reply-To for forwards too, so isReply=True
-            #   alone can't distinguish a reply from a forward. Forwards go
-            #   to AI — the user may or may not expect a response back.
-            #
-            # FRESH  → isReply=False
-            #   Brand-new original email. AI decides as normal.
-            #
-            def _is_thread_reply(item: dict) -> bool:
-                if not item.get("isReply"):
-                    return False
-                subj = item.get("subject", "")
-                # Forward prefix → NOT a reply for our purposes
-                if _re.match(r'^(Fw|Fwd)\s*:', subj, _re.IGNORECASE):
-                    return False
-                return True
-
-            reply_items = [i for i in new_candidates if _is_thread_reply(i)]
-            fresh_items = [i for i in new_candidates if not _is_thread_reply(i)]
-
-            log.info(
-                f"[tracking] Pass 2 — {len(reply_items)} thread replies "
-                f"(bypass AI), {len(fresh_items)} fresh/forward emails (AI)"
-            )
+            # Every new sent item goes through the same door now, replies
+            # included. The old code split them: anything starting "Re:" was
+            # queued to Needs Review unread, on the theory that reply bodies
+            # rarely carry an explicit question. They often do — and a reply is
+            # also exactly where the ANSWER to a previous ask turns up, so an
+            # unread reply queue was both noisy and blind to the one thing it
+            # most needed to see. With the conversation in hand there is
+            # nothing left for the bypass to work around.
 
             # ── Helper: build recipients dict for one item ─────────────────
-            def _build_recipients(item: dict) -> dict:
+            def _build_recipients(item: dict, allow: set = None) -> dict:
+                """
+                Trackable recipients of one sent item, minus the exclusion list.
+                `allow` narrows to the people the AI says still owe something;
+                None keeps everyone addressed.
+                """
                 result = {}
                 all_addresses = list(dict.fromkeys(
                     (item.get("to") or []) + (item.get("cc") or [])
@@ -2484,6 +3643,8 @@ async def run_tracking_scheduler(user_email: str):
                 for addr in all_addresses:
                     a = addr.lower()
                     if a in TRACKING_EXCLUDED:
+                        continue
+                    if allow is not None and a not in allow:
                         continue
                     result[a] = {
                         "originalAddress":  addr,
@@ -2499,7 +3660,13 @@ async def run_tracking_scheduler(user_email: str):
                 return result
 
             # ── Helper: append approval entry and save ─────────────────────
-            def _queue_approval(item: dict, recipients: dict, ai_reason: str) -> None:
+            def _queue_approval(
+                item: dict,
+                recipients: dict,
+                ai_reason: str,
+                thread_state: str = "",
+                thread_size: int = 1,
+            ) -> None:
                 msg_id  = item.get("messageId", "")
                 subject = item.get("subject", "(no subject)")
                 sent_at = item.get("sentAt", "")
@@ -2515,6 +3682,11 @@ async def run_tracking_scheduler(user_email: str):
                     "sentAt":         sent_at,
                     "recipients":     recipients,
                     "ai_reason":      ai_reason,
+                    # What the thread pass saw, carried through to the card so
+                    # the person approving knows the verdict came from the
+                    # whole conversation and not from one message.
+                    "thread_state":   thread_state,
+                    "thread_size":    thread_size,
                     "body":           (item.get("body") or "")[:5000],
                     "to":             item.get("to", []),
                     "createdAt":      datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
@@ -2532,33 +3704,91 @@ async def run_tracking_scheduler(user_email: str):
                     f"→ {len(recipients)} recipient(s) [{ai_reason}]"
                 )
 
-            # ── Path A: thread replies — bypass AI ────────────────────────
-            for item in reply_items:
-                recipients = _build_recipients(item)
-                if not recipients:
-                    continue
-                _queue_approval(item, recipients, "thread reply — bypass AI")
+            # ── Helper: record a skip ──────────────────────────────────────
+            def _skip(item: dict, reason: str) -> None:
+                append_not_tracked(user_email, {
+                    "messageId": item.get("messageId", ""),
+                    "subject":   item.get("subject", "(no subject)"),
+                    "sentAt":    item.get("sentAt", ""),
+                    "to":        item.get("to", []), "cc": item.get("cc", []),
+                    "reason":    reason,
+                    "skippedAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+                    "body":      (item.get("body") or "")[:5000],
+                })
+                log.info(f"[tracking] skipped '{item.get('subject','')[:45]}' — {reason}")
 
-            # ── Path B: fresh + forward emails — AI decides ────────────────
-            if fresh_items:
-                log.info(f"[tracking] AI evaluating {len(fresh_items)} email(s)")
-                decisions = await ai_tracking_decision(
-                    fresh_items, sender_name=sender_display, sender_email=user_email
+            # ── Stage 1: free local prefilter ─────────────────────────────
+            # Nothing here costs a network call or a token. It only removes
+            # what cannot be a follow-up under any reading — no trackable
+            # recipient left, an auto-reply, or a two-line acknowledgement with
+            # no ask anywhere in it. Everything else earns a thread read.
+            to_judge = []
+            for item in new_candidates:
+                if not _build_recipients(item):
+                    _skip(item, "No trackable recipients (all excluded from tracking)")
+                    continue
+                prefilter_reason = _obvious_no_followup(item)
+                if prefilter_reason:
+                    _skip(item, prefilter_reason)
+                    continue
+                to_judge.append(item)
+
+            # Ceiling per cycle. A first sync over a full sent box would
+            # otherwise fetch and judge a hundred threads in one go. Overflow is
+            # left completely untouched — not queued, not skipped — so the next
+            # cycle picks it up exactly where this one stopped.
+            overflow = []
+            if len(to_judge) > _TRACKING_MAX_JUDGEMENTS_PER_CYCLE:
+                overflow = to_judge[_TRACKING_MAX_JUDGEMENTS_PER_CYCLE:]
+                to_judge = to_judge[:_TRACKING_MAX_JUDGEMENTS_PER_CYCLE]
+
+            log.info(
+                f"[tracking] Pass 2 — {len(new_candidates)} new, "
+                f"{len(new_candidates) - len(to_judge) - len(overflow)} prefiltered, "
+                f"{len(to_judge)} thread-judged, {len(overflow)} deferred to next cycle"
+            )
+            _progress(
+                user_email, phase="reading_threads",
+                label="Reading conversations", total=len(to_judge), done=0,
+                detail=f"{len(to_judge)} email{'' if len(to_judge) == 1 else 's'} to judge",
+            )
+
+            # ── Stage 2: read the conversation, then decide ───────────────
+            if to_judge:
+                # Counted from completions rather than from the loop below, so
+                # the page advances while the scan is still running instead of
+                # jumping to 100% once every thread is already finished.
+                live = {"queued": 0, "skipped": 0}
+
+                def _on_item(done, total, item, decision):
+                    if decision.get("_deferred"):
+                        pass
+                    elif decision.get("should_track"):
+                        live["queued"] += 1
+                    else:
+                        live["skipped"] += 1
+                    _progress(
+                        user_email, phase="reading_threads",
+                        label="Reading conversations", done=done, total=total,
+                        queued=live["queued"], skipped=live["skipped"],
+                        detail=f"{done} of {total} · {(item.get('subject') or '(no subject)')[:60]}",
+                    )
+
+                decisions = await judge_sent_items_with_threads(
+                    to_judge, user_email=user_email, sender_name=sender_display,
+                    on_item=_on_item,
                 )
-                for item, decision in zip(fresh_items, decisions):
-                    msg_id  = item.get("messageId", "")
-                    subject = item.get("subject", "(no subject)")
-                    sent_at = item.get("sentAt", "")
+                deferred = 0
+                for item, decision in zip(to_judge, decisions):
+                    # The model never actually saw this one. Leave it entirely
+                    # untouched — not queued, not skipped — so the next cycle
+                    # asks again once the AI is reachable.
+                    if decision.get("_deferred"):
+                        deferred += 1
+                        continue
 
                     if not decision.get("should_track", True):
-                        append_not_tracked(user_email, {
-                            "messageId": msg_id, "subject": subject, "sentAt": sent_at,
-                            "to":        item.get("to", []), "cc": item.get("cc", []),
-                            "reason":    decision.get("reason", "Not tracked by AI"),
-                            "skippedAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
-                            "body":      (item.get("body") or "")[:5000],
-                        })
-                        log.info(f"[tracking] AI skipped '{subject}'")
+                        _skip(item, decision.get("reason", "Not tracked by AI"))
                         tracking["tracked"]     = list(tracked_by_id.values())
                         tracking["lastUpdated"] = (
                             datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
@@ -2566,38 +3796,40 @@ async def run_tracking_scheduler(user_email: str):
                         save_tracking(tracking, user_email)
                         continue
 
-                    ai_track_set = {a.lower() for a in decision.get("recipients_to_track", [])}
-                    recipients   = {}
-                    all_addresses = list(dict.fromkeys(
-                        (item.get("to") or []) + (item.get("cc") or [])
-                    ))
-                    for addr in all_addresses:
-                        a = addr.lower()
-                        if a in TRACKING_EXCLUDED:
-                            continue
-                        if ai_track_set and a not in ai_track_set:
-                            continue
-                        recipients[a] = {
-                            "originalAddress":  addr,
-                            "type":             "internal" if "hfmg.net" in a else "external",
-                            "replied":          False,
-                            "reminder1_sent":   False,
-                            "reminder1_sentAt": None,
-                            "reminder2_sent":   False,
-                            "reminder2_sentAt": None,
-                            "dismissed":        False,
-                            "dismissedAt":      None,
-                        }
+                    # Narrow to the people the AI says still owe something. An
+                    # empty list means it named nobody usable, so fall back to
+                    # everyone addressed rather than dropping the follow-up.
+                    ai_track_set = {
+                        a.lower() for a in decision.get("recipients_to_track", [])
+                        if isinstance(a, str)
+                    }
+                    recipients = _build_recipients(item, allow=ai_track_set or None)
+                    if not recipients and ai_track_set:
+                        # Every name it returned was excluded or misspelled.
+                        recipients = _build_recipients(item)
 
                     if not recipients:
+                        _skip(item, "AI chose to track, but no trackable recipients remained after exclusions")
                         continue
 
-                    _queue_approval(item, recipients, decision.get("reason", ""))
+                    _queue_approval(
+                        item, recipients,
+                        decision.get("reason", ""),
+                        thread_state=decision.get("thread_state", ""),
+                        thread_size=decision.get("thread_size", 1),
+                    )
 
-        # ── Pass 3: update reply status (safe — only when notRepliedAddresses is populated) ─
+                if deferred:
+                    log.error(
+                        f"[tracking] {deferred} email(s) DEFERRED for {user_email} — "
+                        f"the AI could not be reached. They stay unjudged and will "
+                        f"be retried next cycle. Last error: {AI_LAST_ERROR['error']}"
+                    )
+
+        # ── Pass 3: update reply status (only when EWS actually reported) ──
         for item in existing_items:
             msg_id  = item.get("messageId", "")
-            not_rep = [a.lower() for a in (item.get("notRepliedAddresses") or [])]
+            not_rep = ews_not_replied_set(item)
             # Direct messageId match first (individual emails and exact thread parent).
             # Fall back to conversationId for follow-up replies sent within a tracked
             # thread — those have a different messageId but the same conversationId.
@@ -2610,11 +3842,12 @@ async def run_tracking_scheduler(user_email: str):
             if not existing:
                 continue
 
-            # SAFE rule: only update if the API returned at least one address in
-            # notRepliedAddresses. An empty list means "no reply data available"
-            # (e.g. forwarded emails, old emails outside the tracking window) —
-            # treat as unknown, leave existing replied flags untouched.
-            if not_rep:
+            # Only when EWS reported on this item at all — see
+            # ews_not_replied_set. This used to skip on an EMPTY list too,
+            # which meant the "everyone has replied" answer set no flags, and
+            # Pass 4 below went on sending Day-1 and Day-3 reminders to people
+            # who had already answered.
+            if not_rep is not None:
                 for addr, info in existing.get("recipients", {}).items():
                     if addr in not_rep:
                         info["replied"] = False
@@ -2632,8 +3865,17 @@ async def run_tracking_scheduler(user_email: str):
         # Uses two separate if-blocks (NOT if/elif) so that when bdays >= 3
         # and Day-1 fires for the first time in this run, Day-3 can also fire
         # in the same run without waiting for the next scheduler cycle.
+        # Ceiling on one cycle's delivery. A corrupted sentAt, a restored
+        # backup or a bulk import can make hundreds of reminders look due at
+        # once; without a cap the first cycle after that mails all of them to
+        # real colleagues before anyone sees a log line.
+        sent_this_cycle = 0
+        capped = False
+
         async with _httpx.AsyncClient(timeout=30) as hc:
             for msg_id, tracked in tracked_by_id.items():
+                if capped:
+                    break
                 if tracked.get("resolved"):
                     continue
 
@@ -2655,11 +3897,15 @@ async def run_tracking_scheduler(user_email: str):
 
                     # ── Day-1: bdays >= 1 and Day-1 not yet sent ────────
                     if bdays >= 1 and not info.get("reminder1_sent"):
+                        if sent_this_cycle >= MAX_REMINDERS_PER_CYCLE:
+                            capped = True
+                            break
                         ok = await _send_reminder(
                             hc, addr, info, 1,
                             subject, sent_at, orig_body, sender_first, ORG
                         )
                         if ok:
+                            sent_this_cycle += 1
                             log.info(f"[tracking] Day-1 sent → {addr} | '{subject}'")
                         else:
                             log.error(f"[tracking] Day-1 FAILED → {addr} | '{subject}'")
@@ -2670,14 +3916,28 @@ async def run_tracking_scheduler(user_email: str):
                     if (bdays >= 3
                             and info.get("reminder1_sent")
                             and not info.get("reminder2_sent")):
+                        if sent_this_cycle >= MAX_REMINDERS_PER_CYCLE:
+                            capped = True
+                            break
                         ok = await _send_reminder(
                             hc, addr, info, 3,
                             subject, sent_at, orig_body, sender_first, ORG
                         )
                         if ok:
+                            sent_this_cycle += 1
                             log.info(f"[tracking] Day-3 sent → {addr} | '{subject}'")
                         else:
                             log.error(f"[tracking] Day-3 FAILED → {addr} | '{subject}'")
+
+        if capped:
+            log.error(
+                f"[tracking] REMINDER CAP HIT for {user_email} — "
+                f"{sent_this_cycle} sent this cycle, remainder deferred. "
+                f"If this repeats, check sentAt values before raising "
+                f"TRACKING_MAX_REMINDERS_PER_CYCLE."
+            )
+        elif sent_this_cycle:
+            log.info(f"[tracking] {sent_this_cycle} reminder(s) sent for {user_email}")
 
         # ── Persist final state ───────────────────────────────────────────
         tracking["tracked"]              = list(tracked_by_id.values())
@@ -2686,6 +3946,11 @@ async def run_tracking_scheduler(user_email: str):
         save_tracking(tracking, user_email)
 
         pending_count = len(tracking.get("pending_tracking_approvals", []))
+        _progress(
+            user_email, state="done", phase="done", label="Sync complete",
+            detail=f"{pending_count} awaiting review",
+            finishedAt=datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+        )
         log.info(
             f"[tracking] Scheduler done — {len(tracked_by_id)} tracked, "
             f"{pending_count} pending approval for {user_email}"
@@ -2693,6 +3958,12 @@ async def run_tracking_scheduler(user_email: str):
 
     except Exception as e:
         import traceback
+        _progress(
+            user_email, state="error", phase="error", label="Sync failed",
+            detail=f"{type(e).__name__}: {str(e)[:160]}",
+            error=f"{type(e).__name__}: {str(e)[:200]}",
+            finishedAt=datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+        )
         log.error(f"[tracking] Scheduler exception: {e}\n{traceback.format_exc()}")
 
 
@@ -2707,7 +3978,7 @@ async def approve_tracking_decision(user_email: str, approval_id: str) -> dict:
     for the next scheduler cycle.
     """
     import httpx as _httpx
-    ORG = "http://172.22.6.145"
+    ORG = ORG_BASE
 
     tracking  = load_tracking(user_email)
     approvals = tracking.get("pending_tracking_approvals", [])
@@ -2870,21 +4141,6 @@ def restore_skipped_to_tracking(user_email: str, message_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Kept for API compatibility — pending_reminders queue is retired.
-# Day-1 and Day-3 now fire automatically from the scheduler.
-# These stubs return ok=True so existing frontend calls don't break.
-# ---------------------------------------------------------------------------
-
-async def approve_pending_reminder(user_email: str, reminder_id: str, body: str) -> dict:
-    log.info(f"[tracking] approve_pending_reminder called (retired) reminder_id={reminder_id}")
-    return {"ok": True, "note": "Reminders are now sent automatically by the scheduler."}
-
-def dismiss_pending_reminder(user_email: str, reminder_id: str) -> dict:
-    log.info(f"[tracking] dismiss_pending_reminder called (retired) reminder_id={reminder_id}")
-    return {"ok": True}
-
-
-# ---------------------------------------------------------------------------
 # Recipient dismiss
 # ---------------------------------------------------------------------------
 
@@ -2939,7 +4195,9 @@ def sync_replies_from_ews(user_email: str, ews_sent_items: list) -> int:
         mid = item.get("messageId") or item.get("id") or item.get("MessageId")
         if not mid:
             continue
-        not_replied = {a.lower() for a in (item.get("notRepliedAddresses") or [])}
+        not_replied = ews_not_replied_set(item)
+        if not_replied is None:
+            continue          # EWS didn't report on this one — infer nothing
         ews_lookup[mid] = not_replied
 
     if not ews_lookup:
@@ -3008,16 +4266,36 @@ def get_tracking_summary(user_email: str) -> dict:
     reminders_sent = []
     resolved       = []
 
+    # Every tracked email, id + subject only. The Sent Items tab needs to know
+    # what is already being tracked so it can show "Already tracking" instead
+    # of offering Track again; it was reading a `tracked` key this function
+    # never returned, so that state could never be shown. Deliberately slim —
+    # the full records are already in the buckets below.
+    tracked_index = []
+
     for item in tracking.get("tracked", []):
+        # Without a messageId there is nothing the UI can do with the row —
+        # it can't be viewed, dismissed or acted on — so it would render as a
+        # ghost card rather than a usable one. Drop it here instead.
+        if not item.get("messageId"):
+            log.warning(f"[tracking] skipping stored row with no messageId for {user_email}")
+            continue
+
         bdays = get_business_days_since(item.get("sentAt", ""))
+        # .get throughout: one stored item missing a key used to raise KeyError
+        # here and 500 the entire tracking page rather than dropping one row.
         base  = {
-            "messageId":    item["messageId"],
-            "subject":      item["subject"],
-            "sentAt":       item["sentAt"],
+            "messageId":    item.get("messageId", ""),
+            "subject":      item.get("subject", "(no subject)"),
+            "sentAt":       item.get("sentAt", ""),
             "businessDays": bdays,
             "recipients":   item.get("recipients", {}),
             "body":         item.get("body", ""),  # stored at track-add time; used as fallback in email modal
         }
+        tracked_index.append({
+            "messageId": base["messageId"],
+            "subject":   base["subject"],
+        })
         if item.get("resolved"):
             resolved.append(base)
         elif any(
@@ -3029,6 +4307,7 @@ def get_tracking_summary(user_email: str) -> dict:
             awaiting.append(base)
 
     return {
+        "tracked":        tracked_index,
         "awaiting":       sorted(awaiting,       key=lambda x: x["businessDays"], reverse=True),
         "reminders_sent": sorted(reminders_sent, key=lambda x: x["businessDays"], reverse=True),
         "resolved":       sorted(resolved,       key=lambda x: x["businessDays"], reverse=True)[:20],
@@ -3081,3 +4360,97 @@ def get_attachment_bytes(attachment):
     file_hash = attachment["hash"]
     file_bytes = base64.b64decode(file_hash)
     return file_name, file_bytes
+
+# ── OUTBOX — actions taken while the mail server was unreachable ────────────
+# Persisted to disk, not memory: the whole point is surviving the window
+# where things are broken, and a backend restart during an outage is exactly
+# when that happens.
+#
+# Two classes of action, deliberately treated differently:
+#   auto  — mark read, RSVP. Replaying these twice is harmless (read twice is
+#           read), so they replay by themselves the moment the server returns.
+#   held  — reply, forward, send. NOT safe to fire unattended: the content
+#           ages, the person may have already answered another way, and a
+#           timeout leaves it genuinely unknown whether it went. These wait
+#           for an explicit press.
+OUTBOX_AUTO_ACTIONS = {"mark_read", "rsvp"}
+OUTBOX_HELD_ACTIONS = {"send_reply", "forward", "send_email", "compose"}
+OUTBOX_MAX_ATTEMPTS = 5
+
+
+def _outbox_file_for(user_email: str) -> str:
+    safe = _re.sub(r"[^\w@.-]", "_", (user_email or "default").lower().strip())
+    return f"outbox_{safe}.json"
+
+
+def load_outbox(user_email: str) -> list:
+    path = _outbox_file_for(user_email)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.error(f"[outbox] unreadable for {user_email}: {e}")
+        return []
+
+
+def _save_outbox(user_email: str, items: list):
+    path = _outbox_file_for(user_email)
+    tmp = f"{path}.tmp"
+    with _get_lock(f"outbox:{user_email}"):
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+        os.replace(tmp, path)   # write-then-rename: never leave it half-written
+
+
+def queue_action(user_email: str, action: str, payload: dict) -> dict:
+    """
+    Put an action in the outbox. Returns the stored item.
+
+    The id is what makes replay safe: the server refuses to carry out the
+    same id twice, so a retry after an ambiguous timeout can't repeat it.
+    """
+    items = load_outbox(user_email)
+    item = {
+        "id": f"{action}-{uuid.uuid4().hex[:16]}",
+        "action": action,
+        "payload": payload or {},
+        "queuedAt": datetime.now(timezone.utc).isoformat(),
+        "attempts": 0,
+        "lastError": None,
+        # Held items are surfaced to the person; auto items just replay.
+        "needsConfirm": action in OUTBOX_HELD_ACTIONS,
+    }
+    items.append(item)
+    _save_outbox(user_email, items)
+    log.info(f"[outbox] queued {action} for {user_email} ({item['id']})")
+    return item
+
+
+def remove_from_outbox(user_email: str, item_id: str) -> bool:
+    items = load_outbox(user_email)
+    kept = [i for i in items if i.get("id") != item_id]
+    if len(kept) == len(items):
+        return False
+    _save_outbox(user_email, kept)
+    return True
+
+
+def update_outbox_item(user_email: str, item_id: str, **fields):
+    items = load_outbox(user_email)
+    for i in items:
+        if i.get("id") == item_id:
+            i.update(fields)
+            break
+    _save_outbox(user_email, items)
+
+
+def outbox_summary(user_email: str) -> dict:
+    items = load_outbox(user_email)
+    return {
+        "pending_auto": len([i for i in items if not i.get("needsConfirm")]),
+        "awaiting_send": len([i for i in items if i.get("needsConfirm")]),
+        "items": items,
+    }

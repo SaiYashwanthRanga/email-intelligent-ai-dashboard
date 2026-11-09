@@ -3,6 +3,13 @@ backend/venv/
 backend/__pycache__/
 backend/.env
 backend/cache_*.json
+backend/sent_cache_*.json
+backend/not_tracked_*.json
+backend/tracking_*.json
+!backend/tracking_access.json
+backend/activity_log.json
+backend/detail_cache/
+backend/logs/
 
 # Node frontend
 frontend-new/node_modules/
