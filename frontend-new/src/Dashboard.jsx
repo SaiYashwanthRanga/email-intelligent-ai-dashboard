@@ -243,7 +243,6 @@ function Dashboard() {
   const [fileModalData, setFileModalData] = useState(null);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(true);
   const [senderFilter, setSenderFilter] = useState(null); // { email, name } | null
-  const [canUseTracking, setCanUseTracking] = useState(false);
   const [canUseActivity, setCanUseActivity] = useState(false);
   const [autoDigest, setAutoDigest] = useState(null);       // complete 7-day digest from EWS
   const [digestLoading, setDigestLoading] = useState(true); // shows skeleton until first load
@@ -521,14 +520,9 @@ function Dashboard() {
       console.log(`📋 Cached metadata loaded: ${meta.emailCount} emails, synced at ${meta.lastSync}`);
     }
 
-    // ── Check tracking access for this user ──
+    // ── Check activity access for this user ──
     const email = localStorage.getItem("userEmail") || "";
     if (email) {
-      fetch(`${API_BASE}/tracking/access?user_email=${encodeURIComponent(email)}`)
-        .then(r => r.json())
-        .then(data => setCanUseTracking(!!data.allowed))
-        .catch(() => setCanUseTracking(false));
-
       fetch(`${API_BASE}/activity/access?user_email=${encodeURIComponent(email)}`)
         .then(r => r.json())
         .then(data => setCanUseActivity(!!data.allowed))
@@ -1295,7 +1289,6 @@ function Dashboard() {
       // Sender filter (Insights → Inbox navigation)
       senderFilter={senderFilter}
       setSenderFilter={setSenderFilter}
-      canUseTracking={canUseTracking}
       canUseActivity={canUseActivity}
 
       // Flag / AI correction

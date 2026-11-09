@@ -5,7 +5,6 @@ import {
   User, Paperclip, X, Clock, Download, Users, Loader, Flag, FolderPlus, UserMinus, Plus
 } from 'lucide-react';
 import EmailAutocomplete from './EmailAutocomplete';
-import ComposeMailModal from './ComposeMailModal';
 import ToastContainer from './Toast';
 
 // ─── SHARED EXPORTS (also used by DashboardView) ──────────────────────────
@@ -427,130 +426,6 @@ const emailToDisplayName = (email) => {
 };
 
 // ─── INBOX VIEW ───────────────────────────────────────────────────────────
-// ── TRACKING SECTION COMPONENT ───────────────────────────────────────────────
-function TrackingSection({ title, color, items, emptyMsg, onDismiss, onFollowUp, readOnly }) {
-  const [collapsed, setCollapsed] = React.useState(false);
-
-  return (
-    <div style={{ marginBottom: '24px' }}>
-      <div
-        onClick={() => setCollapsed(c => !c)}
-        style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px', cursor: 'pointer', userSelect: 'none' }}
-      >
-        <span style={{ fontSize: '0.78rem', fontWeight: '800', color, letterSpacing: '0.5px' }}>{title}</span>
-        <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', background: 'var(--bg-card)', border: '1px solid var(--border-color)', borderRadius: '999px', padding: '1px 8px' }}>{items.length}</span>
-        <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginLeft: 'auto' }}>{collapsed ? '▶' : '▼'}</span>
-      </div>
-
-      {!collapsed && (
-        items.length === 0 ? (
-          <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', padding: '12px 16px', background: 'var(--bg-card)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-            {emptyMsg}
-          </div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            {items.map(item => (
-              <TrackingCard
-                key={item.messageId}
-                item={item}
-                onDismiss={onDismiss}
-                onFollowUp={onFollowUp}
-                readOnly={readOnly}
-              />
-            ))}
-          </div>
-        )
-      )}
-    </div>
-  );
-}
-
-function TrackingCard({ item, onDismiss, onFollowUp, readOnly }) {
-  const bdays = item.businessDays || 0;
-  const daysColor = bdays >= 5 ? '#ef4444' : bdays >= 3 ? '#f59e0b' : '#10b981';
-
-  const pendingRecipients = Object.entries(item.recipients || {}).filter(
-    ([, info]) => !info.replied && !info.dismissed
-  );
-
-  const repliedRecipients = Object.entries(item.recipients || {}).filter(
-    ([, info]) => info.replied
-  );
-
-  if (pendingRecipients.length === 0 && !readOnly) return null;
-
-  return (
-    <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border-color)', borderRadius: '10px', padding: '14px 16px', borderLeft: `3px solid ${daysColor}` }}>
-      {/* Subject + days */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '10px', gap: '12px' }}>
-        <div>
-          <div style={{ fontSize: '0.88rem', fontWeight: '700', color: 'var(--text-primary)', marginBottom: '3px' }}>{item.subject || '(no subject)'}</div>
-          <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>
-            Sent {new Date(item.sentAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-          </div>
-        </div>
-        <span style={{ background: `${daysColor}22`, color: daysColor, border: `1px solid ${daysColor}44`, borderRadius: '999px', padding: '3px 10px', fontSize: '0.72rem', fontWeight: '800', flexShrink: 0 }}>
-          {bdays} day{bdays !== 1 ? 's' : ''}
-        </span>
-      </div>
-
-      {/* Pending recipients */}
-      {pendingRecipients.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-          {pendingRecipients.map(([addr, info]) => (
-            <div key={addr} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', background: 'var(--bg-main)', borderRadius: '7px', border: '1px solid var(--border-color)' }}>
-              {/* Type badge */}
-              <span style={{
-                fontSize: '0.6rem', fontWeight: '800', letterSpacing: '0.5px',
-                background: info.type === 'internal' ? 'rgba(59,130,246,0.15)' : 'rgba(245,158,11,0.15)',
-                color: info.type === 'internal' ? '#60a5fa' : '#f59e0b',
-                border: `1px solid ${info.type === 'internal' ? 'rgba(59,130,246,0.3)' : 'rgba(245,158,11,0.3)'}`,
-                borderRadius: '4px', padding: '1px 5px',
-              }}>
-                {info.type === 'internal' ? 'INT' : 'EXT'}
-              </span>
-
-              {/* Address */}
-              <span style={{ fontSize: '0.78rem', color: 'var(--text-primary)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {info.originalAddress || addr}
-              </span>
-
-              {/* Reminder status */}
-              {info.reminder2_sent && <span style={{ fontSize: '0.65rem', color: '#f59e0b', flexShrink: 0 }}>2nd reminder sent</span>}
-              {info.reminder1_sent && !info.reminder2_sent && <span style={{ fontSize: '0.65rem', color: '#3b82f6', flexShrink: 0 }}>1st reminder sent</span>}
-
-              {!readOnly && (
-                <div style={{ display: 'flex', gap: '5px', flexShrink: 0 }}>
-                  <button
-                    onClick={() => onFollowUp(item, addr, info)}
-                    style={{ background: 'rgba(0,217,255,0.14)', border: '1px solid rgba(0,217,255,0.35)', color: '#60a5fa', borderRadius: '5px', padding: '3px 9px', fontSize: '0.7rem', fontWeight: '700', cursor: 'pointer' }}
-                  >
-                    Follow Up
-                  </button>
-                  <button
-                    onClick={() => onDismiss(item.messageId, addr)}
-                    style={{ background: 'transparent', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', borderRadius: '5px', padding: '3px 9px', fontSize: '0.7rem', cursor: 'pointer' }}
-                    title="Dismiss — handled offline"
-                  >
-                    Dismiss
-                  </button>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Replied recipients (collapsed summary) */}
-      {repliedRecipients.length > 0 && (
-        <div style={{ marginTop: '8px', fontSize: '0.7rem', color: '#10b981' }}>
-          ✓ Replied: {repliedRecipients.map(([addr]) => addr.split('@')[0]).join(', ')}
-        </div>
-      )}
-    </div>
-  );
-}
-// ─────────────────────────────────────────────────────────────────────────────
 
 function InboxView({
   emails,
@@ -578,7 +453,6 @@ function InboxView({
   isFileDownloading,
   getFileProgress,
   totalEmailCount,
-  canUseTracking = false,
   // Flag / correction props
   flagOpen,
   setFlagOpen,
@@ -603,7 +477,7 @@ function InboxView({
   const [memberActionPending,   setMemberActionPending]   = useState(null); // { type:'add'|'remove', folderName, folderLabel, emails:[] } | null — awaiting Y/N
   const [memberActionSubmitting, setMemberActionSubmitting] = useState(false);
   // Local toast queue — InboxView didn't have one before; same self-contained
-  // pattern as Calendarview.jsx/Trackingview.jsx rather than a new prop-threading path.
+  // pattern as Calendarview.jsx rather than a new prop-threading path.
   const [toasts, setToasts] = useState([]);
   const addToast = (message, type = 'info') => {
     const id = Date.now() + Math.random();
@@ -650,11 +524,6 @@ function InboxView({
   const [inlineRsvpState,   setInlineRsvpState]    = useState({});
   const [showScrollTop,     setShowScrollTop]      = useState(false);
   const [replyAllLoading,   setReplyAllLoading]    = useState({});
-  // ── Tracking tab state ──────────────────────────────────────────────────
-  const [trackingData,      setTrackingData]       = useState(null);
-  const [trackingLoading,   setTrackingLoading]    = useState(false);
-  const [trackingSyncing,   setTrackingSyncing]    = useState(false);
-  const [followUpCompose,   setFollowUpCompose]    = useState(null); // { to, subject }
   const feedRef = useRef(null);
 
   // Find nearest scrollable ancestor (the left pane in DashboardView scrolls, not feed-container)
@@ -684,81 +553,6 @@ function InboxView({
     parent.addEventListener('scroll', onScroll);
     return () => parent.removeEventListener('scroll', onScroll);
   }, []);
-
-  // ── Fetch tracking data when Tracking tab is selected ──────────────────
-  // Guard: only fetch on the FIRST visit (trackingData === null).
-  // Subsequent tab switches reuse the already-loaded data.
-  // The manual Refresh button calls fetchTrackingData() directly, bypassing this guard.
-  useEffect(() => {
-    if (activeFolder !== 'TRACKING') return;
-    if (trackingData !== null) return;   // already loaded — don't re-fetch
-    fetchTrackingData();
-  }, [activeFolder, trackingData]);
-
-  const fetchTrackingData = async () => {
-    const userEmail = localStorage.getItem('userEmail') || '';
-    if (!userEmail) return;
-    setTrackingLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/tracking?user_email=${encodeURIComponent(userEmail)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setTrackingData(data);
-      }
-    } catch (e) {
-      console.error('fetchTrackingData error:', e);
-    } finally {
-      setTrackingLoading(false);
-    }
-  };
-
-  const syncTracking = async () => {
-    const userEmail = localStorage.getItem('userEmail') || '';
-    if (!userEmail || trackingSyncing) return;
-    setTrackingSyncing(true);
-    try {
-      await fetch(`${API_BASE}/tracking/sync`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_email: userEmail }),
-      });
-      // Reload after short delay to let scheduler start
-      setTimeout(fetchTrackingData, 3000);
-    } catch (e) {
-      console.error('syncTracking error:', e);
-    } finally {
-      setTimeout(() => setTrackingSyncing(false), 3500);
-    }
-  };
-
-  const dismissTrackingRecipient = async (messageId, recipientEmail) => {
-    const userEmail = localStorage.getItem('userEmail') || '';
-    try {
-      await fetch(`${API_BASE}/tracking/dismiss`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_email: userEmail, message_id: messageId, recipient_email: recipientEmail }),
-      });
-      // Optimistic UI update
-      setTrackingData(prev => {
-        if (!prev) return prev;
-        const update = (list) => list.map(item => {
-          if (item.messageId !== messageId) return item;
-          const newRec = { ...item.recipients };
-          if (newRec[recipientEmail]) newRec[recipientEmail] = { ...newRec[recipientEmail], dismissed: true };
-          return { ...item, recipients: newRec };
-        });
-        return {
-          ...prev,
-          awaiting:       update(prev.awaiting || []),
-          reminders_sent: update(prev.reminders_sent || []),
-        };
-      });
-    } catch (e) {
-      console.error('dismissTrackingRecipient error:', e);
-    }
-  };
-  // ────────────────────────────────────────────────────────────────────────
 
   const toggleCardSelection = (emailId) => {
     setSelectedCards(prev => {
@@ -1294,101 +1088,6 @@ function InboxView({
           : activeCategory !== 'ALL'
             ? `No ${activeCategory} emails in ${folderLabel}`
             : `No emails in ${folderLabel}`;
-
-
-        // ── TRACKING TAB — render completely separate view ────────────────
-        if (activeFolder === 'TRACKING') {
-          return (
-            <>
-            <div style={{ padding: '16px' }}>
-              {/* Header */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
-                <div>
-                  <div style={{ fontSize: '1rem', fontWeight: '700', color: 'var(--text-primary)' }}>📡 Follow-Up Tracking</div>
-                  <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '3px' }}>
-                    Auto-reminders sent on Day 1 & Day 3 to internal recipients. Day 5+ items appear in digest.
-                  </div>
-                </div>
-                <button
-                  onClick={syncTracking}
-                  disabled={trackingSyncing}
-                  style={{ background: trackingSyncing ? 'rgba(0,217,255,0.55)' : 'rgba(0,217,255,0.18)', border: '1px solid rgba(0,217,255,0.45)', color: '#60a5fa', borderRadius: '8px', padding: '7px 14px', fontSize: '0.78rem', fontWeight: '700', cursor: trackingSyncing ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
-                >
-                  {trackingSyncing ? '⏳ Syncing...' : '🔄 Sync Now'}
-                </button>
-              </div>
-
-              {trackingLoading ? (
-                <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', padding: '40px', textAlign: 'center' }}>Loading tracking data...</div>
-              ) : !trackingData ? (
-                <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', padding: '40px', textAlign: 'center' }}>No tracking data yet. Click Sync Now to check your sent items.</div>
-              ) : (
-                <>
-                  {/* AWAITING REPLY */}
-                  <TrackingSection
-                    title="⏳ Awaiting Reply"
-                    color="#f59e0b"
-                    items={trackingData.awaiting || []}
-                    emptyMsg="No emails awaiting reply."
-                    onDismiss={dismissTrackingRecipient}
-                    onFollowUp={(item, addr, info) => {
-                      setFollowUpCompose({
-                        to: info?.originalAddress || addr,
-                        subject: `Following up: ${item.subject}`,
-                      });
-                    }}
-                  />
-
-                  {/* REMINDERS SENT */}
-                  <TrackingSection
-                    title="📨 Reminders Sent"
-                    color="#3b82f6"
-                    items={trackingData.reminders_sent || []}
-                    emptyMsg="No reminders sent yet."
-                    onDismiss={dismissTrackingRecipient}
-                    onFollowUp={(item, addr, info) => {
-                      setFollowUpCompose({
-                        to: info?.originalAddress || addr,
-                        subject: `Following up: ${item.subject}`,
-                      });
-                    }}
-                  />
-
-                  {/* RESOLVED */}
-                  {(trackingData.resolved || []).length > 0 && (
-                    <TrackingSection
-                      title="✅ Resolved"
-                      color="#10b981"
-                      items={trackingData.resolved || []}
-                      emptyMsg=""
-                      onDismiss={() => {}}
-                      onFollowUp={() => {}}
-                      readOnly
-                    />
-                  )}
-
-                  {trackingData.lastUpdated && (
-                    <div style={{ fontSize: '0.68rem', color: 'var(--text-secondary)', marginTop: '20px', textAlign: 'center' }}>
-                      Last synced: {new Date(trackingData.lastUpdated).toLocaleString()}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-
-            {/* Follow-up compose modal — sibling of main div inside Fragment */}
-            {followUpCompose && (
-              <ComposeMailModal
-                isOpen={!!followUpCompose}
-                onClose={() => setFollowUpCompose(null)}
-                prefillTo={followUpCompose.to}
-                prefillSubject={followUpCompose.subject}
-              />
-            )}
-            </>
-          );
-        }
-        // ─────────────────────────────────────────────────────────────────
 
         return (
           <div className="email-feed">

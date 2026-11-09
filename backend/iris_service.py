@@ -3,13 +3,10 @@ iris_service.py — Iris, the Inbox Assistant (Phase 3)
 ─────────────────────────────────────────────────────────────────────────
 Kept separate from services.py on purpose so this feature stays easy to
 find, iterate on, and (if needed) rip out, without touching the existing
-analysis/tracking/reply logic.
+analysis/reply logic.
 
 Iris can call these tools mid-conversation:
   - draft_reply            -> reuses services.draft_email_reply() as-is
-  - check_tracking_status   -> reuses services.get_tracking_summary() /
-                                get_tracking_digest() as-is (gated by
-                                services.is_tracking_allowed())
   - search_emails           -> keyword search over
                                 services.get_cached_emails_by_id(), which
                                 accumulates every email the analysis
@@ -28,7 +25,7 @@ Iris can call these tools mid-conversation:
                                 its caching and stale-fallback are reused
 
   - propose_action          -> puts an action (mark read / reply / forward /
-                                RSVP / track) in front of the person as a
+                                RSVP / compose) in front of the person as a
                                 confirmation button
 
 Iris still performs NOTHING itself. propose_action only records a
@@ -41,9 +38,8 @@ whether the mail went, and each proposal carries an actionId the confirm
 route de-duplicates on.
 
 Reuses the same OpenAI client + model already configured in services.py
-rather than standing up a second client, and reuses draft_email_reply /
-get_tracking_summary / get_tracking_digest / is_tracking_allowed exactly
-as they already exist — none of those were modified.
+rather than standing up a second client, and reuses draft_email_reply
+exactly as it already exists.
 """
 
 import json
@@ -61,9 +57,6 @@ from services import (
     ACTIVE_MODEL,
     log,
     draft_email_reply,
-    is_tracking_allowed,
-    get_tracking_summary,
-    get_tracking_digest,
     get_cached_emails_by_id,
     get_cached_detail,
     has_cached_detail,
@@ -109,10 +102,6 @@ asked — don't answer everything in the same loose paragraph.
   vs. what's routine) — not a flat restatement of every field in the
   snapshot as a disconnected list.
 
-- Status/tracking checks: brief, grouped by category (overdue vs.
-  awaiting vs. resolved) since that data is naturally categorical — a
-  short line per group beats one long paragraph here.
-
 - Everything else (questions, casual chat): plain, direct prose sized to
   the question — a one-line question gets a short answer, not an
   artificially padded one.
@@ -135,25 +124,20 @@ never includes full email body text, only short summaries.
 
 Use the snapshot to answer questions grounded in what's actually there.
 If a question needs something the snapshot doesn't cover, try a tool
-before saying you can't help — you have three:
+before saying you can't help:
 
 1. draft_reply — drafts reply text to a specific sender. This ONLY
    produces text for the person to review; it does NOT send anything.
    Always present what it returns as a draft ("Here's a draft you can
    send:") — never say or imply you sent or will send an email.
 
-2. check_tracking_status — looks up the person's follow-up tracking:
-   emails they sent that are awaiting a reply, already had a reminder
-   sent, or are overdue (5+ business days). Use for anything about
-   follow-ups or who hasn't replied yet.
-
-3. search_emails — searches emails the dashboard has already analyzed
+2. search_emails — searches emails the dashboard has already analyzed
    for this person. This is NOT their entire mailbox history — only
    what's been processed so far. If a search comes back empty, say it
    wasn't found in what's been analyzed rather than concluding it
    doesn't exist anywhere.
 
-4. list_emails — browse by filter instead of by keyword: category
+3. list_emails — browse by filter instead of by keyword: category
    (URGENT, PRIORITY, NEWSLETTER, ...), sender, or "last N days". Reach
    for this whenever the question has no specific word to search on —
    "what's urgent", "what came in today", "anything from Deepa this
@@ -165,14 +149,14 @@ before saying you can't help — you have three:
    leaving them out is the difference between a useful "what needs me"
    answer and one full of things handled days ago.
 
-5. search_sent — what the person THEMSELVES has sent recently, with the
+4. search_sent — what the person THEMSELVES has sent recently, with the
    real text of their messages. Every other tool covers mail they
    received; this is the other half of the conversation. Use it for
    "what did I tell X", "did I already answer this", "what did I
    promise", and before saying anything about whether they have replied
    to someone.
 
-6. get_calendar — the person's upcoming meetings. Use for schedule
+5. get_calendar — the person's upcoming meetings. Use for schedule
    questions, whether they are free at a given time, or whether a time
    someone is proposing by email clashes with something already booked.
 
@@ -203,13 +187,13 @@ whatever happens to be visible. Working from a summary when the real
 text was one call away is the most common way to be wrong.
 
 If a tool returns an error or empty result, say so plainly. Never invent
-specific senders, subjects, dates, drafts, or tracking statuses that
+specific senders, subjects, dates, drafts, or statuses that
 didn't come from the snapshot, a tool result, or the conversation itself.
 
 7. propose_action — puts a confirmation button in front of the person
    for something they asked you to DO rather than tell them: mark an
    email read, send a reply, forward, write a new email, RSVP to a
-   meeting, start tracking. You never carry it out. Pressing the button
+   meeting. You never carry it out. Pressing the button
    is what performs it, and they can edit the recipients, subject and
    wording on the card before it goes. So: prepare the action, then say
    what you've queued and that it needs their confirmation. Never say
@@ -244,8 +228,8 @@ CURRENT CAPABILITIES (be honest if asked): you can chat, answer
 questions grounded in the snapshot, browse and search analysed email,
 read the full text of emails that have been cached, search what the
 person has sent, look at their upcoming calendar, draft replies, check
-tracking/follow-up status, and prepare actions (mark read, reply,
-forward, compose a new email, RSVP, track) for them to confirm. You can
+and prepare actions (mark read, reply, forward, compose a new email,
+RSVP) for them to confirm. You can
 write an email on their behalf and it will really be sent — but only
 after they press the button on the card, which they can edit first. You
 never send or change anything on your own, you can't create calendar
@@ -444,33 +428,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "check_tracking_status",
-            "description": (
-                "Check the person's follow-up tracking status — sent emails "
-                "awaiting a reply, reminders already sent, or overdue items "
-                "(5+ business days with no reply). Use for anything about "
-                "follow-ups or who hasn't responded yet."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scope": {
-                        "type": "string",
-                        "enum": ["awaiting", "overdue", "all"],
-                        "description": (
-                            "'awaiting' = general awaiting-reply list, 'overdue' = "
-                            "only Day-5+ items needing attention, 'all' = full summary "
-                            "(awaiting + reminders sent + resolved counts)."
-                        ),
-                    },
-                },
-                "required": ["scope"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "search_emails",
             "description": (
                 "Search emails the dashboard has already analyzed for this "
@@ -586,8 +543,8 @@ TOOLS = [
                 "in front of them, and nothing happens unless they press it. "
                 "Use it when they ask you to do something rather than tell "
                 "them something: mark mail as read, reply to an email, forward "
-                "one, write a brand-new email to someone, RSVP to a meeting, or "
-                "start tracking a reply. After calling this, tell "
+                "one, write a brand-new email to someone, or RSVP to a meeting. "
+                "After calling this, tell "
                 "them plainly what you've queued up and that it needs their "
                 "confirmation. Never claim it is done."
             ),
@@ -596,7 +553,7 @@ TOOLS = [
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["mark_read", "send_reply", "forward", "compose", "rsvp", "track"],
+                        "enum": ["mark_read", "send_reply", "forward", "compose", "rsvp"],
                         "description": (
                             "Which action to put up for confirmation. Use "
                             "'send_reply' to answer an email that exists, "
@@ -757,7 +714,7 @@ def read_cached_email(user_email: str, message_id: str) -> dict:
         payload["thread_message_count"] = len(messages)
 
     # The person's own note about this thread, if they left one — keyed the
-    # same way the reading pane and Trackingview.jsx key a thread
+    # same way the reading pane keys a thread
     # (conversationId, falling back to messageId for singletons). Surfaced
     # here so both the read_email tool and the "person is looking at this
     # email right now" injection in get_iris_reply pick it up for free.
@@ -911,48 +868,6 @@ async def get_replied_conversations(user_email: str) -> set:
         for s in await get_sent_emails(user_email)
         if isinstance(s, dict) and s.get("conversationId")
     }
-
-
-async def get_needs_response_emails(user_email: str, limit: int = 50) -> list:
-    """
-    The inbound half of "what do I owe" — received emails whose thread the
-    person has never sent a reply into. Complements the Tracking system's
-    existing "who owes me" view (sent mail awaiting a reply from others),
-    using the exact same conversationId cross-reference list_cached_emails
-    already relies on to mark rows already_replied.
-
-    A thread with no conversationId is skipped rather than guessed at —
-    there's nothing to cross-reference it against, so calling it "needs a
-    response" would just as often be wrong as right.
-    """
-    try:
-        cached = get_cached_emails_by_id(user_email) or {}
-    except Exception as e:
-        log.error(f"get_needs_response_emails: cache read failed: {e}")
-        return []
-
-    replied = await get_replied_conversations(user_email)
-
-    rows = []
-    for entry in cached.values():
-        if not isinstance(entry, dict) or entry.get("_threadRef"):
-            continue
-        conv_id = entry.get("conversationId")
-        if not conv_id or conv_id in replied:
-            continue
-        rows.append({
-            "messageId": entry.get("id") or entry.get("messageId"),
-            "conversationId": conv_id,
-            "from": entry.get("from") or entry.get("sender") or "Unknown Sender",
-            "subject": entry.get("subject") or "No Subject",
-            "category": entry.get("category") or "NORMAL",
-            "summary": entry.get("summary") or "",
-            "received_at": entry.get("received_at") or entry.get("received"),
-            "unread": entry.get("isRead") is False,
-        })
-
-    rows.sort(key=lambda r: str(r.get("received_at") or ""), reverse=True)
-    return rows[:limit]
 
 
 async def preview_tag_matches(user_email: str, tag_name: str, tag_prompt: str, scan_limit: int = 150) -> list:
@@ -1197,24 +1112,6 @@ async def get_calendar_window(user_email: str, days_ahead: int = 7) -> dict:
     }
 
 
-def _slim_tracking_item(item: dict) -> dict:
-    """
-    Strips a tracking item down to what's useful in a chat answer —
-    drops the stored email `body` entirely and reduces the recipients
-    dict to just email + reply status, instead of every internal flag.
-    """
-    recipients = item.get("recipients", {}) or {}
-    return {
-        "subject": item.get("subject", "No Subject"),
-        "sentAt": item.get("sentAt"),
-        "businessDays": item.get("businessDays"),
-        "recipients": [
-            {"email": addr, "replied": bool(info.get("replied"))}
-            for addr, info in recipients.items()
-        ],
-    }
-
-
 # Human-readable labels for the activity trail shown while Iris works, so
 # a 15-second pause reads as "it's searching and reading" rather than a
 # frozen panel.
@@ -1223,7 +1120,6 @@ TOOL_LABELS = {
     "list_emails":           "Looking through your mail",
     "read_email":            "Reading the email",
     "get_calendar":          "Checking your calendar",
-    "check_tracking_status": "Checking follow-ups",
     "draft_reply":           "Drafting a reply",
     "propose_action":        "Preparing an action",
 }
@@ -1285,33 +1181,6 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
                 return json.dumps({"error": "draft_reply needs both a sender and context."})
             draft = await draft_email_reply(sender, context, user_name)
             return json.dumps({"draft": draft})
-
-        elif name == "check_tracking_status":
-            if not is_tracking_allowed(user_email):
-                return json.dumps({"error": "Tracking isn't enabled for this account."})
-
-            scope = (arguments or {}).get("scope", "all")
-
-            if scope == "overdue":
-                digest = get_tracking_digest(user_email)
-                return json.dumps({"overdue": digest[:15]}, default=str)
-
-            summary = get_tracking_summary(user_email)
-            awaiting = summary.get("awaiting", [])
-            reminders_sent = summary.get("reminders_sent", [])
-            resolved = summary.get("resolved", [])
-
-            payload = {
-                "awaiting_count": len(awaiting),
-                "reminders_sent_count": len(reminders_sent),
-                "resolved_count": len(resolved),
-            }
-            if scope in ("awaiting", "all"):
-                payload["awaiting"] = [_slim_tracking_item(i) for i in awaiting[:15]]
-            if scope == "all":
-                payload["reminders_sent"] = [_slim_tracking_item(i) for i in reminders_sent[:15]]
-
-            return json.dumps(payload, default=str)
 
         elif name == "search_emails":
             query = (arguments or {}).get("query", "")

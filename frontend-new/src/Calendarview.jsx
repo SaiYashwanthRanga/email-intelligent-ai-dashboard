@@ -461,7 +461,7 @@ const CalendarView = () => {
   const [briefDate,  setBriefDate]  = useState(null);
   const [showBrief,  setShowBrief]  = useState(false);
 
-  // ─── Toast feedback (same pattern as Trackingview.jsx) ───
+  // ─── Toast feedback ───
   const [toasts, setToasts] = useState([]);
   const addToast = (message, type = 'info') => {
     const id = Date.now() + Math.random();

@@ -20,9 +20,9 @@ import { Sparkles, X, Send, Copy, Check } from "lucide-react";
  *
  * STATUS: Phase 3 — tool-calling on the backend. <Iris /> itself barely
  * changed for this phase: it now also sends user_email (see sendToIris
- * below) so the backend's tools can look up the right person's tracking
- * data / analyzed-email cache. Everything else — the tool-calling loop,
- * draft_reply / check_tracking_status / search_emails — runs entirely
+ * below) so the backend's tools can look up the right person's
+ * analyzed-email cache. Everything else — the tool-calling loop,
+ * draft_reply / search_emails / read_email — runs entirely
  * server-side inside the single /api/iris/chat request, so from this
  * component's point of view it's still just "POST a message, get back
  * a reply string." See iris_service.py for the actual tool logic.
@@ -69,8 +69,8 @@ const MAX_RECENT_EMAILS = 25;
 
 // ─── SINGLE INTEGRATION SEAM ───────────────────────────────────────────────
 // Calls the real backend. Phase 3: also sends user_email (not just the
-// display name) since the backend's tools — tracking status, email
-// search — look data up by email, not by display name.
+// display name) since the backend's tools — email search, reading,
+// drafting — look data up by email, not by display name.
 async function sendToIris(message, history, inboxContext) {
   const userName = localStorage.getItem("loggedInUser") || "User";
   const userEmail = localStorage.getItem("userEmail") || "default";

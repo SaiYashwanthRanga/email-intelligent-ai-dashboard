@@ -19,7 +19,7 @@ function mergeSignatureIntoBody(html, signatureHtml) {
   return withoutOldSignature ? `${withoutOldSignature}<br/>${block}` : block;
 }
 
-const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = "", prefillQuotedBody = "", useReminderSender = false, onSent }) => {
+const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = "", prefillQuotedBody = "", onSent }) => {
   const [to, setTo] = useState("");
   const [cc, setCc] = useState("");
   const [subject, setSubject] = useState("");
@@ -61,8 +61,6 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
   }, [prefillQuotedBody]);
 
   // Load send-settings (undo window) and signatures whenever the modal opens.
-  // Reminder sends go out via a shared reminders@ mailbox, so this user's own
-  // signature preferences don't apply there.
   useEffect(() => {
     if (!isOpen) return;
     const email = localStorage.getItem("userEmail") || "";
@@ -73,20 +71,18 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
       .then(data => setUndoWindowSeconds(data.undoWindowSeconds || 0))
       .catch(() => {});
 
-    if (!useReminderSender) {
-      fetch(`${API_BASE}/signatures?user_email=${encodeURIComponent(email)}`)
-        .then(res => res.json())
-        .then(data => {
-          setSignatures(data.signatures || []);
-          setDefaultNewId(data.defaultNewId || null);
-          setDefaultReplyId(data.defaultReplyId || null);
-          // Replying (there's a quoted original) uses the reply default; a
-          // fresh message uses the new-message default.
-          setSelectedSignatureId((prefillQuotedBody ? data.defaultReplyId : data.defaultNewId) || null);
-        })
-        .catch(() => {});
-    }
-  }, [isOpen, useReminderSender]);
+    fetch(`${API_BASE}/signatures?user_email=${encodeURIComponent(email)}`)
+      .then(res => res.json())
+      .then(data => {
+        setSignatures(data.signatures || []);
+        setDefaultNewId(data.defaultNewId || null);
+        setDefaultReplyId(data.defaultReplyId || null);
+        // Replying (there's a quoted original) uses the reply default; a
+        // fresh message uses the new-message default.
+        setSelectedSignatureId((prefillQuotedBody ? data.defaultReplyId : data.defaultNewId) || null);
+      })
+      .catch(() => {});
+  }, [isOpen]);
 
   // Insert/replace the signature block whenever the selection changes.
   useEffect(() => {
@@ -150,14 +146,10 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
         `<div style="color:#333;font-size:0.9em">${resolvedQuote}</div>`
       : "";
     formData.append("bodyHtml", body + quotedSection);
-    // Only set fromEmail for regular sends — reminder endpoint uses
-    // reminders@hfmg.net via EWS impersonation, no fromEmail needed
-    if (!useReminderSender) {
-      formData.append("fromEmail", localStorage.getItem("userEmail") || "");
-    }
+    formData.append("fromEmail", localStorage.getItem("userEmail") || "");
     attachments.forEach(file => formData.append("attachments", file));
 
-    const endpoint = useReminderSender ? "send-reminder" : "send-email";
+    const endpoint = "send-email";
 
     if (!undoWindowSeconds) {
       await dispatchSend({ formData, endpoint });
@@ -318,7 +310,7 @@ const ComposeMailModal = ({ isOpen, onClose, prefillTo = "", prefillSubject = ""
                   📎 Attach
                   {attachments.length > 0 && <span style={s.attachBadge}>{attachments.length}</span>}
                 </label>
-                {!useReminderSender && signatures.length > 0 && (
+                {signatures.length > 0 && (
                   <div style={{ position: 'relative' }}>
                     <button onClick={() => setShowSignaturePicker(p => !p)} style={s.attachBtn} title="Insert signature">
                       ✍️ Signature

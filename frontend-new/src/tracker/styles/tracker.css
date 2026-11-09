@@ -1,0 +1,527 @@
+/* ── Reply Tracker ──────────────────────────────────────────────────────────
+   Visuals come from the shared theme (App.css + visionos-theme.css):
+   page shell, top-bar, tab-btn, count-badge, input-text, btn-gradient,
+   btn-copy and btn-icon-only are the app's own classes. This file only adds
+   layout plus tracker-specific pieces, styled with the same theme tokens
+   (--bg-card, --glass-border, --vos-*, --hero-gradient, category colors). */
+
+.trk-page,
+.trk-portal {
+  /* Status tones — same palette as the category tags (.urgent, .normal …) */
+  --trk-success: #30d158;  --trk-success-text: #63e6a0;
+  --trk-info: #0a84ff;     --trk-info-text: #64d2ff;
+  --trk-warning: #ff9f0a;  --trk-warning-text: #ffb340;
+  --trk-danger: #ff453a;   --trk-danger-text: #ff6961;
+  --trk-neutral: #98989d;  --trk-neutral-text: #b8b8bd;
+  --trk-row-hover: rgba(255, 255, 255, 0.05);
+  --trk-inset: rgba(255, 255, 255, 0.04);
+}
+body.light-mode .trk-page,
+body.light-mode .trk-portal {
+  --trk-success-text: #15803d;
+  --trk-info-text: #2563eb;
+  --trk-warning-text: #b45309;
+  --trk-danger-text: #dc2626;
+  --trk-neutral-text: #475569;
+  --trk-row-hover: #f1f5f9;
+  --trk-inset: #f8fafc;
+}
+
+.trk-tone-success { --tone: var(--trk-success); --tone-text: var(--trk-success-text); }
+.trk-tone-info    { --tone: var(--trk-info);    --tone-text: var(--trk-info-text); }
+.trk-tone-warning { --tone: var(--trk-warning); --tone-text: var(--trk-warning-text); }
+.trk-tone-danger  { --tone: var(--trk-danger);  --tone-text: var(--trk-danger-text); }
+.trk-tone-neutral { --tone: var(--trk-neutral); --tone-text: var(--trk-neutral-text); }
+
+.trk-muted { color: var(--text-muted); }
+
+/* ── Sticky header ──
+   The glass cards use backdrop-filter / transforms, which create their own
+   stacking layers; without a z-index they scroll *over* the sticky bar.
+   Once the page is scrolled the bar turns into a frosted white panel so
+   content passing underneath is fully blurred out. */
+.trk-topbar {
+  z-index: 100;
+  transition: background 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+}
+.trk-topbar.is-scrolled {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.14) 100%),
+    rgba(28, 30, 38, 0.55);
+  backdrop-filter: blur(48px) saturate(180%);
+  -webkit-backdrop-filter: blur(48px) saturate(180%);
+  border-color: rgba(255, 255, 255, 0.28);
+  box-shadow: var(--vos-sheen), 0 16px 40px rgba(0, 0, 0, 0.5);
+}
+body.light-mode .trk-topbar.is-scrolled {
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.10);
+}
+
+/* ── Header extras ── */
+.trk-sample {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  padding: 6px 12px; border-radius: 999px; font-size: 0.75rem; font-weight: 700;
+  color: #ffb340;
+  background: rgba(255, 159, 10, 0.16);
+  border: 1px solid rgba(255, 159, 10, 0.4);
+  box-shadow: var(--vos-sheen);
+}
+body.light-mode .trk-sample { color: #b45309; background: #fef3c7; border-color: #fcd34d; box-shadow: none; }
+
+.trk-error {
+  margin-bottom: 18px; padding: 12px 16px; border-radius: var(--vos-radius-sm);
+  color: #ff6961; background: rgba(255, 69, 58, 0.12); border: 1px solid rgba(255, 69, 58, 0.35);
+}
+
+/* ── Layout (unchanged) ── */
+.trk-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 20px;
+  align-items: start;
+}
+.trk-main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.trk-side { display: flex; flex-direction: column; gap: 20px; position: sticky; top: 110px; }
+
+@media (max-width: 1100px) {
+  .trk-layout { grid-template-columns: 1fr; }
+  .trk-side { position: static; }
+}
+
+/* ── Card — same glass surface as .email-card / sender cards ── */
+.trk-card {
+  background: var(--bg-card);
+  backdrop-filter: blur(var(--vos-blur-med)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--vos-blur-med)) saturate(150%);
+  border: var(--glass-border);
+  border-radius: var(--vos-radius-md);
+  box-shadow: var(--vos-sheen), var(--vos-shadow);
+  padding: 20px;
+  color: var(--text-primary);
+}
+body.light-mode .trk-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+}
+.trk-card__header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; margin-bottom: 16px;
+}
+.trk-card__title { margin: 0; font-size: 1rem; font-weight: 800; letter-spacing: -0.3px; color: var(--text-primary); }
+.trk-card__subtitle { margin: 3px 0 0; font-size: 0.75rem; color: var(--text-secondary); }
+.trk-card__actions { display: flex; gap: 8px; align-items: center; }
+
+/* Square icon button built on .btn-copy */
+.trk-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; padding: 0 !important;
+}
+.trk-row-action { padding: 6px; border-radius: var(--vos-radius-sm); }
+.trk-row-action:hover { background: rgba(10, 132, 255, 0.12); }
+
+/* ── KPI ── */
+.trk-kpi-grid {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px;
+}
+@media (max-width: 900px) { .trk-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.trk-kpi {
+  text-align: left; font: inherit; width: 100%;
+  display: flex; flex-direction: column; gap: 2px;
+  transition: transform 0.28s ease, box-shadow 0.28s ease, background 0.28s ease, border-color 0.28s ease;
+}
+.trk-kpi.is-clickable { cursor: pointer; }
+.trk-kpi.is-clickable:hover {
+  transform: translateY(-3px);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.24);
+  box-shadow: var(--vos-sheen), 0 26px 50px rgba(0, 0, 0, 0.4);
+}
+.trk-kpi.is-active {
+  border-color: color-mix(in srgb, var(--tone) 55%, transparent);
+  box-shadow: var(--vos-sheen), 0 0 0 1px color-mix(in srgb, var(--tone) 35%, transparent), var(--vos-shadow);
+}
+body.light-mode .trk-kpi.is-clickable:hover { background: #ffffff; border-color: #3b82f6; box-shadow: 0 8px 20px rgba(59, 130, 246, 0.08); }
+body.light-mode .trk-kpi.is-active { border-color: var(--tone); box-shadow: 0 0 0 1px var(--tone); }
+
+.trk-kpi__top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+/* Icon chip — same treatment as the Admin section tiles */
+.trk-kpi__icon {
+  display: flex; align-items: center; justify-content: center;
+  width: 38px; height: 38px; border-radius: 12px;
+  color: var(--tone-text);
+  background: color-mix(in srgb, var(--tone) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tone) 32%, transparent);
+  box-shadow: var(--vos-sheen);
+}
+.trk-kpi__arrow { color: var(--text-muted); }
+.trk-kpi__label { font-size: 0.82rem; font-weight: 700; color: var(--text-secondary); }
+.trk-kpi__value {
+  font-size: 2rem; font-weight: 800; letter-spacing: -0.5px; line-height: 1.15;
+  color: var(--text-primary); font-variant-numeric: tabular-nums;
+}
+.trk-kpi__caption { font-size: 0.74rem; color: var(--text-muted); }
+
+/* ── Toolbar / controls ── */
+.trk-toolbar {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 14px;
+}
+.trk-toolbar__right { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+.trk-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.trk-tab { padding: 7px 14px !important; font-size: 0.82rem !important; }
+.trk-tab .count-badge { padding: 1px 8px; font-size: 0.7rem; }
+
+/* .input-text based fields — keep theme look, drop its block-form sizing */
+.trk-field {
+  display: inline-flex !important; align-items: center; gap: 6px;
+  width: auto !important; margin: 0 !important;
+  height: 36px; padding: 0 12px !important;
+  color: var(--text-secondary);
+}
+.trk-field:focus-within {
+  border-color: rgba(100, 210, 255, 0.6);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.18);
+}
+.trk-field input, .trk-field select {
+  border: 0; outline: 0; background: transparent; color: var(--text-primary);
+  font: inherit; font-size: 0.82rem;
+}
+.trk-field input:focus-visible, .trk-field select:focus-visible { outline: none; }
+.trk-search input { width: 190px; }
+.trk-select { font-size: 0.8rem; }
+.trk-select select { cursor: pointer; }
+.trk-select option { color: #0f172a; background: #fff; }
+
+/* Buttons built on .btn-gradient / .btn-copy */
+.trk-btn {
+  display: inline-flex !important; align-items: center; justify-content: center; gap: 6px;
+  width: auto !important; white-space: nowrap; font-weight: 700;
+}
+.trk-btn--md { height: 36px; padding: 0 14px !important; font-size: 0.84rem !important; }
+.trk-btn--sm { height: 30px; padding: 0 11px !important; font-size: 0.76rem !important; }
+.trk-btn--done {
+  border-radius: var(--vos-radius-sm);
+  color: #63e6a0; background: rgba(48, 209, 88, 0.16);
+  border: 1px solid rgba(48, 209, 88, 0.4);
+  cursor: default;
+}
+body.light-mode .trk-btn--done { color: #15803d; background: #dcfce7; border-color: #86efac; }
+.trk-btn:disabled { cursor: default; }
+
+/* ── Table ── */
+.trk-table-wrap { overflow-x: auto; margin: 0 -20px -20px; }
+.trk-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; color: var(--text-primary); }
+.trk-table th {
+  text-align: left; font-weight: 700; font-size: 0.7rem; letter-spacing: 0.6px; text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 10px 12px; border-bottom: 1px solid var(--border-color); white-space: nowrap;
+  background: var(--trk-inset);
+}
+.trk-table td { padding: 11px 12px; border-bottom: 1px solid var(--border-color); vertical-align: middle; }
+.trk-table tr:last-child td { border-bottom: 0; }
+.trk-table th:first-child, .trk-table td:first-child { padding-left: 20px; }
+.trk-table th:last-child, .trk-table td:last-child { padding-right: 20px; }
+.trk-table tbody tr { transition: background 0.15s ease; }
+.trk-table tbody tr:hover { background: var(--trk-row-hover); }
+.trk-table tbody tr.is-selected { background: rgba(10, 132, 255, 0.12); }
+body.light-mode .trk-table tbody tr.is-selected { background: #dbeafe; }
+.trk-table tbody tr.is-clickable { cursor: pointer; }
+.trk-table__check { width: 40px; }
+.trk-table__check input { accent-color: var(--accent-blue); width: 15px; height: 15px; cursor: pointer; }
+.trk-table__empty {
+  text-align: center; padding: 40px 12px !important;
+  color: #00d9ff; font-style: italic; font-weight: 500; /* matches .loading-text */
+}
+.trk-col-subject { max-width: 320px; }
+.trk-subject {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.trk-tag {
+  flex-shrink: 0; font-size: 0.62rem; font-weight: 800; padding: 1px 6px; border-radius: 999px;
+  color: var(--text-secondary); background: rgba(152, 152, 157, 0.16); border: 1px solid rgba(152, 152, 157, 0.4);
+}
+
+/* ── Person / avatar — echoes .avatar (sheen highlight) ── */
+.trk-avatar {
+  position: relative; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  border-radius: 50%; color: #fff; font-weight: 800;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.12), var(--vos-sheen);
+}
+.trk-avatar::before {
+  content: ''; position: absolute; top: 8%; left: 22%; width: 56%; height: 32%;
+  border-radius: 50%; background: linear-gradient(180deg, rgba(255, 255, 255, 0.45), transparent);
+  pointer-events: none;
+}
+.trk-person { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+.trk-person__text { display: flex; flex-direction: column; min-width: 0; }
+.trk-person__name { font-weight: 700; white-space: nowrap; color: var(--text-primary); }
+.trk-person__detail {
+  font-size: 0.72rem; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;
+}
+
+/* ── Badges — same soft glass pill as .cat-tag ── */
+.trk-badge, .trk-pill {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  padding: 3px 10px; border-radius: 999px; font-size: 0.72rem; font-weight: 700;
+  color: var(--tone-text);
+  background: color-mix(in srgb, var(--tone) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tone) 40%, transparent);
+  box-shadow: var(--vos-sheen);
+  backdrop-filter: blur(8px);
+}
+body.light-mode .trk-badge, body.light-mode .trk-pill { box-shadow: none; }
+.trk-badge__dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tone); box-shadow: 0 0 6px var(--tone); }
+
+/* ── No-reply panel ── */
+.trk-noreply-list { display: flex; flex-direction: column; gap: 10px; }
+.trk-noreply {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; border-radius: var(--vos-radius-sm);
+  background: var(--trk-inset);
+  border: var(--glass-border);
+  border-left: 3px solid var(--tone);
+  transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+.trk-noreply:hover { background: rgba(255, 255, 255, 0.07); transform: translateY(-1px); }
+body.light-mode .trk-noreply { border: 1px solid #e2e8f0; border-left: 3px solid var(--tone); }
+body.light-mode .trk-noreply:hover { background: #f1f5f9; }
+.trk-noreply__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.trk-noreply__row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.trk-noreply__name {
+  font-weight: 700; font-size: 0.86rem; color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.trk-noreply__row .trk-badge { font-size: 0.66rem; padding: 2px 8px; }
+.trk-noreply__subject {
+  font-size: 0.8rem; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.trk-noreply__meta {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 0.7rem; color: var(--text-muted);
+}
+.trk-noreply__wait { color: var(--tone-text); font-weight: 700; }
+.trk-dot-sep { width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: 0.6; }
+
+.trk-more {
+  margin-top: 12px; width: 100%;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-radius: var(--vos-radius-sm); cursor: pointer;
+  font: inherit; font-size: 0.8rem; font-weight: 700;
+  color: var(--text-secondary); background: transparent;
+  border: 1px dashed var(--border-color);
+  transition: all 0.25s ease;
+}
+.trk-more:hover { background: rgba(10, 132, 255, 0.12); color: var(--text-primary); border-color: rgba(100, 210, 255, 0.5); }
+
+.trk-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 26px 0; color: var(--text-secondary);
+}
+.trk-empty p { margin: 0; font-size: 0.85rem; }
+
+/* ── Follow-up summary — hero gradient like the thread-summary header ── */
+.trk-followup {
+  border-radius: var(--vos-radius-md);
+  padding: 20px;
+  color: #fff;
+  background: var(--hero-gradient);
+  border: var(--glass-border);
+  backdrop-filter: blur(var(--vos-blur-med)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--vos-blur-med)) saturate(150%);
+  box-shadow: var(--vos-sheen), var(--vos-shadow);
+}
+body.light-mode .trk-followup {
+  background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+  border: none;
+  box-shadow: 0 10px 24px rgba(59, 130, 246, 0.25);
+}
+.trk-followup__title { margin: 0 0 16px; font-size: 1rem; font-weight: 800; letter-spacing: -0.3px; }
+.trk-followup__grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.trk-followup__item { display: flex; align-items: center; gap: 10px; }
+.trk-followup__icon {
+  display: flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; border-radius: 11px;
+  background: rgba(255, 255, 255, 0.16); border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow: var(--vos-sheen);
+}
+.trk-followup__value { font-size: 1.15rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.trk-followup__label { font-size: 0.72rem; opacity: 0.85; }
+.trk-followup__note {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin: 16px 0 0; padding: 10px 12px; border-radius: var(--vos-radius-sm);
+  font-size: 0.74rem; line-height: 1.45;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+.trk-followup__note svg { flex-shrink: 0; margin-top: 1px; }
+
+/* ── Email drawer (row / card click) ───────────────────────────────────────
+   Slides in from the right. Portaled to <body> inside .trk-portal (which
+   carries the tone tokens), because .main-content's backdrop-filter would
+   otherwise trap position:fixed inside the scrolling page. */
+.trk-drawer-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(3, 6, 15, 0.55);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  display: flex; justify-content: flex-end;
+  animation: trk-fade 0.15s ease-out;
+}
+body.light-mode .trk-drawer-backdrop { background: rgba(15, 23, 42, 0.28); }
+.trk-drawer {
+  width: min(820px, 100vw); height: 100%;
+  background: var(--bg-main);
+  border-left: var(--glass-border);
+  box-shadow: -24px 0 60px rgba(0, 0, 0, 0.45);
+  display: flex; flex-direction: column;
+  animation: trk-slide 0.2s ease-out;
+}
+body.light-mode .trk-drawer { box-shadow: -16px 0 40px rgba(15, 23, 42, 0.14); border-left: 1px solid #e2e8f0; }
+@keyframes trk-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes trk-slide { from { transform: translateX(32px); opacity: 0.6; } to { transform: none; opacity: 1; } }
+
+.trk-drawer__head {
+  display: flex; gap: 16px; align-items: flex-start; justify-content: space-between;
+  padding: 18px 22px 14px; border-bottom: var(--glass-border);
+}
+body.light-mode .trk-drawer__head { border-bottom: 1px solid #e2e8f0; }
+.trk-drawer__title { min-width: 0; }
+.trk-drawer__title h2 {
+  margin: 0; font-size: 1.08rem; font-weight: 800; letter-spacing: -0.3px; color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+.trk-drawer__meta { display: flex; align-items: center; gap: 10px; margin-top: 6px; font-size: 0.76rem; color: var(--text-secondary); }
+.trk-drawer__actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.trk-drawer__body { flex: 1; overflow-y: auto; padding: 16px 22px 28px; display: flex; flex-direction: column; gap: 18px; }
+.trk-drawer__loading { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 0.85rem; padding: 24px 0; }
+.trk-drawer__section h3 { margin: 0 0 10px; font-size: 0.86rem; font-weight: 800; color: var(--text-primary); }
+
+/* Recipients being tracked */
+.trk-recipients { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.trk-recipient {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  background: var(--trk-inset); border: var(--glass-border); border-radius: 12px;
+}
+body.light-mode .trk-recipient { border: 1px solid #e2e8f0; }
+.trk-recipient.is-focus { border-color: var(--trk-info); box-shadow: 0 0 0 1px var(--trk-info) inset; }
+.trk-recipient__text { flex: 1; min-width: 0; }
+.trk-recipient__name { font-size: 0.84rem; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 6px; }
+.trk-recipient__detail { font-size: 0.72rem; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Conversation */
+.trk-mail { border: var(--glass-border); border-radius: 14px; overflow: hidden; margin-bottom: 10px; background: var(--trk-inset); }
+body.light-mode .trk-mail { border: 1px solid #e2e8f0; }
+.trk-mail.is-mine { border-left: 3px solid var(--trk-info); }
+.trk-mail__head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; }
+.trk-mail__who { flex: 1; min-width: 0; }
+.trk-mail__from { font-size: 0.82rem; font-weight: 700; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trk-mail__from .trk-muted { font-weight: 500; margin-left: 4px; }
+.trk-mail__to { font-size: 0.72rem; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trk-mail__date { font-size: 0.72rem; color: var(--text-secondary); display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.trk-mail__frame { display: block; width: 100%; border: 0; background: #fff; }
+.trk-mail__empty { padding: 10px 14px; font-size: 0.8rem; }
+
+/* Reminder / reply composers */
+.trk-compose {
+  border: 1px solid var(--trk-info); border-radius: 14px; padding: 14px 16px;
+  background: var(--trk-inset); display: flex; flex-direction: column; gap: 10px;
+}
+.trk-compose__head { display: flex; align-items: center; justify-content: space-between; }
+.trk-compose__head h4 { margin: 0; display: flex; align-items: center; gap: 7px; font-size: 0.9rem; font-weight: 800; color: var(--text-primary); }
+.trk-compose__field { display: flex; flex-direction: column; gap: 4px; font-size: 0.72rem; font-weight: 700; color: var(--text-secondary); }
+.trk-compose__field .input-text { width: 100%; box-sizing: border-box; font-size: 0.84rem; font-weight: 500; }
+.trk-compose__field textarea.input-text { resize: vertical; min-height: 120px; font-family: inherit; line-height: 1.5; }
+.trk-compose__note {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 0.76rem; color: var(--text-secondary); line-height: 1.45;
+}
+.trk-compose__hint { margin: -2px 0 0; font-size: 0.7rem; color: var(--text-muted); }
+.trk-compose__error {
+  font-size: 0.78rem; color: var(--trk-danger-text);
+  background: color-mix(in srgb, var(--trk-danger) 12%, transparent);
+  border-radius: 8px; padding: 7px 10px;
+}
+.trk-compose__actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Overdue cards open the drawer too */
+.trk-noreply.is-clickable { cursor: pointer; }
+.trk-noreply.is-clickable:hover { border-color: var(--tone); }
+
+@media (max-width: 720px) {
+  .trk-drawer__head { flex-direction: column; }
+  .trk-recipient { flex-wrap: wrap; }
+}
+
+/* ── Reminder modal (bell in the table / Nudge on a card) ── */
+.trk-modal-backdrop {
+  position: fixed; inset: 0; z-index: 1100;
+  background: rgba(3, 6, 15, 0.6);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  animation: trk-fade 0.15s ease-out;
+}
+body.light-mode .trk-modal-backdrop { background: rgba(15, 23, 42, 0.32); }
+.trk-modal {
+  width: min(640px, 100%); max-height: calc(100vh - 32px); overflow-y: auto;
+  background: var(--bg-main); border: var(--glass-border); border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5); padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+body.light-mode .trk-modal { border: 1px solid #e2e8f0; box-shadow: 0 20px 48px rgba(15, 23, 42, 0.18); }
+.trk-modal .trk-compose { border: none; background: transparent; padding: 4px 6px; }
+.trk-modal__context {
+  font-size: 0.8rem; font-weight: 700; color: var(--text-primary); padding: 4px 6px 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.trk-compose__to { font-size: 0.84rem; font-weight: 600; color: var(--text-primary); padding: 2px 0; }
+
+/* ── Row actions: bell + stop tracking ── */
+.trk-row-actions { display: inline-flex; gap: 4px; justify-content: flex-end; }
+.trk-row-action--stop:hover:not(:disabled) { color: var(--trk-danger-text); }
+
+/* ── Stop-tracking confirmation ── */
+.trk-modal--narrow { width: min(460px, 100%); }
+.trk-stop__who { padding: 2px 0; }
+.trk-stop__name { font-size: 0.92rem; font-weight: 800; color: var(--text-primary); }
+.trk-stop__who .trk-muted { font-size: 0.78rem; }
+.trk-stop__email { font-size: 0.8rem; color: var(--text-primary); overflow-wrap: anywhere; }
+.trk-stop__effects {
+  margin: 2px 0 0; padding-left: 18px;
+  font-size: 0.78rem; color: var(--text-secondary); line-height: 1.6;
+}
+
+/* ── "Why this is tracked" (AI) ── */
+.trk-why {
+  border: 1px solid color-mix(in srgb, var(--trk-info) 45%, transparent);
+  background: color-mix(in srgb, var(--trk-info) 8%, transparent);
+  border-radius: 14px; padding: 12px 14px;
+}
+.trk-why__head { display: flex; align-items: center; justify-content: space-between; }
+.trk-why__head h3 { margin: 0; display: flex; align-items: center; gap: 7px; font-size: 0.86rem; font-weight: 800; color: var(--text-primary); }
+.trk-why__text { margin: 8px 0 0; font-size: 0.86rem; line-height: 1.5; color: var(--text-primary); display: flex; align-items: center; gap: 6px; }
+.trk-why__hint { margin: 6px 0 0; font-size: 0.72rem; color: var(--text-muted); }
+.trk-link { background: none; border: 0; padding: 0; color: var(--trk-info-text); font-weight: 700; cursor: pointer; text-decoration: underline; }
+
+.trk-recipient { flex-wrap: wrap; }
+.trk-recipient__why { flex-basis: 100%; padding-left: 40px; display: flex; flex-direction: column; gap: 6px; }
+.trk-recipient__reason { font-size: 0.78rem; color: var(--text-secondary); line-height: 1.45; }
+.trk-recipient__label {
+  font-size: 0.66rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--trk-info-text); margin-right: 4px;
+}
+.trk-recipient__ask {
+  margin: 0; display: flex; gap: 7px; align-items: flex-start;
+  border-left: 3px solid var(--trk-info); padding: 6px 10px;
+  background: var(--trk-inset); border-radius: 0 8px 8px 0;
+  font-size: 0.8rem; font-style: italic; color: var(--text-primary); line-height: 1.45;
+}
+.trk-recipient__ask svg { flex-shrink: 0; margin-top: 3px; color: var(--trk-info-text); }
+.trk-tag--warn { margin-left: 6px; color: var(--trk-warning-text); border-color: var(--trk-warning); }

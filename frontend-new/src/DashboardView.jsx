@@ -4,7 +4,7 @@ import axios from 'axios';
 import {
   Paperclip, BarChart3, X, PieChart, Mail, ArrowLeft, Calendar,
   FileText, Download, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader, LogOut,
-  Users, Settings
+  Users, Settings, MailCheck
 } from 'lucide-react';
 import TriageSummary from './TriageSummary';
 import ToastContainer from './Toast';
@@ -183,7 +183,6 @@ const DashboardView = ({
   isAnalyzingBackground,
   senderFilter, setSenderFilter,
   triageStats,
-  canUseTracking = false,
   canUseActivity = false,
   autoDigest = null,
   digestLoading = false,
@@ -532,9 +531,7 @@ const DashboardView = ({
               <button className={`view-btn ${mainView === 'INSIGHTS' ? 'active' : ''}`} onClick={() => { setSelectedEmail(null); setMainView('INSIGHTS'); }}><PieChart size={18} /> Insights</button>
               <button className={`view-btn ${mainView === 'THREADS' ? 'active' : ''}`}  onClick={() => { setSelectedEmail(null); setMainView('THREADS'); }}><Mail size={18} /> Inbox</button>
               <button className="view-btn" onClick={() => navigate('/calendar')} title="Open Calendar"><Calendar size={18} /> Calendar</button>
-              {canUseTracking && (
-                <button className="view-btn" onClick={() => navigate('/tracking')} title="Follow-Up Tracking" style={{ position: 'relative' }}>📡 Tracking</button>
-              )}
+              <button className="view-btn" onClick={() => navigate('/tracker')} title="Reply Tracker"><MailCheck size={18} /> Tracker</button>
               {canUseActivity && (
                 <button className="view-btn" onClick={() => navigate('/activity')} title="Team Activity"><Users size={18} /> Activity</button>
               )}
@@ -816,7 +813,6 @@ const DashboardView = ({
                     isFileDownloading={isFileDownloading}
                     getFileProgress={getFileProgress}
                     totalEmailCount={triageStats?.vol_emails}
-                    canUseTracking={canUseTracking}
                     flagOpen={flagOpen}
                     setFlagOpen={setFlagOpen}
                     flagSubmitting={flagSubmitting}

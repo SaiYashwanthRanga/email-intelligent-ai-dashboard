@@ -3,7 +3,6 @@ import uuid
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 import requests
 import httpx
 import uvicorn
@@ -21,7 +20,8 @@ from typing import List
 from urllib.parse import unquote
 
 from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, IrisChatRequest, ActivityPingRequest
-from iris_service import get_iris_reply, get_needs_response_emails, preview_tag_matches
+from iris_service import get_iris_reply, preview_tag_matches
+from tracker.api.routes import router as tracker_router
 
 import logging
 
@@ -29,9 +29,8 @@ import logging
 #
 # Two destinations, two levels. The console is what you watch during a deploy,
 # so it stays at ERROR: nothing prints unless something is actually wrong. The
-# log FILE keeps INFO, because the background scheduler is otherwise invisible
-# — every line proving it ran ("cycle start", "Needs Review", "reminder sent")
-# is INFO, and on a server nobody is watching the console anyway. Quietening
+# log FILE keeps INFO, because background work (prefetch, outbox replay) is
+# otherwise invisible and on a server nobody is watching the console anyway. Quietening
 # the terminal should not mean going blind; it means the record moves to disk.
 #
 #   LOG_LEVEL=INFO        chatty console again (local development)
@@ -134,20 +133,6 @@ from services import (
     generate_day_brief_summary,
     get_or_generate_calendar_bullets,
     extract_sender_email,
-    # ── Tracking system ──
-    run_tracking_scheduler,
-    get_tracking_summary,
-    get_tracking_digest,
-    dismiss_tracking_recipient,
-    is_tracking_allowed,
-    get_tracking_allowed_users,
-    load_tracking,
-    sync_replies_from_ews,
-    analyze_sent_thread_reply,
-    get_tracking_progress,
-    begin_tracking_progress,
-    fetch_thread_messages,
-    norm_thread_message,
     get_group_members_dict,
     add_group_member,
     remove_group_member,
@@ -202,6 +187,22 @@ _analysis_jobs: dict = {}
 # fails the way a firewall block does — without editing this file.
 ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177")
 
+# ─── LOGIN → MAILBOX OVERRIDES ───
+# MAILBOX_OVERRIDES in .env: comma-separated "who=mailbox" pairs. `who` is the
+# login name typed on the login page OR the mailbox the org login returns;
+# matching accounts work on `mailbox` instead — the inbox, tracker, replies,
+# reminders and every other per-user API call use it. Display name is kept.
+#   MAILBOX_OVERRIDES=karthikeyana=Jim@hfmg.net,chandu.natakarani@hfmg.net=Jim@hfmg.net
+def _load_mailbox_overrides() -> dict:
+    out = {}
+    for pair in os.getenv("MAILBOX_OVERRIDES", "karthikeyana=Jim@hfmg.net").split(","):
+        who, sep, mailbox = pair.partition("=")
+        if sep and who.strip() and "@" in mailbox:
+            out[who.strip().lower()] = mailbox.strip()
+    return out
+
+MAILBOX_OVERRIDES = _load_mailbox_overrides()
+
 # =====================================================
 # 🔧 CONFIGURE THIS: Your org server's endpoint to
 # fetch a single email (with full attachment base64)
@@ -218,71 +219,9 @@ ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177")
 # =====================================================
 
 
-# ─── TRACKING SCHEDULER ───
-# Users seen on the tracking endpoints this process. Kept only so a newly
-# granted account starts on its next request instead of waiting for a cycle —
-# the schedule itself comes from the access list, see _scheduler_targets.
-_active_tracking_users: set = set()
-
-TRACKING_CYCLE_SECONDS = 5 * 60
-# Short grace period so the first sweep doesn't fight app startup for the
-# event loop. It is not a "wait until someone opens the page" delay — the
-# first full sync runs this many seconds after boot, unprompted.
-TRACKING_STARTUP_DELAY = int(os.getenv("TRACKING_STARTUP_DELAY", "10"))
-
-
-def _scheduler_targets() -> list:
-    """
-    Who the background scheduler runs for this cycle.
-
-    Read from tracking_access.json every cycle, not from an in-memory set of
-    whoever opened the page. That set starts empty on every restart, so
-    reminders stopped firing entirely until each user happened to visit the
-    tracking tab — approve a follow-up, close the tab, restart the server, and
-    the Day-1 and Day-3 mails were never sent. Re-reading the file each cycle
-    also means granting or revoking access takes effect without a restart.
-    """
-    try:
-        targets = get_tracking_allowed_users()
-    except Exception as e:
-        log.error(f"[tracking loop] could not read the access list: {e}")
-        targets = set()
-    targets |= {u.lower().strip() for u in _active_tracking_users if u}
-    return sorted(targets)
-
-
-async def _tracking_scheduler_loop():
-    """
-    Background loop: sweeps every enabled user on a fixed cycle, starting
-    shortly after boot.
-
-    The first sweep is a full sync — it pulls each user's sent mail, reads the
-    bodies and runs the AI over anything new — so the Needs Review queue is
-    being built before anyone opens the Tracking tab.
-    """
-    await asyncio.sleep(TRACKING_STARTUP_DELAY)
-    first = True
-    while True:
-        targets = _scheduler_targets()
-        log.info(
-            f"[tracking loop] {'STARTUP sync' if first else 'cycle'} — "
-            f"{len(targets)} user(s): {', '.join(targets) or 'none'}"
-        )
-        first = False
-        for user_email in targets:
-            try:
-                await run_tracking_scheduler(user_email)
-            except Exception as e:
-                log.error(f"[tracking loop] error for {user_email}: {e}")
-        await asyncio.sleep(TRACKING_CYCLE_SECONDS)
-
-@asynccontextmanager
-async def lifespan(app):
-    asyncio.create_task(_tracking_scheduler_loop())
-    log.info("[tracking] Scheduler background task started")
-    yield
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
+# Follow-up tracker (backend/tracker): /api/tracker/*
+app.include_router(tracker_router)
 
 # 2. SECURITY (CORS)
 app.add_middleware(
@@ -378,12 +317,16 @@ async def login(credentials: LoginRequest):
 
         user_data = response.json()
 
-        # ── HARDCODE: open Jim's inbox for this specific account only ──
-        # Scoped to the login identifier, not the returned mail, so it only
-        # fires for this one account. Display name is left untouched.
-        if credentials.email.strip().lower() == "karthikeyana":
-            log.info(f"Login override: {credentials.email} -> Jim@hfmg.net inbox")
-            user_data["mail"] = "Jim@hfmg.net"
+        # ── Mailbox override (MAILBOX_OVERRIDES in .env) ──
+        # Matched on the login name typed, or on the mailbox the org server
+        # returned for it — so it only fires for the listed accounts, after
+        # the org server has accepted their own password.
+        own_mail = str(user_data.get("mail") or "")
+        target = (MAILBOX_OVERRIDES.get(credentials.email.strip().lower())
+                  or MAILBOX_OVERRIDES.get(own_mail.strip().lower()))
+        if target:
+            log.info(f"Login override: {credentials.email} ({own_mail or 'no mail'}) -> {target} mailbox")
+            user_data["mail"] = target
 
         log.info(f"Login OK: {credentials.email}")
         return user_data
@@ -647,43 +590,6 @@ async def get_email_details(messageId: str, userEmail: str):
             resp = await client.get(org_url, params=params)
 
         if resp.status_code != 200:
-            # ── Fallback: tracking cache ──────────────────────────────────────
-            # Sent emails (tracking page) live in Sent Items, not inbox.
-            # When .NET inbox/onemail can't find them, serve the body we stored
-            # at tracking-add time (up to 5 000 chars) so the modal isn't blank.
-            try:
-                from services import load_tracking
-                tracking = load_tracking(userEmail)
-                # Search both active tracking AND pending AI suggestions —
-                # the "View Email" button on a pending approval card hits this
-                # same endpoint before the item has ever been approved.
-                cached_item = next(
-                    (item for item in (
-                        tracking.get("tracked", [])
-                        + tracking.get("pending_tracking_approvals", [])
-                    ) if item.get("messageId") == messageId),
-                    None
-                )
-                if cached_item:
-                    log.info(
-                        f"[email-details] .NET {resp.status_code} — "
-                        f"serving tracking-cache body for {messageId[:20]}..."
-                    )
-                    return {
-                        "messageId":          messageId,
-                        "subject":            cached_item.get("subject", ""),
-                        "body":               cached_item.get("body", ""),
-                        "from":               userEmail,
-                        "to":                 [],
-                        "cc":                 [],
-                        "attachments":        [],
-                        "hasAttachments":     False,
-                        "messages":           [],
-                        "_fromTrackingCache": True,
-                    }
-            except Exception as fallback_err:
-                log.warning(f"[email-details] Tracking cache fallback failed: {fallback_err}")
-
             # ── Fallback: offline detail cache ────────────────────────────────
             # An error status is just as unusable as an unreachable server, so
             # serve the copy saved while it was healthy rather than a dead panel.
@@ -1465,8 +1371,8 @@ async def iris_chat(payload: IrisChatRequest):
     """
     Iris — Inbox Assistant, Phase 3.
     Grounded in the inbox snapshot (payload.inbox_context) plus tool
-    calls (draft_reply / check_tracking_status / search_emails), which
-    need payload.user_email to look up the right user's cache/tracking
+    calls (draft_reply / search_emails / read_email ...), which
+    need payload.user_email to look up the right user's cached
     data. See iris_service.py for the tool implementations and the
     tool-calling loop itself.
     """
@@ -1657,41 +1563,28 @@ async def iris_confirm(payload: dict = Body(...)):
 async def health():
     """
     Liveness plus the handful of facts that decide whether a deploy is sane:
-    is the AI key present, where is mail being sent, and is unattended
-    reminder delivery armed. Checking those by reading the code on a live box
+    is the AI key present and where is mail being sent. Checking those by
+    reading the code on a live box
     is how the wrong ORG_BASE stays unnoticed until someone gets a real email.
 
     Deliberately exposes no secrets — only whether the key is configured.
     """
     from services import (
-        ORG_BASE as SVC_ORG_BASE, REMINDERS_ENABLED, MAX_REMINDERS_PER_CYCLE,
-        ACTIVE_MODEL, api_key, AI_LAST_ERROR,
+        ORG_BASE as SVC_ORG_BASE, ACTIVE_MODEL, api_key,
     )
-    targets = _scheduler_targets()
     return {
         "status": "ok",
         "time":   datetime.now(timezone.utc).isoformat(),
         "ai": {
             "key_configured": bool(api_key),
             "model":          ACTIVE_MODEL,
-            # Last failure from the tracking classifier. A populated value here
-            # is why Needs Review is empty or why emails are being deferred —
-            # far faster to read than inferring it from the queue.
-            "last_error":     AI_LAST_ERROR.get("error"),
-            "last_error_at":  AI_LAST_ERROR.get("at"),
         },
         "org_base": {
-            "api":       ORG_BASE,
-            "scheduler": SVC_ORG_BASE,
+            "api":      ORG_BASE,
+            "services": SVC_ORG_BASE,
             # These are read from different modules; if they ever disagree the
-            # API and the scheduler are talking to different mail servers.
-            "agree":     ORG_BASE.rstrip("/") == SVC_ORG_BASE.rstrip("/"),
-        },
-        "tracking": {
-            "reminders_enabled":   REMINDERS_ENABLED,
-            "max_per_cycle":       MAX_REMINDERS_PER_CYCLE,
-            "cycle_seconds":       TRACKING_CYCLE_SECONDS,
-            "scheduled_users":     len(targets),
+            # API routes and services.py are talking to different mail servers.
+            "agree":    ORG_BASE.rstrip("/") == SVC_ORG_BASE.rstrip("/"),
         },
     }
 
@@ -1743,58 +1636,6 @@ async def send_email(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/send-reminder")
-async def send_reminder(
-    to: List[str] = Form(...),
-    cc: List[str] = Form([]),
-    subject: str = Form(...),
-    bodyHtml: str = Form(...),
-    attachments: List[UploadFile] = File([]),
-):
-    """
-    Send a follow-up / reminder email from reminders@hfmg.net via EWS impersonation.
-    Routes to /api/Values/mail/SentAsRemainder — no FromEmail field needed,
-    the .NET endpoint handles the sender via impersonation.
-    Used by the tracking page Follow Up compose and any user-initiated reminders.
-    """
-    try:
-        org_api_url = f"{ORG_BASE}/api/Values/mail/SentAsRemainder"
-
-        parts = []
-        for t in to:
-            parts.append(("To", (None, t, "text/plain")))
-        for c in cc:
-            parts.append(("Cc", (None, c, "text/plain")))
-        parts.append(("Subject",   (None, subject, "text/plain")))
-        parts.append(("BodyHtml",  (None, bodyHtml, "text/plain")))
-        # .NET SendMailRequest requires FromEmail even for SentAsRemainder —
-        # the EWS impersonation overrides the actual sender to reminders@hfmg.net
-        parts.append(("FromEmail", (None, "reminders@hfmg.net", "text/plain")))
-
-        for file in attachments:
-            file_bytes = await file.read()
-            if file_bytes:
-                parts.append(("Attachments", (file.filename, file_bytes, file.content_type)))
-
-        if not any(k == "Attachments" for k, _ in parts):
-            parts.append(("Attachments", ("", b"", "application/octet-stream")))
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(org_api_url, files=parts)
-
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
-
-        log.info(f"Reminder sent via reminders@hfmg.net to {to}")
-        return {"success": True, "message": "Reminder sent"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"send_reminder error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2501,27 +2342,11 @@ async def get_auto_digest(user_email: str):
     return result
 
 
-# ── TRACKING ENDPOINTS ────────────────────────────────────────────────────────
-
-@app.get("/api/tracking/access")
-async def check_tracking_access(user_email: str):
-    """
-    Returns whether the given user is allowed to use the tracking feature.
-    The frontend calls this once on mount to decide whether to show the
-    Tracking tab/button. The real enforcement is in every /api/tracking* endpoint.
-    Reads from tracking_access.json — no server restart needed after editing.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    return {"allowed": is_tracking_allowed(user_email)}
-
-
 # ── ACTIVITY TRACKING ENDPOINTS ───────────────────────────────────────────────
 # Shows when each person using the dashboard is active and from which
 # (best-effort) device. This is data ABOUT other people, not just the caller,
-# so /api/activity/summary is gated by activity_access.json the same way
-# tracking is gated by tracking_access.json — edit that file to add/remove
-# who can see the summary; no server restart needed.
+# so /api/activity/summary is gated by activity_access.json — edit that file
+# to add/remove who can see the summary; no server restart needed.
 
 @app.post("/api/activity/ping")
 async def activity_ping(payload: ActivityPingRequest):
@@ -2558,255 +2383,6 @@ async def activity_summary(requester_email: str, days: int = 14):
     if not is_activity_allowed(requester_email):
         raise HTTPException(status_code=403, detail="Not authorized to view activity data.")
     return {"users": get_activity_summary(days=days)}
-
-
-@app.get("/api/tracking")
-async def get_tracking(user_email: str):
-    """
-    Returns the full tracking store for the Tracking tab UI.
-    Splits into: awaiting, reminders_sent, resolved.
-    Also registers the user for the background scheduler.
-
-    On every load, cross-references live EWS reply data from the .NET
-    sent7days endpoint so Active Tracking stays in sync with real reply
-    status without waiting for the 2-hour background scheduler.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
-    _active_tracking_users.add(user_email)
-
-    # ── Live EWS reply sync ───────────────────────────────────────────────────
-    # Pull the same sent7days data the Sent Items tab uses and patch the
-    # tracking JSON so reply statuses are always current on every load.
-    # Wrapped in a broad try/except — an EWS failure must never block
-    # the tracking load; the user still gets their data, just un-synced.
-    try:
-        if org_is_down():
-            raise RuntimeError("org server known unreachable — skipping live sync")
-        async with httpx.AsyncClient(timeout=20) as client:
-            ews_resp = await client.get(
-                f"{ORG_BASE}/api/Values/sent7days",
-                params={"email": user_email}
-            )
-        if ews_resp.status_code != 200:
-            org_mark_failure(f"sent7days HTTP {ews_resp.status_code}")
-        else:
-            org_mark_success()
-            ews_data = ews_resp.json()
-            if isinstance(ews_data, list) and ews_data:
-                updated = sync_replies_from_ews(user_email, ews_data)
-                if updated:
-                    log.info(f"[tracking/ews-sync] {updated} recipient(s) patched for {user_email}")
-    except Exception as sync_err:
-        log.warning(f"[tracking/ews-sync] Non-fatal EWS sync error: {sync_err}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    try:
-        return get_tracking_summary(user_email)
-    except Exception as e:
-        log.error(f"get_tracking error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/tracking/dismiss")
-async def dismiss_tracking(payload: dict = Body(...)):
-    """
-    Dismiss a specific recipient from a tracked email.
-    Body: { user_email, message_id, recipient_email }
-    Dismissed items never appear in the digest again.
-    """
-    user_email      = payload.get("user_email")
-    message_id      = payload.get("message_id")
-    recipient_email = payload.get("recipient_email")
-
-    if not all([user_email, message_id, recipient_email]):
-        raise HTTPException(status_code=400, detail="Missing user_email, message_id, or recipient_email")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
-
-    ok = dismiss_tracking_recipient(user_email, message_id, recipient_email)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Tracked email or recipient not found")
-    return {"success": True}
-
-
-# The pending_reminders queue was retired when Day-1/Day-3 reminders moved to
-# auto-send from the scheduler. Nothing has written that key since, so
-# GET /api/tracking/pending could only ever return [], and its approve route
-# called a stub that returned ok=True without sending anything — an endpoint
-# that reports a reminder as sent when none was is worse than no endpoint.
-# Removed rather than left as a trap. Reminder sending now lives solely in
-# run_tracking_scheduler Pass 4 (services.py).
-
-
-@app.get("/api/sent-emails")
-async def get_sent_emails(user_email: str):
-    """
-    Proxy: GET /api/Values/sent7days?email=...
-    Returns ALL sent emails for the last 7 days for the Tracking page Sent Emails tab.
-    The .NET endpoint already limits to a 7-day window so no further capping is needed.
-
-    The .NET endpoint returns SentMailTrackDto[] with EWS-computed reply status:
-      - isReply            true when In-Reply-To header is set
-      - notRepliedAddresses recipients who haven't replied yet
-      - hasPendingReplies  any recipient still outstanding
-      - hasQuestionMark    subject/body contains a question mark
-    NOTE: the docstring used to say the body is null "for performance". It
-    isn't — every sent email comes back with its text, which is what lets
-    Iris answer "what did I tell X" from the person's own words.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-
-    org_url = f"{ORG_BASE}/api/Values/sent7days"
-    log.debug(f"sent-emails: user={user_email}")
-
-    import re as _sre
-    cache_path = f"sent_cache_{_sre.sub(r'[^\w@.-]', '_', user_email.lower().strip())}.json"
-
-    def _serve_stale(reason: str, status: int, detail: str):
-        # Same idea as fetch_inbox: when the org server is down, show the last
-        # sent list we fetched instead of a blank tab, flagged as cached.
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            if cached.get("items"):
-                log.warning(f"sent-emails: {reason} — serving {len(cached['items'])} cached items for {user_email}")
-                r = JSONResponse(content=cached["items"])
-                r.headers["X-Data-Source"] = "cache"
-                r.headers["X-Cache-As-Of"] = cached.get("as_of", "")
-                return r
-        except Exception:
-            pass
-        raise HTTPException(status_code=status, detail=detail)
-
-    # Same circuit breaker as the inbox: once the org server has just failed,
-    # skip the wait and answer from the saved copy immediately.
-    if org_is_down():
-        return _serve_stale("org server known unreachable", 502, "Mail server unreachable.")
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(org_url, params={"email": user_email})
-
-        if resp.status_code != 200:
-            org_mark_failure(f"sent7days HTTP {resp.status_code}")
-            return _serve_stale(
-                f"org server returned {resp.status_code}", resp.status_code,
-                f"Mail server error: {resp.text[:200]}"
-            )
-
-        org_mark_success()
-        data = resp.json()
-        if not isinstance(data, list):
-            return []
-
-        # Return all emails — .NET already limits to 7 days
-        log.debug(f"sent-emails: returning {len(data)} items for {user_email}")
-        if data:
-            try:
-                tmp = cache_path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump({"as_of": datetime.now(timezone.utc).isoformat(), "items": data}, f)
-                os.replace(tmp, cache_path)   # atomic: never leaves a half-written cache
-            except Exception as ce:
-                log.warning(f"sent-emails: could not write cache: {ce}")
-        return data
-
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        org_mark_failure("sent7days timeout")
-        return _serve_stale("timeout", 504, "Mail server timeout")
-    except httpx.ConnectError:
-        org_mark_failure("sent7days connect error")
-        return _serve_stale("connect error", 503, "Cannot reach mail server")
-    except Exception as e:
-        log.error(f"get_sent_emails error: {e}")
-        return _serve_stale(f"error {e}", 500, str(e))
-
-
-@app.get("/api/tracking/pending-tracking")
-async def get_pending_tracking_approvals(user_email: str):
-    """
-    Returns all AI-suggested tracking decisions awaiting user approval.
-    These are emails the AI wants to track but the user must approve first.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking not enabled for this account.")
-    tracking  = load_tracking(user_email)
-    approvals = tracking.get("pending_tracking_approvals", [])
-    return {"approvals": approvals, "total": len(approvals)}
-
-
-@app.post("/api/tracking/pending-tracking/approve")
-async def approve_tracking_approval(
-    user_email:  str = Form(...),
-    approval_id: str = Form(...),
-):
-    """
-    User approves a pending tracking decision.
-    Moves the entry from pending_tracking_approvals → tracked.
-    """
-    if not user_email or not approval_id:
-        raise HTTPException(status_code=400, detail="Missing fields")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking not enabled for this account.")
-    from services import approve_tracking_decision
-    result = await approve_tracking_decision(user_email, approval_id)
-    if not result.get("ok"):
-        raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
-    return result
-
-
-@app.post("/api/tracking/pending-tracking/dismiss")
-async def dismiss_tracking_approval(
-    user_email:  str = Form(...),
-    approval_id: str = Form(...),
-):
-    """
-    User dismisses a pending tracking decision without tracking.
-    Moves the entry to the AI Skipped log.
-    """
-    if not user_email or not approval_id:
-        raise HTTPException(status_code=400, detail="Missing fields")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking not enabled for this account.")
-    from services import dismiss_tracking_decision
-    result = dismiss_tracking_decision(user_email, approval_id)
-    if not result.get("ok"):
-        raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
-    return result
-
-
-@app.get("/api/tracking/skipped")
-async def get_tracking_skipped(user_email: str):
-    """
-    Returns the AI-skipped (not-tracked) log for this user.
-    Shown in the 'AI Skipped' tab of the tracking page.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    from services import load_not_tracked_log
-    entries = load_not_tracked_log(user_email)
-    return {"skipped": entries, "total": len(entries)}
-
-
-@app.get("/api/tracking/needs-response")
-async def get_needs_response_route(user_email: str):
-    """
-    The inbound half of "what do I owe" — received emails whose thread the
-    person has never replied into. Shown in the Tracking page's
-    Deliverables tab alongside the existing outbound (sent-mail) tracking.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    rows = await get_needs_response_emails(user_email)
-    return {"emails": rows, "total": len(rows)}
 
 
 @app.get("/api/thread-notes")
@@ -3018,409 +2594,6 @@ async def get_tag_matches_route(tag_id: str, user_email: str):
     return {"emails": get_emails_by_ids(user_email, tag.get("matchedIds") or [])}
 
 
-@app.get("/api/tracking/digest")
-async def get_digest(user_email: str):
-    """
-    Returns all Day-5+ outstanding items for the digest panel.
-    Both internal and external non-repliers included.
-    Auto-excludes anyone who has already replied or been dismissed.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
-    try:
-        return {"digest": get_tracking_digest(user_email)}
-    except Exception as e:
-        log.error(f"get_digest error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/tracking/restore")
-async def restore_skipped(
-    user_email: str = Form(...),
-    message_id: str = Form(...),
-):
-    """
-    Move an AI-skipped email from the skipped log back into active tracking.
-    Also fires an immediate Day-1 reminder if the email is already >= 1 business day old.
-    """
-    if not user_email or not message_id:
-        raise HTTPException(status_code=400, detail="Missing fields")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking not enabled for this account.")
-    try:
-        from services import restore_skipped_to_tracking, approve_tracking_decision
-        result = restore_skipped_to_tracking(user_email, message_id)
-        if not result.get("ok"):
-            raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
-
-        # Fire immediate reminder if already overdue — reuse approve_tracking_decision
-        # logic by running the scheduler check directly on the restored entry
-        try:
-            from services import load_tracking, get_business_days_since, generate_reminder_body, save_tracking
-            import httpx as _httpx
-            from datetime import datetime
-
-            ORG =ORG_BASE
-            tracking = load_tracking(user_email)
-            tracked  = next((t for t in tracking.get("tracked", []) if t["messageId"] == message_id), None)
-
-            if tracked:
-                sent_at = tracked.get("sentAt", "")
-                bdays   = get_business_days_since(sent_at)
-                subject = tracked.get("subject", "")
-                sender_first = user_email.split("@")[0].split(".")[0].title()
-
-                if bdays >= 1:
-                    for addr, info in tracked.get("recipients", {}).items():
-                        if info.get("replied") or info.get("dismissed") or info.get("type") == "external":
-                            continue
-                        if info.get("reminder1_sent") or info.get("reminder1_pending"):
-                            continue
-
-                        rec_first = addr.split("@")[0].split(".")[0].title()
-                        orig_body = tracked.get("body", "")
-                        draft_body = await generate_reminder_body(subject, rec_first, 1, sender_first, is_external=False)
-
-                        import html as _html, re as _re
-                        plain = _re.sub(r"<[^>]+>", " ", orig_body)
-                        plain = _html.unescape(plain)
-                        plain = _re.sub(r"[ \t]+", " ", plain).strip()
-                        if len(plain) > 600:
-                            plain = plain[:600].rstrip() + "…"
-                        try:
-                            sent_fmt = datetime.fromisoformat(sent_at.rstrip("Z")).strftime("%B %d, %Y")
-                        except Exception:
-                            sent_fmt = sent_at
-
-                        context_html = (
-                            f"<br/><br/><hr style='border:none;border-top:1px solid #ccc;margin:16px 0'/>"
-                            f"<p style='color:#555;font-size:0.85em;margin:0 0 8px 0'>"
-                            f"<strong>--- Original Message ---</strong><br/>"
-                            f"<strong>Subject:</strong> {subject}<br/>"
-                            f"<strong>Sent:</strong> {sent_fmt}<br/>"
-                            f"<strong>To:</strong> {info.get('originalAddress', addr)}</p>"
-                            f"<p style='color:#333;font-size:0.9em;white-space:pre-wrap;margin:0'>{plain}</p>"
-                        )
-                        full_html = draft_body.replace("\n", "<br/>") + context_html
-
-                        parts = [
-                            ("To",          (None, info.get("originalAddress", addr), "text/plain")),
-                            ("Subject",     (None, f"Quick Follow-Up – {subject}", "text/plain")),
-                            ("BodyHtml",    (None, full_html, "text/plain")),
-                            ("FromEmail",   (None, "reminders@hfmg.net", "text/plain")),
-                            ("Attachments", ("", b"", "application/octet-stream")),
-                        ]
-                        async with _httpx.AsyncClient(timeout=30) as hc:
-                            r = await hc.post(f"{ORG}/api/Values/mail/SentAsRemainder", files=parts)
-
-                        if r.status_code == 200:
-                            info["reminder1_sent"]    = True
-                            info["reminder1_sentAt"]  = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-                            info["reminder1_pending"] = False
-                            log.info(f"[tracking] Immediate Day-1 reminder sent after restore → {addr} | '{subject}'")
-                        else:
-                            log.error(f"[tracking] Restore reminder failed for {addr}: {r.status_code} {r.text}")
-
-                    # ── Safe merge-save: reload fresh then patch ONLY the reminder
-                    # flags we just set.  A full recipients overwrite here would clobber
-                    # any reply-status or reminder-flag changes the background scheduler
-                    # wrote between our first load and now (race condition fix).
-                    _REMINDER_FLAGS = (
-                        "reminder1_sent", "reminder1_sentAt", "reminder1_pending",
-                        "reminder2_sent", "reminder2_sentAt", "reminder2_pending",
-                    )
-                    tracking_fresh = load_tracking(user_email)
-                    for t in tracking_fresh.get("tracked", []):
-                        if t["messageId"] == message_id:
-                            for _addr, _our in tracked["recipients"].items():
-                                if _addr in t["recipients"]:
-                                    _tgt = t["recipients"][_addr]
-                                    for _flag in _REMINDER_FLAGS:
-                                        # Only write the flag if we set it AND the fresh
-                                        # record doesn't already have it (scheduler may
-                                        # have beaten us to it — don't clobber).
-                                        if _our.get(_flag) and not _tgt.get(_flag):
-                                            _tgt[_flag] = _our[_flag]
-                            break
-                    save_tracking(tracking_fresh, user_email)
-
-        except Exception as re:
-            log.error(f"[tracking/restore] Immediate reminder error: {re}")
-            # Don't fail the restore — email is tracked even if reminder fails
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        log.error(f"[tracking/restore] CRASH: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
-
-
-
-@app.post("/api/tracking/add-manual")
-async def add_manual_tracking(payload: dict = Body(...)):
-    """
-    Manually add a sent email to active tracking from the Sent Items tab.
-    Bypasses the AI / Needs Review gate — user has explicitly chosen to track this.
-
-    Body: {
-      user_email, messageId, conversationId, subject, sentAt,
-      to, cc, body, notRepliedAddresses
-    }
-
-    On success:
-      • Adds the email to tracking["tracked"] with manuallyAdded=true
-      • Immediately fires Day-1 reminder if already >= 1 business day old
-    """
-    user_email = payload.get("user_email", "").strip()
-    message_id = payload.get("messageId", "").strip()
-
-    if not user_email or not message_id:
-        raise HTTPException(status_code=400, detail="Missing user_email or messageId")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking not enabled for this account.")
-
-    try:
-        from services import (
-            load_tracking, save_tracking, TRACKING_EXCLUDED,
-            get_business_days_since, _send_reminder,
-        )
-        import httpx as _httpx
-        ORG = ORG_BASE
-
-        tracking      = load_tracking(user_email)
-        tracked_by_id = {t["messageId"]: t for t in tracking.get("tracked", [])}
-
-        if message_id in tracked_by_id:
-            return {"ok": False, "detail": "Already being tracked"}
-
-        sent_at   = payload.get("sentAt", "")
-        subject   = payload.get("subject", "(no subject)")
-        body      = payload.get("body", "")
-        to_list   = payload.get("to") or []
-        cc_list   = payload.get("cc") or []
-
-        # ── EWS-computed reply status (from .NET GetSentMailsOfSevenDays) ──
-        # notRepliedAddresses: explicit list of who has NOT replied yet.
-        # repliedByAddresses:  explicit list of who HAS replied.
-        # has_ews_data: True when the client sent notRepliedAddresses (even if []),
-        #   meaning the .NET endpoint ran its In-Reply-To matching. Without this
-        #   flag, an empty list would be indistinguishable from "field not provided".
-        # OLD BUG: `replied = bool(not_rep) and (a not in not_rep)` → if not_rep
-        #   was [] (everyone replied), bool([]) = False → replied = False for all.
-        #   This caused reminders to fire even when every recipient had replied.
-        has_ews_data   = payload.get("notRepliedAddresses") is not None
-        not_rep_set    = {a.lower() for a in (payload.get("notRepliedAddresses") or [])}
-        replied_set    = {a.lower() for a in (payload.get("repliedByAddresses")  or [])}
-
-        # Build recipients from To + CC, excluding system addresses
-        all_addresses = list(dict.fromkeys(to_list + cc_list))
-        recipients = {}
-        for addr in all_addresses:
-            a = addr.lower()
-            if a in TRACKING_EXCLUDED:
-                continue
-
-            if has_ews_data:
-                # Trust EWS: anyone in not_rep_set hasn't replied → track them.
-                # Anyone NOT in not_rep_set (i.e. in replied_set or simply absent)
-                # has already replied → mark replied=True so no reminder is sent.
-                has_replied = a not in not_rep_set
-            else:
-                # No EWS data provided → assume everyone still needs follow-up.
-                has_replied = False
-
-            recipients[a] = {
-                "originalAddress": addr,
-                "type":            "internal" if "hfmg.net" in a else "external",
-                "replied":         has_replied,
-                "reminder1_sent":  False,
-                "reminder1_sentAt": None,
-                "reminder2_sent":  False,
-                "reminder2_sentAt": None,
-                "dismissed":       False,
-                "dismissedAt":     None,
-                "manuallyAdded":   True,
-            }
-
-        if not recipients:
-            raise HTTPException(status_code=400, detail="No trackable recipients found (all are excluded or empty)")
-
-        # If EWS tells us everyone has already replied, nothing to track.
-        pending_recipients = {a: r for a, r in recipients.items() if not r["replied"]}
-        if has_ews_data and not pending_recipients:
-            log.info(f"[tracking/add-manual] All recipients replied for '{subject}' — skipping")
-            return {
-                "ok": False,
-                "detail": "All recipients have already replied — nothing to track.",
-            }
-
-        log.info(
-            f"[tracking/add-manual] '{subject}' → "
-            f"{len(pending_recipients)} pending / {len(recipients) - len(pending_recipients)} replied "
-            f"for {user_email}"
-        )
-
-        new_record = {
-            "messageId":      message_id,
-            "conversationId": payload.get("conversationId", ""),
-            "subject":        subject,
-            "sentAt":         sent_at,
-            "body":           body[:5000],
-            "recipients":     recipients,
-            "resolved":       False,
-            "resolvedAt":     None,
-            "ai_reason":      "Manually added from Sent Items",
-            "manuallyAdded":  True,
-        }
-        tracked_by_id[message_id] = new_record
-        tracking["tracked"]     = list(tracked_by_id.values())
-        tracking["lastUpdated"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-        save_tracking(tracking, user_email)
-
-        log.info(f"[tracking/add-manual] '{subject}' → {len(pending_recipients)} pending / {len(recipients) - len(pending_recipients)} replied for {user_email}")
-
-        # Immediately fire reminders if already overdue
-        bdays        = get_business_days_since(sent_at)
-        sender_first = user_email.split("@")[0].split(".")[0].title()
-        reminders_sent = []
-
-        if bdays >= 1:
-            async with _httpx.AsyncClient(timeout=30) as hc:
-                for addr, info in recipients.items():
-                    if info.get("replied") or info.get("dismissed"):
-                        continue
-                    if info.get("type") == "external":
-                        continue
-
-                    # Day-1
-                    if not info.get("reminder1_sent"):
-                        ok = await _send_reminder(
-                            hc, addr, info, 1,
-                            subject, sent_at, body, sender_first, ORG
-                        )
-                        if ok:
-                            reminders_sent.append(f"{addr} (Day-1)")
-                            log.info(f"[tracking/add-manual] Immediate Day-1 → {addr}")
-
-                    # Day-3 (separate if)
-                    if bdays >= 3 and info.get("reminder1_sent") and not info.get("reminder2_sent"):
-                        ok = await _send_reminder(
-                            hc, addr, info, 3,
-                            subject, sent_at, body, sender_first, ORG
-                        )
-                        if ok:
-                            reminders_sent.append(f"{addr} (Day-3)")
-                            log.info(f"[tracking/add-manual] Immediate Day-3 → {addr}")
-
-            if reminders_sent:
-                # ── Safe merge-save: reload fresh then patch ONLY the reminder
-                # flags we just set.  A full recipients overwrite here would clobber
-                # any reply-status or reminder-flag changes the background scheduler
-                # wrote between save #1 (above) and now (race condition fix).
-                _REMINDER_FLAGS = (
-                    "reminder1_sent", "reminder1_sentAt", "reminder1_pending",
-                    "reminder2_sent", "reminder2_sentAt", "reminder2_pending",
-                )
-                tracking_fresh = load_tracking(user_email)
-                for t in tracking_fresh.get("tracked", []):
-                    if t["messageId"] == message_id:
-                        for _addr, _our in new_record["recipients"].items():
-                            if _addr in t["recipients"]:
-                                _tgt = t["recipients"][_addr]
-                                for _flag in _REMINDER_FLAGS:
-                                    # Only write the flag if we set it AND the fresh
-                                    # record doesn't already have it (scheduler may
-                                    # have beaten us to it — don't clobber).
-                                    if _our.get(_flag) and not _tgt.get(_flag):
-                                        _tgt[_flag] = _our[_flag]
-                        break
-                save_tracking(tracking_fresh, user_email)
-
-        return {
-            "ok": True,
-            "subject":        subject,
-            "recipients":     len(recipients),
-            "pending_count":  len(pending_recipients),   # how many still need follow-up
-            "replied_count":  len(recipients) - len(pending_recipients),
-            "reminders_sent": reminders_sent,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        log.error(f"[tracking/add-manual] CRASH: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
-
-@app.post("/api/analyze-sent-thread")
-async def analyze_sent_thread(payload: dict = Body(...)):
-    """
-    AI analysis of a sent email thread from the Sent Items tab.
-    Works for both single emails and full threads.
-
-    Flow:
-      1. Call .NET onemail (conversationId-based search, inbox + sent).
-      2. If list comes back empty (edge case), fallback to direct primary-email fetch.
-      3. Normalize PascalCase .NET fields → camelCase before AI analysis.
-
-    Body: { user_email, messageId, subject, notRepliedAddresses? }
-    Returns: { needs_reply, verdict, pending, analysis, confidence }
-    """
-    user_email  = payload.get("user_email", "").strip()
-    message_id  = payload.get("messageId", "").strip()
-    subject     = payload.get("subject", "")
-    not_replied = payload.get("notRepliedAddresses") or []
-
-    if not user_email or not message_id:
-        raise HTTPException(status_code=400, detail="Missing user_email or messageId")
-
-    # Same fetch the tracking scheduler uses, so this button and the background
-    # pass are always looking at the same conversation, ordered the same way.
-    thread_messages = await fetch_thread_messages(user_email, message_id, timeout=60)
-
-    # ── Fallback: empty list means EWS conversationId search returned nothing ─
-    # Re-fetch via email-details (which also hits onemail but already has its
-    # own normalisation + primary-email fallback logic).
-    if not thread_messages:
-        log.warning(
-            f"[analyze-sent-thread] onemail returned empty list for "
-            f"messageId={message_id[:20]}… — falling back to email-details"
-        )
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                fb = await client.get(
-                    "http://localhost:8000/api/email-details",
-                    params={"messageId": message_id, "userEmail": user_email}
-                )
-            if fb.status_code == 200:
-                fb_data = fb.json()
-                # email-details always returns a normalized dict with optional messages[]
-                if isinstance(fb_data.get("messages"), list) and fb_data["messages"]:
-                    thread_messages = [norm_thread_message(m) for m in fb_data["messages"]]
-                else:
-                    thread_messages = [norm_thread_message(fb_data)]
-        except Exception as fb_err:
-            log.error(f"[analyze-sent-thread] fallback fetch failed: {fb_err}")
-
-    log.info(
-        f"[analyze-sent-thread] {len(thread_messages)} message(s) for "
-        f"'{subject[:40]}' — user={user_email}"
-    )
-
-    result = await analyze_sent_thread_reply(
-        thread_messages=thread_messages,
-        user_email=user_email,
-        subject=subject,
-        not_replied_addresses=not_replied,
-    )
-    return result
-
-
 # ── Corrections — shared human-feedback store ─────────────────────────────────
 # Stores user flags when an email is wrongly classified.
 # Deduplication rules:
@@ -3502,38 +2675,6 @@ async def list_corrections():
     """Return all stored corrections (admin visibility)."""
     return _load_corrections()
 
-
-@app.post("/api/tracking/sync")
-async def sync_tracking(payload: dict = Body(...)):
-    """
-    Manually trigger the tracking scheduler for a user.
-    Body: { user_email }
-    Used by the frontend Tracking tab refresh button.
-    """
-    user_email = payload.get("user_email")
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
-    _active_tracking_users.add(user_email)
-    begin_tracking_progress(user_email)
-    asyncio.create_task(run_tracking_scheduler(user_email))
-    return {"success": True, "message": "Tracking sync started"}
-
-
-@app.get("/api/tracking/sync-status")
-async def tracking_sync_status(user_email: str):
-    """
-    Where the current scan has got to, for the Tracking page's progress panel.
-
-    Cheap and poll-friendly: an in-memory read, no disk and no mail server. The
-    page polls this roughly once a second while a sync is running.
-    """
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing user_email")
-    if not is_tracking_allowed(user_email):
-        raise HTTPException(status_code=403, detail="Tracking feature is not enabled for this account.")
-    return get_tracking_progress(user_email)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
