@@ -8,6 +8,7 @@ import hashlib
 import html
 import base64
 import threading
+import contextlib
 from collections import defaultdict, Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -210,7 +211,7 @@ client = AsyncOpenAI(api_key=api_key)
 # --- CONFIGURATION: ORG MAIL SERVER ------------------------------------------
 # One source of truth for the .NET mail server, overridable via env (main.py
 # reads the same ORG_BASE variable) so both modules talk to the same server.
-ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177").rstrip("/")
+ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.98:4200").rstrip("/")
 
 # --- CONFIGURATION: VIP + PRIORITY SENDERS ---
 VIP_FILE      = "vip_list.json"
@@ -658,20 +659,56 @@ _cache_locks_mutex = threading.Lock()
 
 def _get_lock(user_email: str) -> threading.Lock:
     """Return (creating if needed) a per-user write lock."""
+    user_email = (user_email or "").lower().strip()   # same file as _cache_file_for
     with _cache_locks_mutex:
         if user_email not in _cache_locks:
             _cache_locks[user_email] = threading.Lock()
         return _cache_locks[user_email]
 
+@contextlib.contextmanager
+def _process_file_lock(path: str):
+    """
+    Cross-process exclusive lock (the API and the Celery worker both write the
+    same cache file; a threading.Lock only covers one process). Held on a
+    sidecar "<path>.lock" file so the cache file itself can be replaced.
+    """
+    lock_path = f"{path}.lock"
+    with open(lock_path, "a+b") as lf:
+        if os.name == "nt":
+            import msvcrt
+            lf.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)   # retries ~10s, then raises
+                    break
+                except OSError:
+                    continue
+            try:
+                yield
+            finally:
+                lf.seek(0)
+                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+
 def save_cache(new_data: dict, user_email: str = "default"):
     path = _cache_file_for(user_email)
-    with _get_lock(user_email):           # ← serialises writes per user
+    with _get_lock(user_email), _process_file_lock(path):   # threads + processes
         current = load_cache(user_email)
         current.update(new_data)
         # Always stamp the current version so stale caches are detected on next load
         current[CACHE_VERSION_KEY] = CACHE_VERSION
-        with open(path, "w") as f:
+        # Write to a temp file then swap it in, so a reader never sees a
+        # half-written file (which load_cache would treat as an empty cache).
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
             json.dump(current, f, indent=2)
+        os.replace(tmp, path)
 
 TIMESTAMP_KEY     = "meta_last_processed_timestamp"
 REPORT_KEY        = "meta_last_full_report"
@@ -920,6 +957,59 @@ def get_last_known_inbox(user_email: str, limit: int = None) -> list:
 
     primaries.sort(key=_sort_key, reverse=True)
     return primaries[:limit] if limit else primaries
+
+# ── Inbox snapshot — the inbox exactly as the last full live fetch saw it ──
+# The id-cache keeps every email ever analyzed (moved/deleted ones too), so
+# on its own it can't say what is in the inbox *now*. The snapshot records
+# the ordered ids + read state of the last full live fetch; serving from it
+# shows the real inbox without calling the mail server.
+INBOX_SNAPSHOT_KEY = "meta_inbox_snapshot"
+
+def save_inbox_snapshot(emails: list, user_email: str):
+    items = []
+    for e in emails:
+        eid = e.get("id") or e.get("messageId")
+        if eid:
+            items.append({"id": eid, "isRead": bool(e.get("isRead"))})
+    save_cache({INBOX_SNAPSHOT_KEY: {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }}, user_email)
+
+def get_inbox_from_snapshot(user_email: str, limit: int, max_age_seconds: int):
+    """
+    (emails, as_of) rebuilt from the snapshot and the analysis cache, or
+    None when there's no fresh snapshot or its emails aren't all classified
+    yet — the caller then fetches live instead.
+    """
+    cache = load_cache(user_email)
+    snap = cache.get(INBOX_SNAPSHOT_KEY) or {}
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(snap["at"])).total_seconds()
+    except Exception:
+        return None
+    if age > max_age_seconds or not snap.get("items"):
+        return None
+
+    by_id = cache.get(EMAIL_ID_CACHE_KEY, {})
+    out, seen = [], set()
+    for item in snap["items"]:
+        entry = by_id.get(item["id"])
+        if entry and entry.get("_threadRef"):
+            entry = by_id.get(entry["_threadRef"])
+        if not entry or entry.get("_threadRef"):
+            return None   # not classified yet — serve live rather than a partial inbox
+        pid = entry.get("id") or entry.get("messageId")
+        if pid in seen:
+            continue      # several messages of one thread → one card
+        seen.add(pid)
+        e = entry.copy()
+        # Read in Outlook (snapshot) or here (mark-read updates the id-cache).
+        e["isRead"] = bool(item.get("isRead")) or bool(entry.get("isRead"))
+        out.append(e)
+        if len(out) >= limit:
+            break
+    return out, snap["at"]
 
 # Phrases/domains that mean "this is a meeting/call invite" — the server-side
 # mirror of BODY_SIGNALS in frontend-new/src/meetingInvite.js, which is where
@@ -2247,6 +2337,7 @@ _thread_notes_locks: dict = {}
 _thread_notes_locks_mutex = threading.Lock()
 
 def _get_thread_notes_lock(user_email: str) -> threading.Lock:
+    user_email = (user_email or "").lower().strip()   # file names are lowercased too
     with _thread_notes_locks_mutex:
         if user_email not in _thread_notes_locks:
             _thread_notes_locks[user_email] = threading.Lock()

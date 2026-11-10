@@ -442,6 +442,7 @@ function InboxView({
   senderFilter,
   setSenderFilter,
   inboxReady,
+  countsReady = true,
   isAnalyzingBackground,
   markAsRead,
   markAsReplied,
@@ -452,7 +453,6 @@ function InboxView({
   handleFileDownload,
   isFileDownloading,
   getFileProgress,
-  totalEmailCount,
   // Flag / correction props
   flagOpen,
   setFlagOpen,
@@ -923,22 +923,12 @@ function InboxView({
           }
         };
 
-        const msgCount = (e) =>
-          e.threadCount ||
-          e.thread_count ||
-          (Array.isArray(e.messages) && e.messages.length > 0 ? e.messages.length : 0) ||
-          1;
-
-        // Counts for folder buttons. These folders count conversations/cards;
-        // other folders keep the existing total-message count.
+        // Every badge counts cards — one per conversation, like Outlook's
+        // conversation view — so a badge always matches the cards the folder
+        // shows. (It used to add up the messages inside each thread, and ALL
+        // EMAILS showed a mail-volume stat, so the numbers didn't line up.)
         const folderPool = getFolderPool(activeFolder);
-        const folderMsgCount = (folder) => {
-          const pool = getFolderPool(folder);
-          if (folder === 'ALL_EMAILS') return totalEmailCount ?? pool.length;
-          return ['THREADS', 'RINKU', 'SALLY'].includes(folder)
-            ? pool.length
-            : pool.reduce((s, e) => s + msgCount(e), 0);
-        };
+        const folderMsgCount = (folder) => getFolderPool(folder).length;
 
         // Category counts reflect within the CURRENT active folder pool
         const catCount = (cat) => {
@@ -974,7 +964,7 @@ function InboxView({
                     className={`tab-btn ${isActive ? 'active' : ''}`}
                     onClick={() => { setSelectedEmail(null); setActiveFolder(name); setActiveCategory('ALL'); setSelectedCards(new Set()); }}>
                     {emoji} {label}
-                    <span className={`count-badge ${isActive ? 'active' : ''}`}>{folderMsgCount(name)}</span>
+                    {countsReady && <span className={`count-badge ${isActive ? 'active' : ''}`}>{folderMsgCount(name)}</span>}
                     {hasMembers && (
                       <Users
                         size={12}
@@ -1007,7 +997,7 @@ function InboxView({
                   <button key={tab.name} className={`tab-btn ${activeCategory === tab.name ? 'active' : ''} ${tab.name.toLowerCase()}`}
                     onClick={() => { setSelectedEmail(null); setActiveCategory(tab.name); setSelectedCards(new Set()); }}>
                     {tab.emoji} {tab.name}
-                    <span className={`count-badge badge-${tab.name.toLowerCase()}`}>{catCount(tab.name)}</span>
+                    {countsReady && <span className={`count-badge badge-${tab.name.toLowerCase()}`}>{catCount(tab.name)}</span>}
                     {hasMembers && (
                       <Users
                         size={12}

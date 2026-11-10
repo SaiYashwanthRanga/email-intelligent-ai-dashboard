@@ -22,6 +22,8 @@ from urllib.parse import unquote
 from models import AnalysisRequest, ReplyRequest, ThreadParseRequest, LoginRequest, IrisChatRequest, ActivityPingRequest
 from iris_service import get_iris_reply, preview_tag_matches
 from tracker.api.routes import router as tracker_router
+from tracker.config import settings as tracker_settings
+from tracker.services.mailboxes import get_app_users
 
 import logging
 
@@ -117,6 +119,8 @@ from services import (
     get_cached_emails_by_id,
     save_emails_to_id_cache,
     get_last_known_inbox,
+    save_inbox_snapshot,
+    get_inbox_from_snapshot,
     get_last_fetch_ok_at,
     set_last_fetch_ok_at,
     get_cached_detail,
@@ -185,7 +189,7 @@ _analysis_jobs: dict = {}
 # Overridable via env (same pattern as ALLOWED_ORIGINS) so the mail-server
 # outage path can be exercised — point it at a dead port and every call
 # fails the way a firewall block does — without editing this file.
-ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.188:177")
+ORG_BASE = os.getenv("ORG_BASE", "http://172.22.6.98:4200")
 
 # ─── LOGIN → MAILBOX OVERRIDES ───
 # MAILBOX_OVERRIDES in .env: comma-separated "who=mailbox" pairs. `who` is the
@@ -242,6 +246,82 @@ app.add_middleware(
     # undefined and treats every stale-cache fallback as a fresh live sync.
     expose_headers=["X-Data-Source", "X-Cache-As-Of"],
 )
+
+
+# 3. CASE-INSENSITIVE USER EMAILS
+# The org server can hand back "Ranga.SaiYashwanth@hfmg.net" while Celery and
+# the access lists use "ranga.saiyashwanth@hfmg.net". Files were already keyed
+# in lowercase, but in-memory state (analysis jobs, prefetch/outbox guards,
+# per-user locks) and list checks weren't — so the same person could look
+# like two. Lowercasing the identity fields once, here, covers every endpoint.
+class LowercaseUserEmailMiddleware:
+    KEYS = {"email", "user_email", "userEmail", "mailbox", "targetUserEmail", "requester_email"}
+    SKIP_PATHS = {"/api/login"}        # login passes the typed username through untouched
+    MAX_JSON_BYTES = 1024 * 1024       # bigger bodies (/api/analyze) normalize in the endpoint
+
+    def __init__(self, app):
+        self.app = app
+
+    @classmethod
+    def _lower(cls, obj: dict) -> bool:
+        changed = False
+        for k in cls.KEYS & obj.keys():
+            v = obj[k]
+            if isinstance(v, str) and v != v.strip().lower():
+                obj[k] = v.strip().lower()
+                changed = True
+        return changed
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] in self.SKIP_PATHS:
+            return await self.app(scope, receive, send)
+
+        from urllib.parse import parse_qsl, urlencode
+        qs = scope.get("query_string", b"").decode("latin-1")
+        if qs:
+            pairs = parse_qsl(qs, keep_blank_values=True)
+            if any(k in self.KEYS and v != v.strip().lower() for k, v in pairs):
+                pairs = [(k, v.strip().lower() if k in self.KEYS else v) for k, v in pairs]
+                scope = dict(scope, query_string=urlencode(pairs).encode("latin-1"))
+
+        headers = dict(scope.get("headers") or [])
+        is_json = b"application/json" in headers.get(b"content-type", b"")
+        try:
+            length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            length = 0
+        if not (is_json and 0 < length <= self.MAX_JSON_BYTES):
+            return await self.app(scope, receive, send)
+
+        body, more = b"", True
+        while more:
+            message = await receive()
+            if message["type"] != "http.request":
+                return await self.app(scope, receive, send)   # client went away
+            body += message.get("body", b"")
+            more = message.get("more_body", False)
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict) and self._lower(data):
+                body = json.dumps(data).encode("utf-8")
+                scope = dict(scope, headers=[
+                    (k, str(len(body)).encode() if k == b"content-length" else v)
+                    for k, v in scope["headers"]
+                ])
+        except ValueError:
+            pass   # not valid JSON — let the endpoint report it
+
+        sent = False
+        async def replay():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+        return await self.app(scope, replay, send)
+
+
+app.add_middleware(LowercaseUserEmailMiddleware)
 
 # --- HELPER FUNCTIONS ---
 
@@ -644,7 +724,7 @@ async def get_email_details(messageId: str, userEmail: str):
 
 
 @app.get("/api/fetch-inbox")
-def fetch_inbox(email: str, count: int = 500):
+def fetch_inbox(email: str, count: int = 500, live: bool = False):
     # Build the org server inbox URL from the email address.
     # Route template: GET /api/Values/inbox/{mail}/count{num}
     # "count" and the number share the same path segment — no slash between them.
@@ -675,6 +755,21 @@ def fetch_inbox(email: str, count: int = 500):
             return resp_obj
         log.error(f"fetch_inbox: {reason} — no cache to fall back to for {clean_email}")
         raise HTTPException(status_code=hard_status, detail=hard_detail)
+
+    # App users' inboxes are kept fresh by the Celery inbox sync
+    # (tracker/tasks/inbox_sync.py), so answer from that snapshot instantly
+    # instead of waiting on the mail server. live=true is the sync itself.
+    if not live and tracker_settings.inbox_sync_enabled and clean_email.lower() in get_app_users():
+        # Fresh = within two sync intervals, so one slow run doesn't drop to live.
+        synced = get_inbox_from_snapshot(
+            clean_email, limit=count, max_age_seconds=2 * tracker_settings.inbox_sync_interval_seconds
+        )
+        if synced:
+            emails_out, as_of = synced
+            resp_obj = JSONResponse(content=emails_out)
+            resp_obj.headers["X-Data-Source"] = "synced"
+            resp_obj.headers["X-Cache-As-Of"] = as_of
+            return resp_obj
 
     # Skip the 120s wait entirely when the server has just failed — the
     # fallback below is what we'd end up serving anyway.
@@ -769,6 +864,10 @@ def fetch_inbox(email: str, count: int = 500):
         # queued during the outage.
         schedule_outbox_flush(clean_email)
         set_last_fetch_ok_at(datetime.now(timezone.utc).isoformat(), clean_email)
+        # Only a full fetch describes the whole inbox; a small first batch
+        # must not replace the snapshot with its 50 emails.
+        if count >= tracker_settings.inbox_sync_count:
+            save_inbox_snapshot(data, clean_email)
 
         # Pull bodies in the background so opening an email is a local read
         # rather than a round trip, and so the whole inbox — not just what's
@@ -798,6 +897,9 @@ def fetch_inbox(email: str, count: int = 500):
 @app.post("/api/analyze")
 async def analyze_emails(payload: AnalysisRequest):
     user_email = payload.user_email if hasattr(payload, "user_email") and payload.user_email else "default"
+    # Lowercased here rather than in LowercaseUserEmailMiddleware: a 500-email
+    # body is over that middleware's size limit.
+    user_email = user_email.strip().lower()
     emails = [normalize_email(e) for e in payload.emails]
 
     if not emails:

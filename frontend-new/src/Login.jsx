@@ -38,7 +38,10 @@ const Login = () => {
       const user = await response.json();
 
       // Server returns: { account, name, mail, role }
-      const resolvedEmail = user.mail;
+      // Lowercase: the server may return "Ranga.SaiYashwanth@…", and every
+      // per-user key on the backend (caches, jobs, tracker) must match.
+      const resolvedEmail = (user.mail || "").trim().toLowerCase();
+      if (user.mail) user.mail = resolvedEmail;
       const resolvedName  = user.name || resolvedEmail.split("@")[0];
 
       if (!resolvedEmail) {

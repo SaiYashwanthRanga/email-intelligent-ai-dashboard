@@ -8,6 +8,8 @@ import InboxView from './InboxView.jsx';
 import { getDeviceId, getDeviceLabel } from './deviceIdentity';
 
 const API_BASE = import.meta.env.VITE_API_URL;
+const INITIAL_BATCH = 50;    // shown immediately
+const FULL_BATCH = 500;      // loaded in the background afterwards
 
 // --- ✅ HELPER: Extract email from "Name <email@domain.com>" format ---
 const extractEmail = (value) => {
@@ -32,6 +34,9 @@ function Dashboard() {
   const [lastSyncTime, setLastSyncTime] = useState(null);
   const [isIdle, setIsIdle] = useState(false);
   const [inboxReady, setInboxReady] = useState(false);
+  // Folder/category tab counts are only meaningful once the full inbox has
+  // been loaded and classified, so they stay hidden until then.
+  const [countsReady, setCountsReady] = useState(false);
   const [isSoftSyncing, setIsSoftSyncing] = useState(false);
 
   // ✅ FIXED: Only use the real Exchange delivery timestamp for card display.
@@ -667,8 +672,12 @@ function Dashboard() {
   // DashboardView manages this internally now
 
   // --- STEP 4: UPDATED FETCH FUNCTION TO RESTORE SELECTION ---
-  const fetchAndAnalyze = async (arg) => {
+  // opts.live: skip the backend's synced cache and fetch straight from the
+  // mail server (the Refresh button). Initial load and auto-refresh use the
+  // cache the Celery inbox sync keeps fresh.
+  const fetchAndAnalyze = async (arg, opts = {}) => {
     const silent = arg === true;
+    const live = opts.live === true;
     const currentSelectedId = selectedEmailId; // Capture current ID
 
     console.log(
@@ -690,13 +699,51 @@ function Dashboard() {
       // ✅ FIXED: Send email as param; backend builds the full API URL
       const userEmail = localStorage.getItem("userEmail");
 
+      // Tell the user when the mail server is down and we're showing cached mail.
+      const noteIfCached = (r) => {
+        if (r.headers?.["x-data-source"] !== "cache") return;
+        const asOf = r.headers?.["x-cache-as-of"];
+        const when = asOf ? ` (as of ${new Date(asOf).toLocaleString()})` : "";
+        addToast(`Mail server unreachable — showing cached emails${when}`, "error");
+      };
+
+      // Manual/initial load, in two steps:
+      //   1. fetch only the newest INITIAL_BATCH, show them, and classify them;
+      //   2. once that's finished, fetch the full FULL_BATCH and classify the rest.
+      // One step at a time: the backend runs one classification job per user,
+      // so overlapping the two would mix their results. Tab counts stay hidden
+      // until step 2 has finished.
+      let firstBatchShown = false;
+      if (!silent) {
+        setCountsReady(false);
+        const first = await axios.get(`${API_BASE}/fetch-inbox`, {
+          params: { email: userEmail, count: INITIAL_BATCH, live }
+        });
+        if (Array.isArray(first.data)) {
+          setEmails(first.data);
+          setInboxReady(true);
+          firstBatchShown = true;
+          noteIfCached(first);
+          await runAnalysis(first.data, true, { final: false });
+        }
+      }
+
       const res = await axios.get(`${API_BASE}/fetch-inbox`, {
-        params: { email: userEmail }
+        params: { email: userEmail, count: FULL_BATCH, live }
+      }).catch(err => {
+        // Full load failed after the first batch painted — keep what we have.
+        if (firstBatchShown) {
+          addToast(`Showing the first ${INITIAL_BATCH} emails; full load failed: ${err.message}`, "error");
+          return null;
+        }
+        throw err;
       });
-      
+      if (!res) return;
+
       if (Array.isArray(res.data)) {
         if (!silent) {
           addToast(`Fetched ${res.data.length} emails. Analyzing...`, "success");
+          if (!firstBatchShown) noteIfCached(res);   // already told the user once
         }
 
         // 🟢 SILENT AUTO-SYNC → DO NOT overwrite UI yet
@@ -705,8 +752,12 @@ function Dashboard() {
         } 
         // 🔵 MANUAL REFRESH → normal behavior
         else {
-          setEmails(res.data);
-          setInboxReady(true);
+          // Don't swap the classified first 50 back to raw emails — the
+          // analyze response below brings them (cached) plus the rest.
+          if (!firstBatchShown) {
+            setEmails(res.data);
+            setInboxReady(true);
+          }
           await runAnalysis(res.data, false);
         }
 
@@ -739,7 +790,9 @@ function Dashboard() {
           }
         }
 
-        const now = new Date().toISOString();
+        // Served from the background (Celery) sync or the outage cache: show
+        // when that data was actually fetched, not when we read it.
+        const now = res.headers?.["x-cache-as-of"] || new Date().toISOString();
         localStorage.setItem("lastSyncTime", now);
         setLastSyncTime(now);
       } else { 
@@ -792,7 +845,8 @@ function Dashboard() {
   };
 
   // ── Poll /api/analysis-updates until done ──
-  const startPolling = (userEmail) => {
+  // onFinish(status) is called once polling stops: "done", "none", "error".
+  const startPolling = (userEmail, onFinish = () => {}) => {
     stopPolling();
     setIsAnalyzingBackground(true);
 
@@ -847,6 +901,7 @@ function Dashboard() {
         if (status === "done") {
           stopPolling();
           setIsAnalyzingBackground(false);
+          onFinish("done");
           if (updatedReport) {
             setReport(updatedReport);
             const metaCache = {
@@ -859,18 +914,30 @@ function Dashboard() {
         } else if (status === "error" || status === "none") {
           stopPolling();
           setIsAnalyzingBackground(false);
+          onFinish(status);
         }
       } catch (err) {
         console.error("Poll error:", err);
         stopPolling();
         setIsAnalyzingBackground(false);
+        onFinish("error");
       }
     }, 2000);  // poll every 2s for snappier updates
   };
 
-  const runAnalysis = async (emailsToAnalyze, silent = false) => {
+  // Resolves once classification has fully finished (after polling, if the
+  // backend had new emails to classify) with "done" | "none" | "error".
+  // opts.final: this pass covers the whole inbox, so its result may reveal
+  // the tab counts. The first-50 pass is not final.
+  const runAnalysis = async (emailsToAnalyze, silent = false, { final = true } = {}) => {
     const payload = emailsToAnalyze || emails;
-    if (!payload || payload.length === 0) { setLoading(false); return; }
+    if (!payload || payload.length === 0) {
+      setLoading(false);
+      if (final) setCountsReady(true);
+      return "done";
+    }
+    const userEmail = localStorage.getItem("userEmail") || "default";
+    let analyzing = false;
 
     const rawHasAttachments = {};
     (payload || []).forEach(e => {
@@ -879,7 +946,6 @@ function Dashboard() {
     });
 
     try {
-      const userEmail = localStorage.getItem("userEmail") || "default";
       const res = await axios.post(`${API_BASE}/analyze`, { emails: payload, user_email: userEmail });
 
       if (res.data.emails && Array.isArray(res.data.emails)) {
@@ -895,18 +961,22 @@ function Dashboard() {
         if (res.data.report) setReport(res.data.report);
       }
 
-      if (res.data.analyzing) {
-        const userEmail = localStorage.getItem("userEmail") || "default";
-        startPolling(userEmail);
-      }
+      analyzing = !!res.data.analyzing;
       if (!silent) addToast("Inbox loaded!", "success");
-
     } catch (err) {
       console.error(err);
       addToast("Analysis Failed. Check console.", "error");
-    } finally {
       setLoading(false);
+      return "error";
     }
+    setLoading(false);
+
+    // New emails are classified in the backend's background; wait for it.
+    const status = analyzing
+      ? await new Promise(resolve => startPolling(userEmail, resolve))
+      : "done";   // everything was already classified
+    if (final && (status === "done" || status === "none")) setCountsReady(true);
+    return status;
   };
 
   // --- THREAD PARSING (SIMPLIFIED) ---
@@ -1277,6 +1347,7 @@ function Dashboard() {
       // --- NEW PROPS PASSED DOWN ---
       lastSyncTime={lastSyncTime}
       inboxReady={inboxReady}
+      countsReady={countsReady}
       isSoftSyncing={isSoftSyncing}
       autoSyncEnabled={autoSyncEnabled}
       setAutoSyncEnabled={setAutoSyncEnabled}
@@ -1338,7 +1409,7 @@ function Dashboard() {
       groupedEmails={sortedEmails}
       
       // Functions / Handlers
-      fetchAndAnalyze={fetchAndAnalyze}
+      fetchAndAnalyze={() => fetchAndAnalyze(false, { live: true })}
       handleLogout={handleLogout}
       handleCopy={handleCopy}
       generateAiReply={generateAiReply}

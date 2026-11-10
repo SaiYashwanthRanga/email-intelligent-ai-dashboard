@@ -18,10 +18,10 @@ if not exist "venv\Scripts\python.exe" (
 )
 
 REM PostgreSQL holds the tracker data AND the Celery queue, so nothing works without it.
-sc query postgresql-x64-18 | find "RUNNING" >nul
+sc query postgresql-x64-16 | find "RUNNING" >nul
 if errorlevel 1 (
-    echo [ERROR] PostgreSQL service "postgresql-x64-18" is not running.
-    echo         Start it from an admin prompt:  net start postgresql-x64-18
+    echo [ERROR] PostgreSQL service "postgresql-x64-16" is not running.
+    echo         Start it from an admin prompt:  net start postgresql-x64-16
     goto :fail
 )
 
@@ -50,7 +50,7 @@ if errorlevel 1 (
 
 if not exist "logs" mkdir "logs"
 
-start "Email API (uvicorn :8000)" cmd /k "venv\Scripts\python.exe -m uvicorn main:app --reload --port 8000"
+start "Email API (uvicorn :8000)" cmd /k "venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000"
 start "Tracker Celery worker" cmd /k "venv\Scripts\celery.exe -A tracker.worker.celery_app worker --pool=solo --loglevel=info"
 start "Tracker Celery beat" cmd /k "venv\Scripts\celery.exe -A tracker.worker.celery_app beat --loglevel=info --schedule logs\celerybeat-schedule"
 

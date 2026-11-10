@@ -169,6 +169,14 @@ const Iris = ({
     }
   }, [messages, thinking]);
 
+  // Other parts of the page (e.g. the Insights "Ask Iris anything" row) open
+  // the popup with window.dispatchEvent(new CustomEvent("iris:open")).
+  useEffect(() => {
+    const open = () => setIsOpen(true);
+    window.addEventListener("iris:open", open);
+    return () => window.removeEventListener("iris:open", open);
+  }, []);
+
   // Focus the input when the popup opens
   useEffect(() => {
     if (isOpen) setTimeout(() => textareaRef.current?.focus(), 50);

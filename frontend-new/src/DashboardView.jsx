@@ -2,11 +2,11 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
-  Paperclip, BarChart3, X, PieChart, Mail, ArrowLeft, Calendar,
-  FileText, Download, Hash, Copy, Check, Sun, Moon, ArrowRight, Zap, Loader, LogOut,
+  Paperclip, X, PieChart, Mail, ArrowLeft, Calendar,
+  FileText, Download, Hash, Copy, Check, Sun, Moon, Zap, Loader, LogOut,
   Users, Settings, MailCheck
 } from 'lucide-react';
-import TriageSummary from './TriageSummary';
+import InsightsOverview from './InsightsOverview';
 import ToastContainer from './Toast';
 import ComposeMailModal from "./ComposeMailModal";
 import EmailAutocomplete from "./EmailAutocomplete";
@@ -17,84 +17,6 @@ import InboxView, {
   replyToMail, markReadBackend, extractEmail,
   CATEGORY_META, HtmlEmailRenderer, FlagDropdown
 } from './InboxView';
-
-// ─── SKELETON SHIMMER ─────────────────────────────────────────────────────
-const skeletonStyle = {
-  background: "linear-gradient(90deg, rgba(255,255,255,0.04) 25%, rgba(255,255,255,0.09) 50%, rgba(255,255,255,0.04) 75%)",
-  backgroundSize: "400px 100%",
-  animation: "analyzingShimmer 1.6s ease-in-out infinite",
-};
-
-// ─── TOP SENDERS PANEL ────────────────────────────────────────────────────
-function InsightsInstantPanel({ emails, onViewSender }) {
-  const senderMap = {};
-  emails.forEach(e => {
-    const from = e.from || e.sender || "";
-    const nameMatch  = from.match(/^([^<]+)</);
-    const emailMatch = from.match(/[\w.+-]+@[\w.-]+/);
-    const label = nameMatch ? nameMatch[1].trim() : (emailMatch ? emailMatch[0] : from);
-    const key   = emailMatch ? emailMatch[0].toLowerCase() : from.toLowerCase();
-    if (!key) return;
-    if (!senderMap[key]) senderMap[key] = { label, count: 0, unread: 0, key };
-    senderMap[key].count++;
-    if (!e.isRead) senderMap[key].unread++;
-  });
-  const topSenders = Object.values(senderMap).sort((a, b) => b.count - a.count).slice(0, 6);
-  if (!topSenders.length) return null;
-  return (
-    <div className="insta-glass-card" style={{ padding: "18px", marginBottom: "16px", animation: "fadeSlideUp 0.4s ease 0.1s both" }}>
-      <div style={{ fontSize: "0.72rem", fontWeight: "700", letterSpacing: "1px", color: "var(--text-secondary)", textTransform: "uppercase", marginBottom: "14px" }}>👥 Top Senders by Volume</div>
-      <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-        {topSenders.map((s, i) => (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <div style={{ width: "28px", height: "28px", borderRadius: "50%", background: `hsl(${(i * 47 + 210) % 360}, 60%, 45%)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.7rem", fontWeight: "800", color: "white", flexShrink: 0 }}>{s.label.charAt(0).toUpperCase()}</div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
-                <span style={{ fontSize: "0.8rem", fontWeight: "600", color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "55%" }}>{s.label}</span>
-                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
-                  <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>{s.count} mail{s.count !== 1 ? "s" : ""}</span>
-                  <button onClick={() => onViewSender && onViewSender(s.key, s.label)} style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", border: "none", borderRadius: "5px", padding: "2px 9px", fontSize: "0.68rem", fontWeight: "700", cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 2px 8px rgba(0,217,255,0.35)" }}>View</button>
-                </div>
-              </div>
-              <div style={{ height: "4px", background: "var(--border-color)", borderRadius: "4px", overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${(s.count / topSenders[0].count) * 100}%`, background: `hsl(${(i * 47 + 210) % 360}, 60%, 45%)`, borderRadius: "4px", transition: "width 0.8s ease" }} />
-              </div>
-            </div>
-            {s.unread > 0 && (<span style={{ background: "#f59e0b", color: "#000", fontSize: "0.6rem", fontWeight: "800", borderRadius: "999px", padding: "1px 6px", flexShrink: 0 }}>{s.unread} new</span>)}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── SKELETON CARD ────────────────────────────────────────────────────────
-function SkeletonCard({ lines = 2, style = {} }) {
-  return (
-    <div style={{ background: "var(--bg-card)", border: "1px solid var(--border-color)", borderRadius: "12px", padding: "16px", display: "flex", flexDirection: "column", gap: "10px", ...style }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-        <div style={{ width: "28px", height: "28px", borderRadius: "50%", ...skeletonStyle }} />
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: "6px" }}>
-          <div style={{ height: "12px", width: "60%", borderRadius: "6px", ...skeletonStyle }} />
-          <div style={{ height: "9px", width: "35%", borderRadius: "6px", ...skeletonStyle }} />
-        </div>
-      </div>
-      {Array.from({ length: lines }).map((_, i) => (
-        <div key={i} style={{ height: "9px", width: i === lines - 1 ? "70%" : "100%", borderRadius: "6px", ...skeletonStyle }} />
-      ))}
-    </div>
-  );
-}
-
-// ─── AI LOADING LABEL ─────────────────────────────────────────────────────
-function AiLoadingLabel({ text = "AI is generating..." }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 14px", marginBottom: "12px", background: "rgba(0,217,255,0.05)", border: "1px solid rgba(0,217,255,0.15)", borderRadius: "8px", fontSize: "0.78rem", color: "#00d9ff" }}>
-      <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: "#00d9ff", boxShadow: "0 0 6px #00d9ff", animation: "pulse 1.4s ease-in-out infinite", flexShrink: 0 }} />
-      {text}
-    </div>
-  );
-}
 
 // ─── THREAD MESSAGES RENDERER ─────────────────────────────────────────────
 function ThreadMessages({ parsedThread, inlineQuoteExpanded, setInlineQuoteExpanded }) {
@@ -250,7 +172,6 @@ const DashboardView = ({
   const [insightsDetailCollapsed, setInsightsDetailCollapsed] = useState(false);
   const [threadsDetailCollapsed,  setThreadsDetailCollapsed]  = useState(false);
   const [showInsightsCompose,   setShowInsightsCompose]   = useState(false);
-  const [digestExpanded,        setDigestExpanded]        = useState(false);
   const [threadExpanded,        setThreadExpanded]        = useState(false);
   const [inlineQuoteExpanded,   setInlineQuoteExpanded]   = useState({});
 
@@ -583,202 +504,27 @@ const DashboardView = ({
           <>
             {/* ─── INSIGHTS VIEW ─── */}
             {mainView === 'INSIGHTS' && (
-              <div className="dashboard-grid">
-                <div className="col-left">
-                  <TriageSummary stats={triageStats} realThreads={realThreads} emails={emails} report={report}
-                    onAttachmentClick={() => { const allFiles = getAllAttachments(); setFileModalData({ title: `All Attachments (${allFiles.length})`, files: allFiles }); }}
-                    onEmailsClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('ALL'); }}
-                    onThreadsClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('THREADS'); setActiveCategory('ALL'); }}
-                    onInvitesClick={() => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder('ALL_EMAILS'); setActiveCategory('ZOOM'); }} />
-
-                  {emails.length > 0 && (<div style={{ marginBottom: "4px" }}><InsightsInstantPanel emails={emails} onViewSender={handleViewSender} /></div>)}
-
-                  {/* DAILY DIGEST */}
-                  <div className="section-title"><FileText size={20} /> 📋 Daily Digest</div>
-                  {(() => {
-                    // autoDigest = complete EWS data (no gaps, all 7 days, read + unread)
-                    // report.daily_digest = partial cache fallback (used until autoDigest loads)
-                    const digestData = autoDigest?.digest?.length > 0
-                      ? autoDigest.digest
-                      : report?.daily_digest;
-
-                    if (digestLoading && !digestData) {
-                      return (
-                        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                          <AiLoadingLabel text="Loading your 7-day digest..." />
-                          {[3, 2, 2].map((lines, i) => <SkeletonCard key={i} lines={lines} />)}
-                        </div>
-                      );
-                    }
-                    if (!digestData || digestData.length === 0) {
-                      return <div className="empty-placeholder">No digest available yet.</div>;
-                    }
-                    return (
-                      <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                        {autoDigest && (
-                          <div style={{ fontSize: "0.7rem", color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: "6px", marginBottom: "2px", opacity: 0.7 }}>
-                            <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#22c55e", display: "inline-block", flexShrink: 0 }} />
-                            Complete inbox · {autoDigest.email_count} emails · read &amp; unread included
-                          </div>
-                        )}
-                        {(digestExpanded ? digestData : digestData.slice(0, 2)).map((item, i) => {
-                          const dateLabel = (() => {
-                            try {
-                              const d = new Date(item.date + "T12:00:00");
-                              const today = new Date();
-                              const yesterday = new Date(today);
-                              yesterday.setDate(yesterday.getDate() - 1);
-                              if (d.toDateString() === today.toDateString()) return "Today";
-                              if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
-                              return d.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
-                            } catch { return item.date; }
-                          })();
-                          return (
-                            <div key={i} className="insta-glass-card" style={{ borderLeft: `4px solid ${i === 0 ? "#00d9ff" : "#3b82f6"}`, padding: "18px 20px", animation: `fadeSlideUp 0.35s ease ${i * 0.08}s both` }}>
-                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px" }}>
-                                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                                  <span style={{ fontSize: "1rem", fontWeight: "800", color: i === 0 ? "#00d9ff" : "#3b82f6", letterSpacing: "0.3px" }}>{dateLabel}</span>
-                                  {i === 0 && (<span style={{ background: "rgba(0,217,255,0.15)", border: "1px solid rgba(0,217,255,0.3)", color: "#00d9ff", fontSize: "0.62rem", fontWeight: "800", padding: "2px 8px", borderRadius: "999px", letterSpacing: "0.5px" }}>LATEST</span>)}
-                                </div>
-                                <span style={{ fontSize: "0.75rem", fontWeight: "600", color: "var(--text-secondary)", background: "rgba(255,255,255,0.05)", border: "1px solid var(--border-color)", borderRadius: "20px", padding: "3px 10px" }}>{item.email_count} email{item.email_count !== 1 ? "s" : ""}</span>
-                              </div>
-                              {item.paragraph
-                                ? <p style={{ margin: 0, fontSize: "0.92rem", lineHeight: "1.75", color: "var(--text-secondary)" }}>{item.paragraph}</p>
-                                : <p style={{ margin: 0, fontSize: "0.88rem", color: "var(--text-muted)", fontStyle: "italic" }}>Summary not available for this day.</p>
-                              }
-                            </div>
-                          );
-                        })}
-                        {digestData.length > 2 && (
-                          <button onClick={() => setDigestExpanded(x => !x)}
-                            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "10px 20px", background: "rgba(255,255,255,0.03)", border: "1px solid var(--border-color)", borderRadius: "10px", cursor: "pointer", fontSize: "0.82rem", fontWeight: "700", color: "var(--text-secondary)", transition: "all 0.2s ease", width: "100%" }}
-                            onMouseEnter={e => { e.currentTarget.style.borderColor = "#3b82f6"; e.currentTarget.style.color = "#3b82f6"; }}
-                            onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border-color)"; e.currentTarget.style.color = "var(--text-secondary)"; }}>
-                            {digestExpanded
-                              ? <><span>▲</span> Show less</>
-                              : <><span>▼</span> Show {digestData.length - 2} more day{digestData.length - 2 > 1 ? "s" : ""}</>
-                            }
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })()}
-
-                  {/* AI THREAD SUMMARIES */}
-                  <div className="section-title"><Hash size={20} /> 🧵 AI Thread Summaries</div>
-                  {!report ? (
-                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                      <AiLoadingLabel text="AI is analysing your threads, summaries coming shortly..." />
-                      {[2, 3, 2, 2].map((lines, i) => <SkeletonCard key={i} lines={lines} />)}
-                    </div>
-                  ) : (
-                    <div className="thread-summary-large">
-                      <div className="ts-hero">
-                        <h1>Executive Summary</h1>
-                        {report.all_thread_files && report.all_thread_files.length > 0 && (
-                          <button className="btn-glass mt-2" onClick={() => openFiles("All Project Files", report.all_thread_files)}>
-                            <Paperclip size={16} /> View All {report.all_thread_files.length} Files
-                          </button>
-                        )}
-                      </div>
-                      <div className="ts-content">
-                        {(report.briefing_cards || []).length > 0 ? (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
-                            {(() => {
-                              const seenSubjects = new Set();
-                              return report.briefing_cards.filter(card => {
-                                const key = (card.subject || card.topic || card.id || "").trim().toLowerCase();
-                                if (!key || seenSubjects.has(key)) return false;
-                                seenSubjects.add(key);
-                                return true;
-                              });
-                            })().map((card) => {
-                              const searchPool  = groupedEmails || emails;
-                              const threadEmail =
-                                searchPool.find(e => String(e.id).trim() === String(card.id).trim() || String(e.messageId).trim() === String(card.id).trim()) ||
-                                (card.subject && searchPool.find(e => e.subject?.trim().toLowerCase() === card.subject.trim().toLowerCase()));
-                              const isRead         = threadEmail?.isRead ?? false;
-                              const displaySubject = card.subject || threadEmail?.subject || card.topic;
-                              const msgCount       = card.thread_count || threadEmail?.threadCount || threadEmail?.thread_count || threadEmail?.messages?.length || 0;
-                              return (
-                                <div key={card.id} className="briefing-card-row" onClick={() => { if (threadEmail) setSelectedEmail(threadEmail); }} style={{ cursor: "pointer", opacity: isRead ? 0.7 : 1 }} title="Click to view full conversation">
-                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: 0 }}>
-                                      {!isRead && (<span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#3b82f6', flexShrink: 0, display: 'inline-block' }} title="Unread" />)}
-                                      <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div className="briefing-topic" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displaySubject}</div>
-                                        {msgCount > 1 && (<span style={{ display: 'inline-block', marginTop: '4px', background: 'linear-gradient(135deg, #00d9ff, #8b5cf6)', color: 'white', fontSize: '0.62rem', fontWeight: '700', padding: '2px 8px', borderRadius: '999px', letterSpacing: '0.3px' }}>🧵 {msgCount} messages</span>)}
-                                      </div>
-                                    </div>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                                      {(() => { const cat = ((card.category || threadEmail?.category || 'NORMAL')).toUpperCase(); const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL; return <span className={`cat-tag ${cat.toLowerCase()}`}>{meta.emoji} {meta.label}</span>; })()}
-                                      {threadEmail && !isRead && (<button onClick={(e) => { e.stopPropagation(); markAsRead(threadEmail); }} title="Mark as read" style={{ background: '#0ea5e9', color: 'white', border: 'none', borderRadius: '5px', padding: '3px 9px', fontSize: '0.7rem', fontWeight: '700', cursor: 'pointer', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: '4px' }}>✉ Mark Read</button>)}
-                                      <ArrowRight size={16} color="var(--accent-blue)" />
-                                    </div>
-                                  </div>
-                                  <div className="briefing-status">{card.summary || threadEmail?.summary || card.status}</div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        ) : (<p className="no-summary-text">{report.thread_summary || "No executive summary available."}</p>)}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* SENDER INSIGHTS */}
-                <div className="col-right">
-                  <div className="section-title"><BarChart3 size={20} /> 👥 Sender Insights</div>
-                  {!report ? (
-                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                      <AiLoadingLabel text="Building sender intelligence..." />
-                      {[2, 2, 3, 2].map((lines, i) => <SkeletonCard key={i} lines={lines} />)}
-                    </div>
-                  ) : (
-                    <div className="sender-list-grid">
-                      {(report.sender_summaries || []).map((s, i) => {
-                        const { mails, attachments } = getSenderDetails(s.name);
-                        return (
-                          <div key={i} className="sender-card-large">
-                            <div className="sender-top">
-                              <div className="avatar-small">{s.name.charAt(0).toUpperCase()}</div>
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <strong>{s.name}</strong>
-                                <div style={{ fontSize: "0.75rem", color: "#94a3b8" }}>{mails.length} Emails • {attachments.length} Attachments</div>
-                              </div>
-                              <button onClick={() => handleViewSender(s.name, s.name)} style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", border: "none", borderRadius: "6px", padding: "4px 12px", fontSize: "0.72rem", fontWeight: "700", cursor: "pointer", flexShrink: 0, boxShadow: "0 2px 8px rgba(0,217,255,0.35)", whiteSpace: "nowrap" }}>View Emails</button>
-                            </div>
-                            <div className="sender-desc">{s.summary || "No summary available"}</div>
-                            {mails.length > 0 && (
-                              <div style={{ marginTop: "10px" }}>
-                                <strong style={{ fontSize: "0.9rem" }}>Emails Sent:</strong>
-                                <ul style={{ fontSize: "0.8rem", paddingLeft: "18px", marginTop: "5px" }}>{mails.map((m, idx) => <li key={idx}>{m.subject || "No Subject"}</li>)}</ul>
-                              </div>
-                            )}
-                            {attachments.length > 0 && (
-                              <div style={{ marginTop: "10px" }}>
-                                <strong style={{ fontSize: "0.9rem" }}>Attachments:</strong>
-                                <div className="ec-atts" style={{ marginTop: "5px" }}>
-                                  {attachments.map((a, idx) => (
-                                    <div key={idx} style={{ display: "flex", alignItems: "center", gap: "6px" }} className="att-file">
-                                      <span style={{ flex: 1 }}>{a.name || "File"}<span style={{ fontSize: "0.85em", color: "#6b7280", marginLeft: "6px" }}>{formatFileSize(a.size)}</span></span>
-                                      <button onClick={(e) => { e.stopPropagation(); handleFileDownload(a, a.messageId); }} disabled={isFileDownloading(a, a.messageId)}
-                                        style={{ backgroundColor: isFileDownloading(a, a.messageId) ? "#9ca3af" : "#0ea5e9", cursor: isFileDownloading(a, a.messageId) ? "not-allowed" : "pointer", color: "white", padding: "6px 12px", borderRadius: "6px", border: "none", display: "flex", alignItems: "center", gap: "6px" }}>
-                                        {isFileDownloading(a, a.messageId) ? <><Loader size={14} className="animate-spin" /> {getFileProgress(a, a.messageId)}%</> : <><Download size={16} /> Download</>}
-                                      </button>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
+              <>
+              <InsightsOverview
+                cards={groupedEmails || emails}
+                triageStats={triageStats}
+                username={username}
+                greetingInfo={greetingInfo}
+                digestData={autoDigest?.digest?.length > 0 ? autoDigest.digest : (report?.daily_digest || [])}
+                digestLoading={digestLoading}
+                lastSyncTime={lastSyncTime}
+                isSyncing={isSoftSyncing}
+                analysisReady={!isAnalyzingBackground}
+                onOpenEmail={(e) => setSelectedEmail(e)}
+                onViewSender={handleViewSender}
+                onOpenFolder={(folder, category) => { setSelectedEmail(null); setMainView('THREADS'); setActiveFolder(folder); setActiveCategory(category); }}
+                onOpenAttachments={() => { const allFiles = getAllAttachments(); setFileModalData({ title: `All Attachments (${allFiles.length})`, files: allFiles }); }}
+                briefingCards={report?.briefing_cards || []}
+                senderSummaries={report?.sender_summaries || []}
+                reportReady={!!report}
+                onAskIris={() => window.dispatchEvent(new CustomEvent('iris:open'))}
+              />
+              </>
             )}
 
             {/* ─── INBOX VIEW ─── */}

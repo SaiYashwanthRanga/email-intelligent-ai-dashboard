@@ -11,6 +11,11 @@ backend/activity_log.json
 backend/detail_cache/
 backend/logs/
 backend/celerybeat-schedule*
+backend/calendar_bullets_*.json
+backend/send_settings_*.json
+backend/signatures_*.json
+*.lock
+*.code-workspace
 
 # Node frontend
 frontend-new/node_modules/

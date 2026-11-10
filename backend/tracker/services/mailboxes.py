@@ -16,7 +16,15 @@ log = logging.getLogger("tracker.mailboxes")
 
 
 def get_tracked_mailboxes() -> list[str]:
-    path = settings.mailboxes_file
+    return _read_address_list(settings.mailboxes_file)
+
+
+def get_app_users() -> list[str]:
+    """The people who use the app (APP_USERS_FILE) — only their inboxes are synced."""
+    return _read_address_list(settings.app_users_file)
+
+
+def _read_address_list(path) -> list[str]:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)

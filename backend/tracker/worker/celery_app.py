@@ -13,34 +13,72 @@ schedule every job twice.
 """
 
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
 
 from celery import Celery
+from celery.signals import after_setup_logger, after_setup_task_logger
 
-from tracker.config import settings
+from tracker.config import BACKEND_DIR, settings
 
 log = logging.getLogger("tracker.worker")
+
+# ── Log files ─────────────────────────────────────────────────────────────
+# The worker and beat each keep a rotating log in backend/logs, alongside the
+# console output: logs/celery-worker.log and logs/celery-beat.log, 5 MB x 5
+# backups (same policy as the API's dashboard.log). Nothing to pass on the
+# command line — start-all.bat and a manual start both get it.
+_LOG_DIR = BACKEND_DIR / "logs"
+_ROLE = "beat" if "beat" in sys.argv else "worker"
+_file_handler = None
+
+
+def _celery_file_handler() -> RotatingFileHandler:
+    global _file_handler
+    if _file_handler is None:
+        _LOG_DIR.mkdir(exist_ok=True)
+        _file_handler = RotatingFileHandler(
+            _LOG_DIR / f"celery-{_ROLE}.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        _file_handler.setLevel(logging.INFO)
+        _file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+    return _file_handler
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _add_file_log(logger, *args, **kwargs):
+    if _celery_file_handler() not in logger.handlers:
+        logger.addHandler(_celery_file_handler())
 
 celery_app = Celery(
     "tracker",
     broker=settings.broker_url,
     backend=settings.result_backend,
-    include=["tracker.tasks.fetch_sent_emails", "tracker.tasks.reminders"],
+    include=["tracker.tasks.fetch_sent_emails", "tracker.tasks.reminders", "tracker.tasks.inbox_sync"],
 )
 
 
 def _beat_schedule() -> dict:
-    if not settings.enabled:
-        return {}
-    return {
-        "tracker-fetch-sent-emails": {
+    schedule = {}
+    if settings.enabled:
+        schedule["tracker-fetch-sent-emails"] = {
             "task": "tracker.fetch_sent_emails",
             "schedule": float(settings.fetch_interval_seconds),
             # If workers fall behind, drop a run that's older than one
             # interval rather than letting stale runs pile up — the next
             # run fetches the same mail anyway.
             "options": {"expires": float(settings.fetch_interval_seconds)},
-        },
-    }
+        }
+    if settings.inbox_sync_enabled:
+        schedule["inbox-sync"] = {
+            "task": "tracker.sync_inboxes",
+            "schedule": float(settings.inbox_sync_interval_seconds),
+            "options": {"expires": float(settings.inbox_sync_interval_seconds)},
+        }
+    return schedule
 
 
 celery_app.conf.update(

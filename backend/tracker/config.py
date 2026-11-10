@@ -52,9 +52,21 @@ changing a value.
                                                  or database is unreachable.
  TRACKER_TASK_RETRY_BACKOFF_SECONDS    30        First retry delay (doubles).
  TRACKER_HTTP_TIMEOUT_SECONDS          60        Mail server request timeout.
- ORG_BASE                              http://172.22.6.188:177
+ ORG_BASE                              http://172.22.6.98:4200
                                                  The .NET mail server (same
                                                  variable main.py reads).
+
+ INBOX SYNC (Celery keeps each app user's inbox cache warm)
+ APP_USERS_FILE                        backend/app_users.json
+                                                 JSON list of the people who use
+                                                 the app; only these are synced.
+ INBOX_SYNC_ENABLED                    true      false = beat doesn't sync inboxes.
+ INBOX_SYNC_INTERVAL_MINUTES           5         How often each inbox is synced.
+ INBOX_SYNC_COUNT                      500       Emails fetched per sync.
+ INBOX_SYNC_API_URL                    http://localhost:8000/api
+                                                 The email API the sync calls, so
+                                                 classification and caching run in
+                                                 the API exactly as for the UI.
 ──────────────────────────────────────────────────────────────────────────
 """
 
@@ -135,6 +147,16 @@ class TrackerSettings:
     task_retry_backoff_seconds: int
     http_timeout_seconds: int
     org_base: str
+    # Inbox sync
+    app_users_file: Path
+    inbox_sync_enabled: bool
+    inbox_sync_interval_minutes: int
+    inbox_sync_count: int
+    inbox_sync_api_url: str
+
+    @property
+    def inbox_sync_interval_seconds(self) -> int:
+        return self.inbox_sync_interval_minutes * 60
 
     @property
     def fetch_interval_seconds(self) -> int:
@@ -175,7 +197,13 @@ def load_settings() -> TrackerSettings:
         task_max_retries=_int_env("TRACKER_TASK_MAX_RETRIES", 2, minimum=0),
         task_retry_backoff_seconds=_int_env("TRACKER_TASK_RETRY_BACKOFF_SECONDS", 30, minimum=1),
         http_timeout_seconds=_int_env("TRACKER_HTTP_TIMEOUT_SECONDS", 60, minimum=1),
-        org_base=os.getenv("ORG_BASE", "http://172.22.6.188:177").rstrip("/"),
+        org_base=os.getenv("ORG_BASE", "http://172.22.6.98:4200").rstrip("/"),
+        # ── Inbox sync ──
+        app_users_file=Path(os.getenv("APP_USERS_FILE", str(BACKEND_DIR / "app_users.json"))),
+        inbox_sync_enabled=_bool_env("INBOX_SYNC_ENABLED", True),
+        inbox_sync_interval_minutes=_int_env("INBOX_SYNC_INTERVAL_MINUTES", 5, minimum=1),
+        inbox_sync_count=_int_env("INBOX_SYNC_COUNT", 500, minimum=1),
+        inbox_sync_api_url=os.getenv("INBOX_SYNC_API_URL", "http://localhost:8000/api").rstrip("/"),
     )
 
 
