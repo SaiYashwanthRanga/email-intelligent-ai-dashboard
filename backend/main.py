@@ -1986,8 +1986,9 @@ async def search_contacts(q: str = "", user_email: str = ""):
     Merges two sources so external correspondents (outside counsel, vendors,
     etc.) show up alongside internal staff — not just people in the org GAL:
 
-      1. DIRECTORY — the internal org server (ORG_BASE/get). Canonical
-         @hfmg.net staff, verified names.
+      1. DIRECTORY — the org server's Active Directory search
+         (ORG_BASE/api/Values/search?q=). Canonical @hfmg.net staff with
+         their real display names; matches name, email or account name.
       2. CACHE — this user's analyzed-email cache (meta_emails_by_id). Every
          from/to/cc/participants address this mailbox has actually
          corresponded with. This is the ONLY place external addresses like
@@ -2002,36 +2003,33 @@ async def search_contacts(q: str = "", user_email: str = ""):
 
     query_lower = q.lower()
 
-    # ─── SOURCE 1: Internal org directory ───
+    # ─── SOURCE 1: Internal org directory (Active Directory search) ───
+    # GET ORG_BASE/api/Values/search?q=… → {success, contacts:[{email,name,source}], totalCount, errors}
+    # Matches on mail, display name and account name, skips disabled accounts.
     directory_results = []
     try:
-        contacts_url = f"{ORG_BASE}/get"
-        log.debug(f"Searching contacts: {contacts_url}")
-
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(contacts_url)
+            response = await client.get(f"{ORG_BASE}/api/Values/search", params={"q": q.strip()})
 
         if response.status_code == 200:
-            all_contacts = response.json()
-            if isinstance(all_contacts, list):
-                for contact in all_contacts:
-                    mail_id = contact.get("mailId", "")
-
-                    # Skip system mailboxes
-                    if "SystemMailbox" in mail_id:
-                        continue
-
-                    if query_lower in mail_id.lower():
-                        name_part = mail_id.split("@")[0] if "@" in mail_id else mail_id
-                        display_name = name_part.replace(".", " ").title()
-
-                        directory_results.append({
-                            "email": mail_id,
-                            "name": display_name,
-                            "group": contact.get("groupName", "user"),
-                        })
+            data = response.json()
+            if isinstance(data, dict) and data.get("success") is False:
+                log.warning(f"Org directory search reported an error: {data.get('errors')}")
+            seen_directory = set()
+            for contact in (data.get("contacts") or []) if isinstance(data, dict) else []:
+                if not isinstance(contact, dict):
+                    continue
+                mail_id = (contact.get("email") or "").strip()
+                if not mail_id or "SystemMailbox" in mail_id or mail_id.lower() in seen_directory:
+                    continue
+                seen_directory.add(mail_id.lower())
+                directory_results.append({
+                    "email": mail_id,
+                    "name": (contact.get("name") or "").strip() or mail_id,
+                    "group": "user",
+                })
         else:
-            log.warning(f"Org directory returned {response.status_code} — falling back to cache-only results")
+            log.warning(f"Org directory search returned {response.status_code} — falling back to cache-only results")
     except (httpx.TimeoutException, httpx.ConnectError) as e:
         # Directory being unreachable shouldn't take down external contact
         # search too — degrade gracefully instead of failing the whole request.

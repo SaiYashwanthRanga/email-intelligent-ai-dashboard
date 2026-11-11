@@ -1,0 +1,117 @@
+/* Inbox list refresh — toolbar, date sections, sender avatars, quieter cards.
+   Everything is scoped to the inbox feed (.feed-container) and uses the
+   shared theme tokens, so no other screen changes. */
+
+/* ── Toolbar: counts + All / Unread ── */
+.ix-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 2px 2px 4px;
+}
+.ix-stat {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 6px 13px; border-radius: 999px;
+  font-size: 0.82rem; font-weight: 600; color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border-color);
+}
+.ix-stat strong { font-size: 0.95rem; font-weight: 800; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.ix-stat-alert { border-color: rgba(255, 69, 58, 0.45); }
+.ix-stat-alert strong { color: #ff6961; }
+body.light-mode .ix-stat { background: #ffffff; }
+body.light-mode .ix-stat-alert strong { color: #dc2626; }
+
+.ix-toggle {
+  display: inline-flex; margin-left: auto; padding: 3px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border-color);
+}
+.ix-toggle button {
+  padding: 6px 16px; border: 0; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 0.82rem; font-weight: 700;
+  background: none; color: var(--text-secondary);
+  transition: background 0.18s ease, color 0.18s ease;
+}
+.ix-toggle button:hover { color: var(--text-primary); }
+.ix-toggle button.is-on { background: rgba(10, 132, 255, 0.28); color: #fff; }
+body.light-mode .ix-toggle { background: #f1f5f9; }
+body.light-mode .ix-toggle button.is-on { background: #dbeafe; color: #1d4ed8; }
+
+/* ── Date sections ── */
+.ix-group {
+  display: flex; align-items: center; gap: 12px;
+  margin: 10px 2px 0;
+  font-size: 0.72rem; font-weight: 800; letter-spacing: 1.4px; text-transform: uppercase;
+  color: var(--text-secondary);
+}
+.ix-group::after { content: ''; flex: 1; height: 1px; background: var(--border-color); }
+
+/* ── Sender avatar ── */
+.ix-avatar {
+  align-self: flex-start; flex-shrink: 0;
+  width: 40px; height: 40px; margin: 14px 14px 0 0; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.82rem; font-weight: 800; letter-spacing: 0.3px; color: #fff;
+  background: hsl(var(--ix-hue, 210) 62% 46%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 0 3px rgba(255, 255, 255, 0.08);
+}
+body.light-mode .ix-avatar { box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.05); }
+
+/* ── Cards: calmer at rest, clearer when unread or open ── */
+.feed-container .email-card { transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease, background 0.2s ease; }
+.feed-container .email-card:hover { transform: translateY(-2px); }
+.feed-container .email-card.active {
+  transform: none;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.45), var(--vos-shadow);
+}
+.feed-container .ec-left-border { width: 4px; }
+.feed-container .ec-top h4 { font-size: 1.02rem; font-weight: 600; }
+.feed-container .unread-mail .ec-top h4 { font-weight: 800; }
+/* Unread marker: a dot before the subject. */
+.feed-container .unread-mail .ec-top h4::before {
+  content: ''; flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-blue);
+}
+.feed-container .email-card:not(.unread-mail) .ec-top h4 { color: var(--text-secondary); }
+.feed-container .ec-meta { margin: 4px 0 10px; }
+
+/* AI summary: labelled, softer panel */
+.feed-container .ec-body {
+  background: rgba(10, 132, 255, 0.06);
+  border: 1px solid rgba(10, 132, 255, 0.16);
+  border-radius: 12px; padding: 12px 14px; font-size: 0.92rem;
+}
+.feed-container .ec-body:not(.ec-analyzing-text):not(:empty)::before {
+  content: 'AI summary';
+  display: block; margin-bottom: 4px;
+  font-size: 0.66rem; font-weight: 800; letter-spacing: 1.2px; text-transform: uppercase;
+  color: var(--accent-blue);
+}
+.feed-container .ec-body:empty { display: none; }
+body.light-mode .feed-container .ec-body { background: #eff6ff !important; border-color: #bfdbfe !important; }
+
+/* ── Card actions: Ask Iris always visible; Flag / Add to Folder on hover ── */
+.ix-ask {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 0.72rem; font-weight: 700;
+  color: #64d2ff; background: rgba(10, 132, 255, 0.16); border: 1px solid rgba(10, 132, 255, 0.4);
+  transition: background 0.18s ease, transform 0.18s ease;
+}
+.ix-ask:hover { background: rgba(10, 132, 255, 0.28); transform: translateY(-1px); }
+body.light-mode .ix-ask { color: #1d4ed8; background: #dbeafe; border-color: #bfdbfe; }
+
+.ix-quiet { opacity: 0; transition: opacity 0.18s ease; }
+.email-card:hover .ix-quiet,
+.email-card:focus-within .ix-quiet,
+.email-card.active .ix-quiet,
+.ix-quiet.is-open { opacity: 1; }
+/* Touch screens have no hover — keep them visible there. */
+@media (hover: none) { .ix-quiet { opacity: 1; } }
+
+@media (max-width: 700px) {
+  .ix-avatar { width: 32px; height: 32px; font-size: 0.7rem; margin-right: 10px; }
+  .ix-toggle { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .feed-container .email-card, .ix-ask { transition: none; }
+  .feed-container .email-card:hover, .ix-ask:hover { transform: none; }
+}

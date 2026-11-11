@@ -2,8 +2,9 @@ import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
-  User, Paperclip, X, Clock, Download, Users, Loader, Flag, FolderPlus, UserMinus, Plus
+  User, Paperclip, X, Clock, Download, Users, Loader, Flag, FolderPlus, UserMinus, Plus, Sparkles
 } from 'lucide-react';
+import './InboxView.css';
 import EmailAutocomplete from './EmailAutocomplete';
 import ToastContainer from './Toast';
 
@@ -286,6 +287,30 @@ const DEFAULT_FORWARD_STATE = {
   sending: false, attachments: []
 };
 
+// ── Inbox list helpers ──
+// Section an email falls under in the list ("Today", "Yesterday", …).
+const dayGroupOf = (value) => {
+  const d = value instanceof Date ? value : new Date(value);
+  if (!d || Number.isNaN(d.getTime()) || d.getTime() <= 0) return 'Earlier';
+  const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+  const days = Math.floor((startOfToday - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
+  if (days <= 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days < 7) return 'Earlier this week';
+  return 'Older';
+};
+
+// A steady colour per sender, so the same person is recognisable at a glance.
+const AVATAR_HUES = [210, 265, 330, 25, 150, 185, 45, 290];
+const avatarOf = (sender) => {
+  const text = String(sender || '?').replace(/<.*$/, '').replace(/["']/g, '').trim() || '?';
+  let h = 0;
+  for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) >>> 0;
+  const words = text.split(/[\s.@_-]+/).filter(Boolean);
+  const initials = ((words[0]?.[0] || '?') + (words.length > 1 ? words[1][0] : '')).toUpperCase();
+  return { initials, hue: AVATAR_HUES[h % AVATAR_HUES.length] };
+};
+
 const formatFileSize = (bytes) => {
   if (!bytes) return "";
   const mb = bytes / (1024 * 1024);
@@ -466,6 +491,7 @@ function InboxView({
   const [inlineForwardState, setInlineForwardState] = useState({});
   const [selectedCards,      setSelectedCards]      = useState(new Set());
   const [searchQuery,        setSearchQuery]        = useState("");
+  const [unreadOnly,         setUnreadOnly]         = useState(false);
   // "View members" modal — shared by team folders (GLOBAL, IT, etc.) and
   // the VIP/LEGAL/PRIORITY category tabs.
   const [membersModal,       setMembersModal]       = useState(null); // { folderName?, title, emoji, members: [{name,email}] } | null
@@ -1059,13 +1085,19 @@ function InboxView({
           : folderPool.filter(e => e.category === activeCategory);
 
         // Step 4: apply search
-        const displayEmails = q
+        const searched = q
           ? categoryPool.filter(e =>
               (e.subject || "").toLowerCase().includes(q) ||
               (e.from || e.sender || "").toLowerCase().includes(q) ||
               (e.summary || "").toLowerCase().includes(q)
             )
           : categoryPool;
+
+        // Step 5: optional "unread only" view
+        const displayEmails = unreadOnly ? searched.filter(e => !e.isRead) : searched;
+        const unreadCount = searched.filter(e => !e.isRead).length;
+        const attentionCount = searched.filter(e => !e.isRead && ['URGENT', 'PRIORITY', 'VIP', 'LEGAL', 'CONFIDENTIAL'].includes((e.category || '').toUpperCase())).length;
+        let lastGroup = null;
 
         const folderLabel = {
           ALL_EMAILS: 'inbox', THREADS: 'threads', GLOBAL: 'Global team',
@@ -1075,12 +1107,24 @@ function InboxView({
 
         const emptyMsg = q
           ? `No emails match "${searchQuery}"`
+          : unreadOnly ? "You're all caught up — no unread emails here."
           : activeCategory !== 'ALL'
             ? `No ${activeCategory} emails in ${folderLabel}`
             : `No emails in ${folderLabel}`;
 
         return (
           <div className="email-feed">
+            {inboxReady && (
+              <div className="ix-toolbar">
+                <span className="ix-stat"><strong>{searched.length}</strong> conversation{searched.length !== 1 ? 's' : ''}</span>
+                <span className="ix-stat"><strong>{unreadCount}</strong> unread</span>
+                {attentionCount > 0 && <span className="ix-stat ix-stat-alert"><strong>{attentionCount}</strong> need attention</span>}
+                <span className="ix-toggle" role="group" aria-label="Show">
+                  <button type="button" className={!unreadOnly ? 'is-on' : ''} onClick={() => { setUnreadOnly(false); setSelectedCards(new Set()); }}>All</button>
+                  <button type="button" className={unreadOnly ? 'is-on' : ''} onClick={() => { setUnreadOnly(true); setSelectedCards(new Set()); }}>Unread</button>
+                </span>
+              </div>
+            )}
             {!inboxReady ? (
               <div className="loading-text">Syncing inbox...</div>
             ) : displayEmails.length === 0 ? (
@@ -1125,9 +1169,15 @@ function InboxView({
                   const replyState   = getEmailReplyState(emailId);
                   const forwardState = getEmailForwardState(emailId);
                   const isChecked    = selectedCards.has(emailId);
+                  const avatar       = avatarOf(getEmailSender(email));
+                  const group        = dayGroupOf(getEffectiveReceivedAt(email));
+                  const showGroup    = group !== lastGroup;
+                  lastGroup = group;
 
                   return (
-                    <div key={emailId}
+                    <React.Fragment key={emailId}>
+                    {showGroup && <div className="ix-group">{group}</div>}
+                    <div
                       className={`email-card ${!email.isRead ? "unread-mail" : ""} ${(selectedEmail?.id === email.id || selectedEmail?.messageId === email.messageId) ? "active" : ""} border-${(email.category || 'normal').toLowerCase()}`}
                       style={{ display: 'flex', alignItems: 'stretch', padding: 0, overflow: 'hidden', contain: 'content' }}
                       onClick={() => setSelectedEmail(email)}>
@@ -1139,6 +1189,8 @@ function InboxView({
                         <RoundCheckbox checked={isChecked} onClick={e => { e.stopPropagation(); toggleCardSelection(emailId); }} />
                       </div>
 
+                      <div className="ix-avatar" aria-hidden="true" style={{ '--ix-hue': avatar.hue }}>{avatar.initials}</div>
+
                       <div className="ec-content" style={{ flex: 1, minWidth: 0, padding: '14px 16px 14px 0' }}>
 
                         {/* TOP ROW */}
@@ -1147,7 +1199,15 @@ function InboxView({
                             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{email.subject || "No Subject"}</span>
                             {(() => { const tc = email.threadCount || email.thread_count || email.messages?.length || 0; return tc > 1 ? (<span style={{ background: "linear-gradient(135deg, #00d9ff, #8b5cf6)", color: "white", fontSize: "0.65rem", fontWeight: "700", padding: "2px 8px", borderRadius: "999px", whiteSpace: "nowrap", flexShrink: 0, letterSpacing: "0.3px" }}>🧵 {tc} messages</span>) : null; })()}
                           </h4>
-                          <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
+                          <div className="ix-actions" style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
+                            <button type="button" className="ix-ask" title="Open this email and have Iris summarise it and say what you need to do"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedEmail(email);
+                                window.dispatchEvent(new CustomEvent('iris:ask', { detail: { prompt: 'Summarise this email and tell me what, if anything, I need to do about it.', emailId } }));
+                              }}>
+                              <Sparkles size={12} /> Ask Iris
+                            </button>
                             <button onClick={(e) => { e.stopPropagation(); markAsRead(email); }} disabled={email.isRead}
                               style={{ background: email.isRead ? "#22c55e" : "#0ea5e9", color: "white", border: "none", borderRadius: "5px", padding: "3px 8px", fontSize: "0.7rem", cursor: email.isRead ? "not-allowed" : "pointer", fontWeight: "600", whiteSpace: "nowrap", opacity: email.isRead ? 0.6 : 1, flexShrink: 0 }}>
                               {email.isRead ? "✓ Read" : "Mark Read"}
@@ -1157,7 +1217,7 @@ function InboxView({
                               {(() => { const cat = (email.category || "PENDING").toUpperCase(); const meta = CATEGORY_META[cat] || CATEGORY_META.NORMAL; return <span className={`cat-tag ${cat.toLowerCase()}`} style={{ whiteSpace: "nowrap" }}>{meta.emoji} {meta.label}</span>; })()}
                             </div>
                             {/* Flag button */}
-                            <button
+                            <button className={`ix-quiet ${flagOpen === emailId ? 'is-open' : ''}`}
                               onClick={e => { e.stopPropagation(); setFlagOpen(flagOpen === emailId ? null : emailId); }}
                               title="Wrong classification? Flag it"
                               style={{ background: flagOpen === emailId ? 'rgba(239,68,68,0.12)' : 'transparent', border: `1px solid ${flagOpen === emailId ? 'rgba(239,68,68,0.3)' : 'transparent'}`, color: flagOpen === emailId ? '#f87171' : 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
@@ -1167,7 +1227,7 @@ function InboxView({
                               <Flag size={12} /> Flag
                             </button>
                             {/* Add-to-folder button */}
-                            <button
+                            <button className={`ix-quiet ${folderPickerFor === emailId ? 'is-open' : ''}`}
                               onClick={e => { e.stopPropagation(); setFolderPickerFor(folderPickerFor === emailId ? null : emailId); }}
                               title="Add sender to a folder"
                               style={{ background: folderPickerFor === emailId ? 'rgba(59,130,246,0.12)' : 'transparent', border: `1px solid ${folderPickerFor === emailId ? 'rgba(59,130,246,0.3)' : 'transparent'}`, color: folderPickerFor === emailId ? '#60a5fa' : 'var(--text-muted)', borderRadius: '6px', padding: '3px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, fontSize: '0.72rem', fontWeight: '600', transition: 'all 0.15s' }}
@@ -1379,6 +1439,7 @@ function InboxView({
 
                       </div>
                     </div>
+                    </React.Fragment>
                   );
                 })}
               </>
