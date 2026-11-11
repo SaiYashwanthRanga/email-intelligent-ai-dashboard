@@ -13,7 +13,13 @@ Iris can call these tools mid-conversation:
                                 pipeline has ever seen for this user
                                 (NOT the person's entire mailbox — see
                                 search_cached_emails() below for the exact
-                                scope/caveats)
+                                scope/caveats), fused with meaning-based
+                                search over full email text (iris_index.py).
+                                Paged, so nothing is silently cut off
+  - summarize_emails        -> works through a large set of emails in
+                                batches (map) and hands back per-batch
+                                digests for the final answer (reduce), with
+                                an honest count of how many were covered
   - list_emails             -> the same scope browsed by facet instead of
                                 keyword (category / sender / last N days),
                                 for questions with no word to search on
@@ -64,6 +70,7 @@ from services import (
     load_thread_notes,
     clean_for_ai,
 )
+import iris_index
 
 # Words carried by ordinary questions that would otherwise have to appear in
 # the email itself for a match — "the report from Deepa" should search for
@@ -85,7 +92,8 @@ Medical Group) AI Email Dashboard.
 TONE: Warm but professional — approachable, never stiff, but this is a
 healthcare organization's internal tool, so stay polished. Keep replies
 concise; default to a few sentences unless the person asks for something
-longer (like a drafted email).
+longer (a drafted email, or a briefing across many emails — those can run
+as long as they need to, organised so they scan easily).
 
 RESPONSE STRUCTURE: shape your formatting to match what's actually being
 asked — don't answer everything in the same loose paragraph.
@@ -132,10 +140,19 @@ before saying you can't help:
    send:") — never say or imply you sent or will send an email.
 
 2. search_emails — searches emails the dashboard has already analyzed
-   for this person. This is NOT their entire mailbox history — only
-   what's been processed so far. If a search comes back empty, say it
-   wasn't found in what's been analyzed rather than concluding it
-   doesn't exist anywhere.
+   for this person, by exact words AND by meaning over the full text, so
+   describe what you are looking for in natural words ("staff leaving",
+   "the lease renewal") — it finds emails on that topic even when they
+   use different wording. This is NOT their entire mailbox history —
+   only what's been processed so far. If a search comes back empty, say
+   it wasn't found in what's been analyzed rather than concluding it
+   doesn't exist.
+
+   PAGING — search_emails and list_emails return one page at a time and
+   tell you total_matching, has_more and next_offset. If the question
+   needs the rest ("all", "every", "how many are about…"), call again
+   with offset=next_offset. If you answer from only part of the matches,
+   say so plainly: "this covers the 30 most recent of 112".
 
 3. list_emails — browse by filter instead of by keyword: category
    (URGENT, PRIORITY, NEWSLETTER, ...), sender, or "last N days". Reach
@@ -190,6 +207,17 @@ If a tool returns an error or empty result, say so plainly. Never invent
 specific senders, subjects, dates, drafts, or statuses that
 didn't come from the snapshot, a tool result, or the conversation itself.
 
+8. summarize_emails — for questions that span MANY emails: "summarise
+   everything from legal this month", "go through all my unread mail",
+   "what are the main themes this week", "brief me on everything about
+   the audit". It reads up to 300 matching emails in batches (full text
+   where available) and returns condensed digests for you to turn into
+   the answer. Use it instead of paging through list_emails yourself
+   whenever more than about 30 emails are involved. Pass a clear `focus`
+   saying what to pull out. It reports total_matching and covered —
+   ALWAYS tell the person how many emails the briefing covers out of how
+   many matched, and say so if some could not be included.
+
 7. propose_action — puts a confirmation button in front of the person
    for something they asked you to DO rather than tell them: mark an
    email read, send a reply, forward, write a new email, RSVP to a
@@ -225,8 +253,9 @@ mail, moving folders, booking a new meeting), say plainly that you can't
 do that yet rather than proposing something adjacent.
 
 CURRENT CAPABILITIES (be honest if asked): you can chat, answer
-questions grounded in the snapshot, browse and search analysed email,
-read the full text of emails that have been cached, search what the
+questions grounded in the snapshot, browse and search analysed email by
+keyword and by meaning, work through hundreds of emails at once for a
+briefing, read the full text of emails, search what the
 person has sent, look at their upcoming calendar, draft replies, check
 and prepare actions (mark read, reply, forward, compose a new email,
 RSVP) for them to confirm. You can
@@ -392,9 +421,18 @@ def _to_openai_messages(history: list) -> list:
 
 # ─── PHASE 3: TOOL DEFINITIONS ──────────────────────────────────────────────
 
-MAX_SEARCH_RESULTS = 12  # keep tool results small — this is a chat reply, not a report
-MAX_TOOL_ROUNDS = 5      # hard cap on model<->tool round-trips per message, prevents runaway loops
+MAX_SEARCH_RESULTS = 30  # rows per page of search/list results; more are one offset away
+MAX_TOOL_ROUNDS = 10     # hard cap on model<->tool round-trips per message, prevents runaway loops
 MAX_HISTORY_MESSAGES = 12  # recent turns kept; older ones dropped to bound cost
+MAX_REPLY_TOKENS = 1500  # room for a real briefing; short questions still get short answers
+
+# summarize_emails (bulk map/reduce)
+BULK_MAX_EMAILS = 300     # most emails one bulk pass will read
+BULK_DEFAULT_EMAILS = 150
+BULK_BATCH_SIZE = 15      # emails condensed per model call
+BULK_CONCURRENCY = 4      # batches in flight at once
+BULK_TEXT_CHARS = 1800    # per email fed to a batch
+BULK_DIGEST_TOKENS = 700  # per-batch digest length
 
 TOOLS = [
     {
@@ -431,10 +469,13 @@ TOOLS = [
             "name": "search_emails",
             "description": (
                 "Search emails the dashboard has already analyzed for this "
-                "person, matching sender, subject, or summary text. NOT the "
-                "person's entire mailbox history — only what's been processed "
-                "so far. An empty result means 'not found in what's been "
-                "analyzed', not 'doesn't exist'."
+                "person — by exact words in sender/subject/summary AND by "
+                "meaning over the full email text, so a topic is found even "
+                "when the email words it differently. NOT the person's "
+                "entire mailbox history — only what's been processed so "
+                "far. An empty result means 'not found in what's been "
+                "analyzed', not 'doesn't exist'. Returns one page plus "
+                "total_matching / has_more / next_offset."
             ),
             "parameters": {
                 "type": "object",
@@ -442,9 +483,13 @@ TOOLS = [
                     "query": {
                         "type": "string",
                         "description": (
-                            "Keyword(s) — a sender name/email, subject topic, etc. "
-                            "Words are matched individually, so a natural phrase is fine."
+                            "What to look for — a sender name/email, a subject, "
+                            "or a topic described in natural words."
                         ),
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip this many results — pass next_offset from the previous page to get more.",
                     },
                 },
                 "required": ["query"],
@@ -484,16 +529,17 @@ TOOLS = [
                 "use this whenever there is no specific word to search for. "
                 "Handles 'what's urgent', 'anything from Deepa this week', "
                 "'what came in today', 'show me the newsletters'. Returns "
-                "newest first. Combine filters freely; omit them all for a "
-                "plain recent list."
+                "newest first, one page at a time, with total_matching / "
+                "has_more / next_offset. Combine filters freely; omit them "
+                "all for a plain recent list."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
                         "type": "string",
-                        "enum": ["VIP", "PRIORITY", "URGENT", "CONFIDENTIAL",
-                                 "MEETING", "ZOOM", "NEWSLETTER", "NORMAL"],
+                        "enum": ["VIP", "PRIORITY", "URGENT", "CONFIDENTIAL", "LEGAL",
+                                 "PROVIDERS", "MEETING", "ZOOM", "NEWSLETTER", "NORMAL"],
                         "description": "Restrict to one category.",
                     },
                     "sender": {
@@ -504,8 +550,66 @@ TOOLS = [
                         "type": "integer",
                         "description": "Only emails from the last N days (1 = today).",
                     },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip this many rows — pass next_offset from the previous page to get more.",
+                    },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_emails",
+            "description": (
+                "Work through a LARGE set of emails in one go and get back "
+                "condensed digests to answer from. Use for anything spanning "
+                "more than about 30 emails: 'summarise everything from X', "
+                "'go through all my mail this week', 'what are the themes', "
+                "'what needs a decision across my inbox'. Reads full text "
+                "where available. Select the set with the same filters as "
+                "list_emails and/or a topic query; omit them all for the "
+                "whole analysed inbox. Returns total_matching and covered — "
+                "always tell the person how many emails the answer covers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "description": (
+                            "What to pull out of the emails, in a sentence — e.g. "
+                            "'what needs a decision or reply from me, with deadlines', "
+                            "'main themes and anything unusual', 'every figure and date "
+                            "mentioned about the audit'."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional topic — restrict to emails about this (matched by words and meaning).",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["VIP", "PRIORITY", "URGENT", "CONFIDENTIAL", "LEGAL",
+                                 "PROVIDERS", "MEETING", "ZOOM", "NEWSLETTER", "NORMAL"],
+                        "description": "Optional — restrict to one category.",
+                    },
+                    "sender": {
+                        "type": "string",
+                        "description": "Optional — full or partial sender name/address.",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Optional — only emails from the last N days (1 = today).",
+                    },
+                    "max_emails": {
+                        "type": "integer",
+                        "description": "Most emails to read, newest first (default 150, up to 300).",
+                    },
+                },
+                "required": ["focus"],
             },
         },
     },
@@ -729,7 +833,8 @@ def read_cached_email(user_email: str, message_id: str) -> dict:
     return payload
 
 
-def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RESULTS) -> list:
+def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RESULTS,
+                         allow_partial: bool = True) -> list:
     """
     Searches services.get_cached_emails_by_id(user_email) — the
     accumulating, ID-keyed cache populated every time the analysis
@@ -817,11 +922,98 @@ def search_cached_emails(user_email: str, query: str, limit: int = MAX_SEARCH_RE
     # words in one subject line, and an empty answer reads as "Iris can't
     # find anything" when the email is sitting right there.
     full_matches = [t for t in scored if t[0] == len(words)]
-    pool = full_matches if full_matches else scored
+    # allow_partial=False is for the hybrid search, where meaning-based
+    # matching covers the "different wording" case far better than emails
+    # that merely share one common word with the question.
+    pool = full_matches if (full_matches or not allow_partial) else scored
 
     # Most words matched first, then relevance weighting, then most recent.
     pool.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
-    return [item for _, _, _, item in pool[:limit]]
+    return [item for _, _, _, item in (pool if limit is None else pool[:limit])]
+
+
+def _row_for_entry(user_email: str, entry: dict, notes: dict) -> dict:
+    """Same row shape search_cached_emails produces, for one cache entry."""
+    eid = entry.get("id") or entry.get("messageId")
+    thread_key = entry.get("conversationId") or eid
+    return {
+        "messageId": eid,
+        "from": entry.get("from") or entry.get("sender") or "Unknown Sender",
+        "subject": entry.get("subject") or "No Subject",
+        "category": entry.get("category") or "NORMAL",
+        "summary": entry.get("summary") or "",
+        "received_at": entry.get("received_at") or entry.get("received") or "",
+        "unread": entry.get("isRead") is False,
+        "has_full_text": has_cached_detail(user_email, eid) if eid else False,
+        "has_note": bool(thread_key and thread_key in notes),
+    }
+
+
+_RRF_K = 60   # reciprocal-rank-fusion constant; the usual default
+
+
+async def search_emails_hybrid(user_email: str, query: str) -> tuple:
+    """
+    Every email matching the query, best first, as (rows, mode).
+
+    Fuses two rankings: the keyword search above (exact words in subject,
+    sender, summary) and the meaning-based index over full text
+    (iris_index). An email found by both rises to the top; one found by
+    either still appears. If the embeddings service can't be reached this
+    degrades to the keyword ranking alone and `mode` says so.
+    """
+    semantic = await iris_index.semantic_search(user_email, query, _html_to_text)
+    # Exact-word matches only while meaning search is carrying the loose
+    # cases; if it found nothing (or is unreachable), fall back to the old
+    # partial-word matching rather than returning nothing.
+    keyword_rows = search_cached_emails(user_email, query, limit=None, allow_partial=False)
+    if not keyword_rows and not semantic:
+        keyword_rows = search_cached_emails(user_email, query, limit=None)
+
+    fused: dict = {}
+    rows_by_id = {}
+    for rank, row in enumerate(keyword_rows):
+        mid = row.get("messageId")
+        if not mid:
+            continue
+        rows_by_id[mid] = dict(row, matched_by="words")
+        fused[mid] = fused.get(mid, 0.0) + 1.0 / (_RRF_K + rank + 1)
+
+    if semantic:
+        cached = get_cached_emails_by_id(user_email) or {}
+        notes = load_thread_notes(user_email)
+        for rank, (mid, _score) in enumerate(semantic):
+            if mid in rows_by_id:
+                rows_by_id[mid]["matched_by"] = "words and meaning"
+            else:
+                entry = cached.get(mid)
+                if not isinstance(entry, dict) or entry.get("_threadRef"):
+                    continue
+                rows_by_id[mid] = dict(_row_for_entry(user_email, entry, notes), matched_by="meaning")
+            fused[mid] = fused.get(mid, 0.0) + 1.0 / (_RRF_K + rank + 1)
+
+    ordered = sorted(fused, key=lambda m: fused[m], reverse=True)
+    mode = "words and meaning" if semantic else "words only"
+    return [rows_by_id[m] for m in ordered], mode
+
+
+def _page(rows: list, offset, size: int = MAX_SEARCH_RESULTS) -> dict:
+    """One page of rows plus the paging facts the model needs to go on."""
+    try:
+        offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    total = len(rows)
+    page = rows[offset:offset + size]
+    has_more = offset + len(page) < total
+    return {
+        "rows": page,
+        "returned": len(page),
+        "total_matching": total,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": offset + len(page) if has_more else None,
+    }
 
 
 # ── SENT MAIL ───────────────────────────────────────────────────────────────
@@ -1000,6 +1192,7 @@ def list_cached_emails(
     sender: str = None,
     days: int = None,
     limit: int = MAX_SEARCH_RESULTS,
+    offset: int = 0,
 ) -> dict:
     """
     Browse the analysed cache by facet rather than by keyword.
@@ -1052,17 +1245,28 @@ def list_cached_emails(
         })
 
     rows.sort(key=lambda r: r["_sort"], reverse=True)
-    total = len(rows)
     for r in rows:
         r.pop("_sort", None)
 
+    if limit is None:        # the bulk tool wants every row, unpaged
+        return {"emails": rows, "returned": len(rows), "total_matching": len(rows),
+                "filters": {"category": cat, "sender": who, "days": days}}
+
+    page = _page(rows, offset, limit)
     return {
-        "emails": rows[:limit],
-        "returned": min(total, limit),
-        "total_matching": total,
+        "emails": page["rows"],
+        "returned": page["returned"],
+        "total_matching": page["total_matching"],
+        "offset": page["offset"],
+        "has_more": page["has_more"],
+        "next_offset": page["next_offset"],
         "filters": {"category": cat, "sender": who, "days": days},
         "note": (
-            "Scope is the emails analysed so far for this person, newest "
+            ("More rows exist — call again with offset=next_offset to see "
+             "them, or use summarize_emails to cover them all at once. If "
+             "you answer from this page alone, say how many of the total "
+             "it covers. " if page["has_more"] else "")
+            + "Scope is the emails analysed so far for this person, newest "
             "first — not their entire mailbox history. Rows with has_note "
             "carry a note the person previously wrote about that thread — "
             "read_email surfaces it; read those before answering about them."
@@ -1118,6 +1322,8 @@ async def get_calendar_window(user_email: str, days_ahead: int = 7) -> dict:
 TOOL_LABELS = {
     "search_emails":         "Searching your inbox",
     "list_emails":           "Looking through your mail",
+    "summarize_emails":      "Working through your emails in batches",
+    "search_sent":           "Checking what you've sent",
     "read_email":            "Reading the email",
     "get_calendar":          "Checking your calendar",
     "draft_reply":           "Drafting a reply",
@@ -1165,6 +1371,168 @@ def build_action_proposal(arguments: dict, user_email: str) -> dict:
     return proposal
 
 
+async def _read_email_live(user_email: str, message_id: str) -> bool:
+    """
+    Fetch one email's full text from the mail server into the detail cache.
+    Used when read_email is asked for an email that hasn't been prefetched
+    yet, so "not cached" stops being a reason Iris can't read something.
+    Imported lazily from main for the same reason as get_calendar_window.
+    """
+    try:
+        from main import _prefetch_one_detail   # local import: avoids a cycle at load
+        return bool(await asyncio.to_thread(_prefetch_one_detail, message_id, user_email))
+    except Exception as e:
+        log.warning(f"read_email live fetch failed: {e}")
+        return False
+
+
+def _bulk_item(user_email: str, row: dict) -> tuple:
+    """One email as fed to a batch — (item, read_in_full): full text when cached, else its summary."""
+    mid = row.get("messageId")
+    text, full = "", False
+    detail = get_cached_detail(user_email, mid) if mid else None
+    if detail and detail.get("body"):
+        text = _html_to_text(detail.get("body") or "")[:BULK_TEXT_CHARS]
+        full = bool(text)
+    if not text:
+        text = row.get("summary") or ""
+    item = {
+        "from": row.get("from"),
+        "subject": row.get("subject"),
+        "received": row.get("received_at"),
+        "category": row.get("category"),
+        "unread": row.get("unread"),
+        "text": text,
+    }
+    if row.get("already_replied"):
+        item["already_replied_by_the_person"] = True
+    return item, full
+
+
+_BULK_SYSTEM = (
+    "You are condensing one batch of a person's emails so an assistant can "
+    "brief them. You will get the batch as JSON and a FOCUS describing what "
+    "the person wants out of it.\n"
+    "Write a compact digest of THIS batch for that focus:\n"
+    "- One line per email that matters to the focus: sender — subject — the "
+    "point, including any concrete ask, deadline, date, figure or decision "
+    "needed. Keep names and numbers exact.\n"
+    "- Emails marked already_replied_by_the_person need nothing further from "
+    "them; say so if you mention them.\n"
+    "- Close with a single line counting what you left out as not relevant "
+    "to the focus (e.g. '6 routine notifications/newsletters omitted').\n"
+    "Use only what is in the batch. Never invent senders, dates or details."
+)
+
+
+async def summarize_emails_bulk(
+    user_email: str,
+    focus: str,
+    query: str = None,
+    category: str = None,
+    sender: str = None,
+    days: int = None,
+    max_emails: int = None,
+) -> dict:
+    """
+    Map/reduce over a large set of emails.
+
+    Map: the matching emails are split into batches and each batch is
+    condensed by its own model call (run a few at a time). Reduce: the
+    digests go back to the main Iris model, which writes the answer.
+
+    The result always states how many emails matched and how many were
+    actually covered, so the answer can be honest about its coverage —
+    the failure this replaces was a "summary of everything" silently built
+    from the first dozen rows.
+    """
+    try:
+        cap = int(max_emails or BULK_DEFAULT_EMAILS)
+    except (TypeError, ValueError):
+        cap = BULK_DEFAULT_EMAILS
+    cap = max(1, min(cap, BULK_MAX_EMAILS))
+
+    listing = list_cached_emails(user_email, category=category, sender=sender, days=days, limit=None)
+    if listing.get("error"):
+        return listing
+    rows = listing.get("emails", [])
+
+    if (query or "").strip():
+        # Topic restriction: keep the filtered set, in relevance order.
+        matched, _mode = await search_emails_hybrid(user_email, query)
+        allowed = {r.get("messageId"): r for r in rows}
+        rows = [allowed[m.get("messageId")] for m in matched if m.get("messageId") in allowed]
+
+    total = len(rows)
+    if total == 0:
+        return {"total_matching": 0, "covered": 0, "batch_digests": [],
+                "note": "No analysed emails match those filters. Say so; don't summarise anything."}
+
+    try:
+        replied = await get_replied_conversations(user_email)
+    except Exception:
+        replied = set()
+    chosen = rows[:cap]
+    for r in chosen:
+        if replied and r.get("conversationId") in replied:
+            r["already_replied"] = True
+
+    built = await asyncio.to_thread(lambda: [_bulk_item(user_email, r) for r in chosen])
+    items = [b[0] for b in built]
+    read_in_full = sum(1 for b in built if b[1])
+
+    batches = [items[i:i + BULK_BATCH_SIZE] for i in range(0, len(items), BULK_BATCH_SIZE)]
+    sem = asyncio.Semaphore(BULK_CONCURRENCY)
+
+    async def condense(index: int, batch: list):
+        async with sem:
+            try:
+                resp = await _chat_with_retry(
+                    model=ACTIVE_MODEL,
+                    messages=[
+                        {"role": "system", "content": _BULK_SYSTEM},
+                        {"role": "user", "content": (
+                            f"FOCUS: {focus or 'the main points and anything needing attention'}\n\n"
+                            f"BATCH {index + 1} of {len(batches)} ({len(batch)} emails):\n"
+                            + json.dumps(batch, default=str)
+                        )},
+                    ],
+                    temperature=0.2,
+                    max_tokens=BULK_DIGEST_TOKENS,
+                )
+                return len(batch), (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                log.error(f"summarize_emails batch {index + 1} failed ({type(e).__name__}): {e}")
+                return 0, None
+
+    results = await asyncio.gather(*(condense(i, b) for i, b in enumerate(batches)))
+    covered = sum(n for n, _ in results)
+    digests = [d for _, d in results if d]
+    failed_batches = sum(1 for _, d in results if d is None)
+
+    if covered == 0:
+        return {"error": "Couldn't work through the emails just now — the AI service didn't respond.",
+                "total_matching": total, "covered": 0}
+
+    return {
+        "total_matching": total,
+        "covered": covered,
+        "not_covered": total - covered,
+        "read_in_full_text": read_in_full,
+        "from_summary_only": len(chosen) - read_in_full,
+        "order": "most relevant first" if (query or "").strip() else "newest first",
+        "batch_digests": digests,
+        "note": (
+            f"These digests cover {covered} of {total} matching emails"
+            + (f" ({failed_batches} batch(es) failed and are missing)" if failed_batches else "")
+            + ". Write the answer from them, organised by what matters for the "
+            "focus rather than batch by batch, and merge duplicates. State the "
+            "coverage to the person in one plain sentence ('this covers X of Y "
+            "emails')" + (", and that the rest were not read" if total > covered else "") + "."
+        ),
+    }
+
+
 async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_name: str,
                              sink: list = None) -> str:
     """
@@ -1184,11 +1552,21 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
 
         elif name == "search_emails":
             query = (arguments or {}).get("query", "")
-            results = search_cached_emails(user_email, query)
+            rows, mode = await search_emails_hybrid(user_email, query)
+            page = _page(rows, (arguments or {}).get("offset"))
             return json.dumps({
-                "results": results,
-                "count": len(results),
+                "results": page["rows"],
+                "count": page["returned"],
+                "total_matching": page["total_matching"],
+                "offset": page["offset"],
+                "has_more": page["has_more"],
+                "next_offset": page["next_offset"],
+                "searched_by": mode,
                 "hint": (
+                    ("More matches exist — call again with offset=next_offset, "
+                     "or say how many of the total this page covers. "
+                     if page["has_more"] else "")
+                    +
                     "Entries with has_full_text can be opened with read_email "
                     "using their messageId — do that before answering anything "
                     "that needs the actual wording. Entries with has_note also "
@@ -1200,7 +1578,25 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
 
         elif name == "read_email":
             message_id = (arguments or {}).get("message_id", "")
-            return json.dumps(read_cached_email(user_email, message_id), default=str)
+            result = read_cached_email(user_email, message_id)
+            # Not prefetched yet: fetch it from the mail server now rather
+            # than answering from a one-line summary.
+            if result.get("error") and message_id and await _read_email_live(user_email, message_id):
+                result = read_cached_email(user_email, message_id)
+            return json.dumps(result, default=str)
+
+        elif name == "summarize_emails":
+            a = arguments or {}
+            result = await summarize_emails_bulk(
+                user_email,
+                focus=(a.get("focus") or "").strip(),
+                query=a.get("query"),
+                category=a.get("category"),
+                sender=a.get("sender"),
+                days=a.get("days"),
+                max_emails=a.get("max_emails"),
+            )
+            return json.dumps(result, default=str)
 
         elif name == "list_emails":
             a = arguments or {}
@@ -1209,6 +1605,7 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
                 category=a.get("category"),
                 sender=a.get("sender"),
                 days=a.get("days"),
+                offset=a.get("offset") or 0,
             )
             # Mark what has already been answered. Without this, "what needs
             # my reply" lists conversations the person replied to days ago.
@@ -1288,6 +1685,11 @@ async def _execute_tool_call(name: str, arguments: dict, user_email: str, user_n
         return json.dumps({"error": f"'{name}' failed to run — try rephrasing or ask something else."})
 
 
+# Strong references to fire-and-forget tasks, so they aren't garbage
+# collected mid-run.
+_background_tasks: set = set()
+
+
 async def get_iris_reply(
     message: str,
     history: list = None,
@@ -1313,6 +1715,15 @@ async def get_iris_reply(
     """
     proposals = []
     steps = []
+
+    # Bring the meaning-search index up to date in the background, so it is
+    # ready (or nearly) by the time a search needs it. Best-effort.
+    try:
+        _bg = asyncio.create_task(iris_index.ensure_index(user_email, _html_to_text))
+        _background_tasks.add(_bg)
+        _bg.add_done_callback(_background_tasks.discard)
+    except Exception:
+        pass
 
     messages = [
         {"role": "system", "content": IRIS_SYSTEM_PROMPT},
@@ -1355,7 +1766,7 @@ async def get_iris_reply(
             tools=TOOLS,
             tool_choice="auto",
             temperature=0.6,
-            max_tokens=500,
+            max_tokens=MAX_REPLY_TOKENS,
         )
         msg = response.choices[0].message
 
@@ -1419,7 +1830,7 @@ async def get_iris_reply(
         model=ACTIVE_MODEL,
         messages=messages,
         temperature=0.6,
-        max_tokens=500,
+        max_tokens=MAX_REPLY_TOKENS,
     )
     return {
         "reply": (final.choices[0].message.content or "").strip(),

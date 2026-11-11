@@ -9,6 +9,7 @@ backend/tracking_*.json
 !backend/tracking_access.json
 backend/activity_log.json
 backend/detail_cache/
+backend/iris_index/
 backend/logs/
 backend/celerybeat-schedule*
 backend/calendar_bullets_*.json

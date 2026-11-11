@@ -463,6 +463,20 @@ const DashboardView = ({
                 triageStats={triageStats}
                 getParticipantDisplay={getParticipantDisplay}
                 getEffectiveReceivedAt={getEffectiveReceivedAt}
+                focusEmail={selectedEmail}
+                onInsertDraft={(text) => {
+                  setReplyDraft(text);
+                  // On Insights the reply box sits behind a Reply button — open it.
+                  if (mainView === 'INSIGHTS') setShowInsightsCompose(true);
+                }}
+                onOpenEmail={(email) => {
+                  // Open the inbox card for that conversation when there is one.
+                  const idOf = (x) => x?.messageId || x?.id;
+                  const card = (groupedEmails || []).find(c => idOf(c) === idOf(email)
+                    || (email.conversationId && c.conversationId === email.conversationId)) || email;
+                  setMainView('THREADS');
+                  setSelectedEmail(card);
+                }}
               />
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginLeft: "20px" }}>
@@ -523,6 +537,7 @@ const DashboardView = ({
                 senderSummaries={report?.sender_summaries || []}
                 reportReady={!!report}
                 onAskIris={() => window.dispatchEvent(new CustomEvent('iris:open'))}
+                onNavigate={(path) => navigate(path)}
               />
               </>
             )}

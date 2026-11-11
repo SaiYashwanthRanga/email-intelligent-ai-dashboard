@@ -809,7 +809,11 @@ def set_last_fetch_ok_at(ts, user_email: str):
 # the access pattern is "read one, write one", and a single JSON file of a
 # few hundred HTML bodies would mean rewriting megabytes on every open.
 DETAIL_CACHE_DIR = "detail_cache"
-DETAIL_CACHE_MAX = 300          # per user; oldest pruned first
+# Per user; oldest pruned first. Sized to hold a full large inbox so Iris can
+# read (and search by meaning over) every email, not just the newest few
+# hundred. Bodies average tens of KB, so this is roughly 100-200 MB of disk
+# per heavy user at the cap. Override with DETAIL_CACHE_MAX in .env.
+DETAIL_CACHE_MAX = int(os.getenv("DETAIL_CACHE_MAX", "1500"))
 DETAIL_BODY_MAX_CHARS = 400_000  # skip absurd bodies rather than bloat the disk
 
 def _detail_dir_for(user_email: str) -> str:
